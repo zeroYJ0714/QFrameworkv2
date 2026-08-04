@@ -1,0 +1,147 @@
+QMainWindow {
+    background: #f4f6f8;
+    color: #20252b;
+}
+
+QMenuBar {
+    background: #ffffff;
+    border-bottom: 1px solid #d9dee5;
+    padding: 2px 6px;
+}
+
+QMenuBar::item {
+    padding: 6px 10px;
+    background: transparent;
+}
+
+QMenuBar::item:selected,
+QMenu::item:selected {
+    background: #e3edf8;
+    color: #15202b;
+}
+
+QMenu {
+    background: #ffffff;
+    border: 1px solid #cfd5dc;
+    padding: 4px;
+}
+
+QMenu::item {
+    padding: 6px 28px 6px 10px;
+}
+
+QToolBar {
+    background: #ffffff;
+    border: none;
+    border-right: 1px solid #d9dee5;
+    spacing: 4px;
+    padding: 6px 4px;
+}
+
+QToolButton {
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 5px;
+}
+
+QToolButton:hover {
+    background: #e9edf2;
+    border-color: #cfd5dc;
+}
+
+QToolButton:pressed,
+QToolButton:checked {
+    background: #d8e7f7;
+    border-color: #8db2da;
+}
+
+QDockWidget {
+    color: #20252b;
+    font-weight: 600;
+}
+
+QDockWidget::title {
+    background: #eef1f4;
+    border-bottom: 1px solid #d4d9df;
+    padding: 7px 9px;
+    text-align: left;
+}
+
+QStatusBar {
+    background: #ffffff;
+    border-top: 1px solid #d9dee5;
+    color: #4c5661;
+}
+
+QDialog {
+    background: #f4f6f8;
+    color: #20252b;
+}
+
+QTableWidget {
+    background: #ffffff;
+    alternate-background-color: #f7f8fa;
+    border: 1px solid #cfd5dc;
+    gridline-color: #e2e6eb;
+    selection-background-color: #d8e7f7;
+    selection-color: #15202b;
+}
+
+QHeaderView::section {
+    background: #e9edf1;
+    color: #303841;
+    border: none;
+    border-right: 1px solid #d4d9df;
+    border-bottom: 1px solid #cfd5dc;
+    padding: 7px 8px;
+    font-weight: 600;
+}
+
+QPushButton {
+    background: #ffffff;
+    color: #20252b;
+    border: 1px solid #bfc7d0;
+    border-radius: 3px;
+    min-height: 26px;
+    padding: 3px 12px;
+}
+
+QPushButton:hover {
+    background: #edf3f9;
+    border-color: #7da6d1;
+}
+
+QPushButton:pressed {
+    background: #d8e7f7;
+}
+
+QLineEdit,
+QComboBox,
+QSpinBox {
+    background: #ffffff;
+    color: #20252b;
+    border: 1px solid #bfc7d0;
+    border-radius: 3px;
+    min-height: 26px;
+    padding: 2px 6px;
+}
+
+QLineEdit:focus,
+QComboBox:focus,
+QSpinBox:focus {
+    border-color: #4e8bc4;
+}
+
+QLabel#ProcessWindowPlaceholder {
+    background: #eef1f4;
+    color: #5c6670;
+    border: 1px dashed #b8c0c9;
+    padding: 16px;
+}
+
+QToolTip {
+    background: #20252b;
+    color: #ffffff;
+    border: 1px solid #20252b;
+    padding: 4px 6px;
+}

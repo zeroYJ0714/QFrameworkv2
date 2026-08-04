@@ -1,0 +1,111 @@
+# QFramework.ini 参考
+
+## 文件位置与只读约束
+
+运行配置固定为：
+
+```text
+<QFrameworkApp.exe 所在目录>\config\QFramework.ini
+```
+
+程序只读取此文件，绝不写回。修改后必须重启。除布局和 QSS 允许使用绝对路径外，所有相对路径都以 INI 所在的 `config` 目录为基准。
+
+仓库中的完整已注释示例位于 `config\QFramework.ini`。
+
+## [Modules]
+
+| 键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `Names` | 逗号分隔字符串 | 空 | 唯一参与加载的模块 ID，顺序就是加载顺序。 |
+
+未列入 `Names` 的分组不会自动载入。
+
+## [Module.<ModuleId>]
+
+| 键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `Enabled` | bool | `true` | `false` 时不加载 DLL、不启动 EXE、不自动重启。 |
+| `Type` | enum | 无 | `InProcessUi`、`InProcessNonUi`、`ProcessUi`、`ProcessNonUi`。 |
+| `DisplayName` | string | 模块 ID | 菜单、Dock 和状态显示名称。 |
+| `FilePath` | path | 无 | DLL 或 EXE；相对 `config` 解析。 |
+| `WaitForDebugger` | bool | `false` | 仅 Debug 子进程有效；主进程模块和 Release 忽略。 |
+| `DebuggerWaitTimeoutMs` | int | `30000` | 等待调试器超时，单位毫秒；超时后继续启动。 |
+
+推荐路径：
+
+```text
+../Plugins/<ModuleId>/<ModuleId>.dll
+../Plugins/<ModuleId>/<ModuleId>.exe
+```
+
+## [MessageBus]
+
+| 键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `DefaultQueueCapacity` | int | `256` | 每个订阅者的默认队列条数。 |
+| `MaxMessageBytes` | int | `16777216` | 单条消息最大字节数。 |
+| `SharedMemoryThresholdBytes` | int | `1048576` | 大于等于此值时使用 `QSharedMemory`。 |
+| `ShutdownDrainTimeoutMs` | int | `3000` | 关闭时排空队列的最长毫秒数。 |
+| `DefaultPolicy` | enum | `Reliable` | `Reliable` 或 `Latest`。 |
+
+`Reliable` 队列满时拒绝新消息并让 `publish()` 返回 `false`；`Latest` 队列满时丢弃最旧消息，保留最新数据。
+
+## [Topic.<TopicName>]
+
+| 键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `QueueCapacity` | int | 继承全局 | 覆盖该主题的每订阅者容量。 |
+| `MaxMessageBytes` | int | 继承全局 | 覆盖该主题的大小上限。 |
+| `Policy` | enum | 继承全局 | `Reliable` 或 `Latest`。 |
+
+只有需要特殊限流或丢帧策略的少数主题才应建立此分组。
+
+## [Process]
+
+| 键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `RegistrationTimeoutMs` | int | `10000` | 子进程注册握手超时。 |
+| `HeartbeatIntervalMs` | int | `1000` | 心跳发送间隔。 |
+| `HeartbeatTimeoutMs` | int | `5000` | 未收到心跳后的故障判定时间。 |
+| `StopTimeoutMs` | int | `5000` | 正常停止等待时间，超时后强制结束。 |
+| `RestartDelayMs` | int | `1000` | 故障后自动重启延迟。 |
+| `RestartWindowMs` | int | `60000` | 自动重启计数窗口。 |
+| `MaxRestartCount` | int | `3` | 计数窗口内最大自动重启次数。 |
+
+注册超时、心跳超时和异常退出都使用同一重启窗口策略。手动重启会清零自动重启计数。
+
+## [Layout]
+
+| 键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `StartupFile` | path | 空 | 启动时加载的 `.qflayout`；空值保持主窗口空白。 |
+
+布局文件缺失或损坏不会阻止框架启动。程序只在用户执行保存操作时写布局文件，不在退出时自动保存。
+
+## [Style]
+
+| 键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `File` | path | 空 | 启动时加载的全局 `.qss`。 |
+
+运行中选择的其他 QSS 只保存在内存，不写回本键。
+
+## [Logging]
+
+| 键 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `Directory` | path | `../Logs` | 集中日志目录。 |
+| `MaxFileBytes` | int64 | `10485760` | 单文件最大字节数。 |
+| `Rolling` | string | `DateAndSize` | 固定为按日期和大小滚动；旧日志不自动删除。 |
+
+## 路径示例
+
+假设程序运行目录为 `D:\Portable\QFramework`，INI 位于 `D:\Portable\QFramework\config\QFramework.ini`：
+
+| INI 值 | 解析结果 |
+| --- | --- |
+| `../Plugins/MyModule/MyModule.dll` | `D:\Portable\QFramework\Plugins\MyModule\MyModule.dll` |
+| `Styles/Default.qss` | `D:\Portable\QFramework\config\Styles\Default.qss` |
+| `../Logs` | `D:\Portable\QFramework\Logs` |
+
+主进程 DLL 自己的业务配置相对主程序 EXE 目录；子进程 EXE 的业务配置和工作目录相对该子进程 EXE 目录。这两类业务配置不由 `FrameworkConfig` 自动解析。

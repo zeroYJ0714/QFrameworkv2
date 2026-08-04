@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package qframework.protocols;
+
+enum ModuleState {
+  MODULE_STATE_UNKNOWN = 0;
+  MODULE_STATE_STARTING = 1;
+  MODULE_STATE_RUNNING = 2;
+  MODULE_STATE_STOPPING = 3;
+  MODULE_STATE_STOPPED = 4;
+  MODULE_STATE_FAILED = 5;
+  MODULE_STATE_RESTARTING = 6;
+}
+
+// 框架发布的模块状态快照。
+message ModuleStatus {
+  string module_id = 1;
+  ModuleState state = 2;
+  string detail = 3;
+  int64 timestamp_ms = 4;
+  uint32 restart_count = 5;
+}

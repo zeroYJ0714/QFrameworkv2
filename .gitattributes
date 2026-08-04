@@ -1,0 +1,39 @@
+* text=auto
+
+# C++ and project source files
+*.c text
+*.cc text
+*.cpp text
+*.cxx text
+*.h text
+*.hh text
+*.hpp text
+*.json text
+*.ini text
+*.md text
+*.proto text
+*.pro text
+*.qrc text
+*.qss text
+*.txt text
+
+# Visual Studio project files use Windows line endings
+*.sln text eol=crlf
+*.vcxproj text eol=crlf
+*.filters text eol=crlf
+*.props text eol=crlf
+*.targets text eol=crlf
+
+# Binary dependencies and documentation images
+*.dll binary
+*.exe binary
+*.exp binary
+*.lib binary
+*.pdb binary
+*.7z binary
+*.zip binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.png binary

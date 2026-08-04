@@ -1,0 +1,118 @@
+# 模块 SDK 参考
+
+## 命名空间与头文件
+
+公开类型位于 `qframework` 命名空间，头文件位于 `Source\QFrameworkSdk`。模块应只依赖公开 SDK、具体 Protobuf 生成头和 `MessageTopics.h`，不要包含框架内部实现头。
+
+## 四个基类
+
+| 类型 | C++ 基类 | Qt 基类 | 载入方式 |
+| --- | --- | --- | --- |
+| `InProcessUi` | `InProcessUiModule` | `QWidget` | `QPluginLoader` |
+| `InProcessNonUi` | `InProcessNonUiModule` | `QObject` | `QPluginLoader` |
+| `ProcessUi` | `ProcessUiModule` | `QWidget` | `QProcess` + `ProcessRuntime` |
+| `ProcessNonUi` | `ProcessNonUiModule` | `QObject` | `QProcess` + `ProcessRuntime` |
+
+## ModuleEndpoint
+
+四个基类都实现或继承 `ModuleEndpoint`。
+
+| 成员 | 返回值与语义 |
+| --- | --- |
+| `moduleId()` | 返回框架绑定的模块 ID；启动前可能为空。 |
+| `publishedTopics()` | 返回允许发布的主题，默认空列表。启动后不支持动态修改。 |
+| `subscribedTopics()` | 返回订阅主题，默认空列表。启动后不支持动态修改。 |
+| `onStart()` | 启动回调，默认 `true`。返回 `false` 时当前模块失败，其他模块继续。 |
+| `onStop()` | 停止回调，默认空实现。 |
+| `onMessage(topic, senderModuleId, data)` | 异步消息回调，默认空实现。 |
+| `publish(topic, data)` | 发布消息；成功返回 `true`，未运行、主题未声明、超限或可靠队列满时返回 `false`。 |
+| `logDebug/Info/Warning/Error(text)` | 写入集中日志并自动带入模块 ID。 |
+
+`bindHost()` 和 `setRunning()` 只供框架生命周期边界使用，模块业务代码不应调用。
+
+## 线程规则
+
+- 主进程模块的 `onStart()`、`onStop()` 在主进程 Qt GUI 线程执行。
+- 子进程模块的 `onStart()`、`onStop()` 在子进程 Qt 主线程执行。
+- 每个模块有独立输入队列和消息线程，`onMessage()` 在该消息线程执行。
+- `publish()` 可从模块自己的任意线程调用。
+- UI 模块不得从 `onMessage()` 直接访问控件；使用信号和显式 `Qt::QueuedConnection`。
+- 框架在回调边界捕获 C++ 异常并记录；原生内存破坏仍可能终止所在进程。
+
+## 生命周期顺序
+
+1. 框架按 `[Modules]/Names` 顺序读取并载入启用模块。
+2. 注册每个模块声明的发布与订阅主题。
+3. 依次调用 `onStart()`。
+4. 所有可用模块完成启动后，中央总线才启用消息投递。
+5. 关闭时先拒绝新消息，在超时内排空队列，再按反向顺序调用 `onStop()`。
+6. 销毁模块后刷新并停止日志。
+
+停止前或停止后调用 `publish()` 返回 `false`。框架不做离线消息补发，子进程重启前会清空未处理消息。
+
+## 插件元数据
+
+主进程 DLL 使用统一 IID：
+
+```cpp
+#define QFRAMEWORK_PLUGIN_IID "org.qframework.Module/1.0"
+```
+
+类声明需要 `Q_OBJECT` 和：
+
+```cpp
+Q_PLUGIN_METADATA(IID QFRAMEWORK_PLUGIN_IID FILE "MyModule.json")
+```
+
+元数据至少包含 `ModuleId` 和 `ModuleType`。框架不执行 SDK/ABI 版本协商；模块与框架二进制兼容性由开发者负责，DLL 更新后必须重启主程序。
+
+## ProcessRuntime
+
+```cpp
+static int ProcessRuntime::run(QCoreApplication* application,
+                               ModuleEndpoint* module);
+```
+
+它是子进程的唯一框架入口，负责：
+
+- 解析框架传入的服务器、令牌、模块类型和限制参数；
+- 注册握手与主题声明；
+- 心跳、停止和样式通知；
+- `QLocalSocket` 小消息与 `QSharedMemory` 大消息；
+- Debug 等待调试器；
+- UI 子进程窗口句柄上报。
+
+模块所有权转交给运行时。业务代码不要直接建立模块间 Socket 或共享内存。
+
+## 内置主题
+
+| 宏 | 字符串值 | 示例消息 |
+| --- | --- | --- |
+| `QFRAMEWORK_IMAGE_RAW` | `QFRAMEWORK_IMAGE_RAW` | `ImageFrame` |
+| `QFRAMEWORK_IMAGE_PROCESSED` | `QFRAMEWORK_IMAGE_PROCESSED` | `ProcessedImage` |
+| `QFRAMEWORK_LOG_DISPLAY` | `QFRAMEWORK_LOG_DISPLAY` | `LogDisplayMessage` |
+| `QFRAMEWORK_STATUS` | `QFRAMEWORK_STATUS` | `ModuleStatus` |
+
+框架只路由 `QString` 主题、发送者模块 ID 和 `QByteArray`。它不验证主题与 Protobuf 类型的映射。发送方负责 `SerializeToString()`，接收方负责 `ParseFromArray()`。
+
+## Protobuf 消息
+
+### ImageFrame
+
+`sequence`、`width`、`height`、`format`、`payload`、`timestamp_ms`。
+
+### ProcessedImage
+
+`image`、`source_sequence`、`processor_module_id`。
+
+### LogDisplayMessage
+
+`level`、`module_id`、`text`、`timestamp_ms`、`thread_id`。
+
+### ModuleStatus
+
+`module_id`、`state`、`detail`、`timestamp_ms`、`restart_count`。状态枚举包括 `UNKNOWN`、`STARTING`、`RUNNING`、`STOPPING`、`STOPPED`、`FAILED`、`RESTARTING`。
+
+## 日志级别
+
+`LogLevel` 包含 `Debug`、`Info`、`Warning`、`Error`。集中日志行包含毫秒时间、级别、模块 ID、线程 ID 和文本。Qt 全局消息处理器也会捕获 `qDebug`、`qWarning`、`qCritical`；无法判断来源时模块 ID 为 `Unknown`。

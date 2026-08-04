@@ -1,0 +1,112 @@
+# 架构说明
+
+## 为什么只有一个中央消息总线
+
+QFramework 把模块发现、生命周期和消息传递分开。模块只声明主题并发布字节，不持有其他模块对象，也不直接建立 Socket、共享内存或 RPC 连接。
+
+```text
+QFrameworkApp.exe
+├─ QFramework.dll
+│  ├─ FrameworkConfig / Logger / MessageBus
+│  ├─ PluginManager -> InProcessUi / InProcessNonUi DLL
+│  ├─ ProcessSupervisor -> ProcessUi / ProcessNonUi EXE
+│  └─ MainWindow / Dock / Layout / Style
+└─ QFrameworkProtocols.dll
+   └─ 所有 .proto 生成代码
+```
+
+中央路由带来三个直接结果：
+
+1. 发布者只依赖主题，不依赖订阅者是否存在。
+2. 每个订阅者有独立队列，一个慢模块不会直接阻塞其他模块。
+3. 进程内与子进程模块看到相同的 `publish()` 和 `onMessage()` API。
+
+框架不保存历史消息。发布时尚未加载或尚未订阅的模块不会补收。
+
+## 依赖方向
+
+依赖始终由下向上：
+
+```text
+QFrameworkProtocols.dll
+          ↑
+QFramework.dll
+          ↑
+QFrameworkApp.exe 与四类模块
+```
+
+`.pb.cc` 只在 `QFrameworkProtocols.dll` 编译一次，其他项目包含具体 `.pb.h` 并链接导入库。这避免多个 DLL 各自带一份 Protobuf 生成实现。
+
+## 模块边界
+
+主进程 DLL 使用 `QPluginLoader`，适合低开销 UI 或业务模块。框架可以捕获普通 C++ 异常，但 DLL 与主程序共享地址空间，严重内存错误仍可能终止整个应用。
+
+子进程 EXE 使用 `QProcess`，适合需要故障隔离、独立模态窗口行为或单独调试的模块。进程崩溃不会直接破坏主进程地址空间，监督器可以重启它。
+
+首版不做 ABI 版本协商、DLL 热卸载或热重载。更新主进程模块后必须重启框架。
+
+## 消息顺序与背压
+
+每个模块拥有一个输入队列和消息线程。同一发送者、同一主题的消息保持顺序；不同发送者之间不承诺全局顺序。
+
+背压由订阅者独立承担：
+
+- `Reliable`：队列满时不阻塞调用线程，拒绝新消息，`publish()` 返回 `false`。
+- `Latest`：队列满时丢弃最旧消息并保留最新消息，适合图像流。
+- 大小超限：在进入队列前拒绝。
+- 关闭：停止接受新消息，在 `ShutdownDrainTimeoutMs` 内尽量排空，超时后统计并丢弃剩余消息。
+
+一条消息可能对某些订阅者成功、对另一些订阅者失败，因此模块必须检查 `publish()` 返回值并记录业务上需要的降级行为。
+
+## 子进程 IPC
+
+监督器为每次启动生成随机服务器名和令牌，并通过命令行只传给目标子进程。注册帧必须同时匹配模块 ID、模块类型、令牌和主题列表，模块不能只凭 ID 冒充另一个配置项。
+
+数据路径按大小选择：
+
+```text
+小消息 -> QLocalSocket 帧 -> 中央 MessageBus
+大消息 -> QSharedMemory + 控制帧 -> ACK -> 释放共享段
+```
+
+共享内存只是传输优化。模块 API 始终接收完整 `QByteArray`，不拥有共享内存句柄。正常确认、断开、重启和关闭都会清理框架持有的共享段。
+
+## 监督与重启
+
+子进程先进入 `Starting`，在 `RegistrationTimeoutMs` 内完成注册后进入 `Running`。监督器定期发送心跳；注册超时、心跳超时、启动错误和异常退出都进入故障处理。
+
+在 `RestartWindowMs` 窗口内，框架最多自动重启 `MaxRestartCount` 次，每次等待 `RestartDelayMs`。超过上限后停止自动重启、写错误日志并弹窗。用户手动重启会清空计数并重新建立随机令牌、IPC 服务和消息队列。
+
+Debug 模式的 `WaitForDebugger` 在子进程调用 `onStart()` 前等待附加；Release 模式忽略该选项，防止发布目录因调试配置停住。
+
+## UI、Dock 与子进程窗口
+
+主窗口在首次启动时保持空白，但 UI 模块可以已经完成 `onStart()`。用户第一次显示模块时，框架把 Dock 放到左侧；多个 Dock 默认可以成为标签页。
+
+`ManagedDockWidget` 允许拖动时出现浮动预览，但在操作结束后重新停靠。关闭 Dock 只改变可见性，不停止模块。
+
+主进程 UI 模块本身是 QWidget，框架把它交给自己的 QDockWidget 管理。子进程 UI 先上报原生 HWND，主进程用 `QWindow::fromWinId()` 建立窗口容器并放入 Dock。子进程重启期间 Dock 保留位置，以占位文本显示状态。
+
+## 布局与样式为什么彼此独立
+
+`.qflayout` 保存主窗口几何、Qt `saveState()` 数据和模块可见性。它不保存 QSS。运行中加载布局会隐藏布局中不存在的 Dock，跳过当前不可用模块，并把文件设为当前活动布局。只有用户明确保存时才写文件。
+
+`StyleManager` 保存当前 QSS 路径和文本。成功切换后，主进程立即应用并把同一文本通知 `ProcessUi` 子进程；失败时保留上一个成功样式。运行中的选择不写回 INI，因此重新启动仍以 `[Style]/File` 为准。
+
+## 配置与日志的所有权
+
+`FrameworkConfig` 在启动时读取固定的 `config\QFramework.ini`，随后只提供内存快照和路径解析。程序没有保存 INI 的代码路径，这使运维修改可审计，也避免 GUI 操作悄悄改变下次启动行为。
+
+`Logger` 是异步、线程安全的单例。模块日志和 Qt 全局日志最终进入同一按日期与大小滚动的文件。框架状态故障会同时记录并提示用户；解析失败、队列丢帧等高频业务故障只记录和计数，避免重复弹窗阻塞操作。
+
+## 首版明确不提供的能力
+
+- 同步 RPC 或请求响应框架；
+- 运行时订阅、取消订阅；
+- 持久消息、离线补发；
+- 主进程 DLL 热更新；
+- 自动 ABI 兼容检查；
+- 安装程序或自动修改 INI；
+- 硬性性能通过阈值。
+
+这些边界保持实现简单且可验证。需要新能力时，应先扩展冻结设计和测试，再改变公共 SDK。

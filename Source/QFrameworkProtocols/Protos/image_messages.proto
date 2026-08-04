@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package qframework.protocols;
+
+// 原始图像帧，像素格式由 format 字段描述。
+message ImageFrame {
+  uint64 sequence = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  string format = 4;
+  bytes payload = 5;
+  int64 timestamp_ms = 6;
+}
+
+// 处理后的图像保留来源序号和处理模块标识。
+message ProcessedImage {
+  ImageFrame image = 1;
+  uint64 source_sequence = 2;
+  string processor_module_id = 3;
+}

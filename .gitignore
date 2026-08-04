@@ -1,0 +1,59 @@
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Visual Studio and local user state
+.vs/
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+*.opendb
+*.sdf
+*.sln.docstates
+*.userosscache
+*.VC.db-shm
+*.VC.db-wal
+
+# Generated build and deployment trees
+/Build/
+**/Build/
+/Bin/
+
+# Compiler and IDE intermediate output
+*.obj
+*.o
+*.tlog
+*.lastbuildstate
+*.idb
+*.iobj
+*.ipdb
+*.ilk
+*.pch
+*.pdb
+*.log
+*.dmp
+*.tmp
+*.bak
+*.exp
+*.cbt
+*.stash
+*.qmake.stash
+
+# Qt generated source files
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+
+# Test and coverage output
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+
+# Local environment and secret files
+.env
+.env.*
+!.env.example

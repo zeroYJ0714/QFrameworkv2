@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package qframework.protocols;
+
+// 日志 UI 使用的结构化显示消息。
+message LogDisplayMessage {
+  string level = 1;
+  string module_id = 2;
+  string text = 3;
+  int64 timestamp_ms = 4;
+  uint64 thread_id = 5;
+}

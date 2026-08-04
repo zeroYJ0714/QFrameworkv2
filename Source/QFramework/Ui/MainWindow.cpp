@@ -11,7 +11,6 @@
 #include <QSignalBlocker>
 #include <QStatusBar>
 #include <QStyle>
-#include <QToolBar>
 
 #include "InProcessUiModule.h"
 #include "LayoutManager.h"
@@ -409,17 +408,6 @@ void MainWindow::createActions()
     connect(selectStyleAction, &QAction::triggered, this, &MainWindow::selectStyleSheet);
     connect(reloadStyleAction, &QAction::triggered, this, &MainWindow::reloadStyleSheet);
 
-    QToolBar* navigationToolBar = new QToolBar(QString::fromUtf8(u8"框架工具"), this);
-    navigationToolBar->setObjectName(QStringLiteral("FrameworkNavigationToolBar"));
-    navigationToolBar->setMovable(false);
-    navigationToolBar->setFloatable(false);
-    navigationToolBar->setToolButtonStyle(Qt::ToolButtonIconOnly);
-    navigationToolBar->setIconSize(QSize(22, 22));
-    navigationToolBar->addAction(managerAction);
-    navigationToolBar->addSeparator();
-    navigationToolBar->addAction(loadLayoutAction);
-    navigationToolBar->addAction(selectStyleAction);
-    addToolBar(Qt::LeftToolBarArea, navigationToolBar);
 }
 
 void MainWindow::createModuleDocks()

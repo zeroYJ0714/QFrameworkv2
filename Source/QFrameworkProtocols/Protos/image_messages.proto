@@ -2,19 +2,28 @@ syntax = "proto3";
 
 package qframework.protocols;
 
-// 原始图像帧，像素格式由 format 字段描述。
+// 原始图像帧：传输层只负责携带这份序列化字节，具体像素解释由 format 决定。
 message ImageFrame {
+  // 生产者递增的帧序号，用于检测丢帧或 Latest 覆盖后的最新值。
   uint64 sequence = 1;
+  // 图像有效宽度，单位为像素。
   uint32 width = 2;
+  // 图像有效高度，单位为像素。
   uint32 height = 3;
+  // 像素编码名称，例如 GRAY8；消费者据此解释 payload。
   string format = 4;
+  // 原始像素字节，不在协议层复制或解码。
   bytes payload = 5;
+  // 采集时间戳，单位为毫秒。
   int64 timestamp_ms = 6;
 }
 
-// 处理后的图像保留来源序号和处理模块标识。
+// 处理后的图像：保留原图和来源信息，便于回溯是哪一帧、哪个模块生成结果。
 message ProcessedImage {
+  // 处理后的图像内容，复用原始帧的尺寸/格式/负载字段。
   ImageFrame image = 1;
+  // 对应原始 ImageFrame.sequence。
   uint64 source_sequence = 2;
+  // 产生结果的模块 ID，供 UI 或日志定位处理链路。
   string processor_module_id = 3;
 }

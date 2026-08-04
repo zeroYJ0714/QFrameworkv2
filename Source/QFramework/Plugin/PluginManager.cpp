@@ -12,12 +12,17 @@
 #include "MessageBus.h"
 #include "QFrameworkPlugin.h"
 
+// 插件启动分为 loadOne 和 startOne：先验证文件、元数据、基类并注册总线，
+// 再调用业务 onStart。这样失败原因可以准确落在“加载”或“启动”阶段。
+
 namespace qframework
 {
 namespace
 {
+// 把只允许进入本管理器的两种 ModuleType 转成插件元数据文本。
 QString inProcessTypeName(ModuleType type)
 {
+    // 插件 JSON 使用稳定字符串；非主进程类型返回空串并在校验时失败。
     if (type == ModuleType::InProcessUi)
         return QStringLiteral("InProcessUi");
     if (type == ModuleType::InProcessNonUi)
@@ -28,6 +33,7 @@ QString inProcessTypeName(ModuleType type)
 
 struct PluginManager::LoadedPlugin
 {
+    // loader 拥有 instance；endpoint/uiModule 都是指向同一插件对象的不同视图。
     ModuleConfig config;
     QPluginLoader* loader = nullptr;
     QObject* instance = nullptr;
@@ -36,6 +42,7 @@ struct PluginManager::LoadedPlugin
     bool started = false;
 };
 
+// 保存中央 MessageBus 借用指针；实际 DLL 直到 loadAndStart() 才加载。
 PluginManager::PluginManager(MessageBus* messageBus, QObject* parent)
     : QObject(parent),
       messageBus_(messageBus),
@@ -45,14 +52,17 @@ PluginManager::PluginManager(MessageBus* messageBus, QObject* parent)
 
 PluginManager::~PluginManager()
 {
+    // 正常 FrameworkRuntime 会显式 shutdown；析构兜底防止插件 DLL 留在内存中。
     if (!shutdownComplete_)
         shutdown(3000);
 }
 
+// 按配置顺序分两阶段加载和启动全部主进程插件；单个失败不会中止后续项。
 bool PluginManager::loadAndStart(const QVector<ModuleConfig>& modules,
                                  QStringList* errors,
                                  bool enableDeliveryAfterStart)
 {
+    // 第一遍只加载和注册，避免早启动模块向尚未注册的模块发布消息。
     bool allSucceeded = true;
     for (const ModuleConfig& config : modules) {
         if (!config.enabled ||
@@ -69,6 +79,7 @@ bool PluginManager::loadAndStart(const QVector<ModuleConfig>& modules,
         }
     }
 
+    // 使用快照，因为 start 失败时 removeFailed 会修改 loaded_ 容器。
     const QVector<LoadedPlugin*> loadedSnapshot = loaded_;
     for (LoadedPlugin* plugin : loadedSnapshot) {
         QString error;
@@ -85,6 +96,7 @@ bool PluginManager::loadAndStart(const QVector<ModuleConfig>& modules,
     return allSucceeded;
 }
 
+// 幂等地停止消息、反向调用 onStop、注销并卸载全部 DLL。
 void PluginManager::shutdown(int drainTimeoutMs)
 {
     if (shutdownComplete_)
@@ -92,10 +104,12 @@ void PluginManager::shutdown(int drainTimeoutMs)
     messageBus_->beginShutdown();
     messageBus_->stopQueues(drainTimeoutMs);
 
+    // 反向关闭与构造依赖顺序一致，后加载模块先停止。
     for (int i = loaded_.size() - 1; i >= 0; --i) {
         LoadedPlugin* plugin = loaded_.at(i);
         if (plugin->started) {
             try {
+                // 隔离插件异常，保证后续模块和 DLL 仍能继续清理。
                 plugin->endpoint->onStop();
             } catch (const std::exception& exception) {
                 Logger::instance().log(
@@ -120,6 +134,7 @@ void PluginManager::shutdown(int drainTimeoutMs)
     shutdownComplete_ = true;
 }
 
+// 按 loaded_ 顺序返回已成功执行 onStart 的模块 ID。
 QStringList PluginManager::runningModuleIds() const
 {
     QStringList result;
@@ -130,6 +145,7 @@ QStringList PluginManager::runningModuleIds() const
     return result;
 }
 
+// 返回 UI 插件对象借用指针；非 UI、未知或失败模块返回 nullptr。
 InProcessUiModule* PluginManager::uiModule(const QString& moduleId) const
 {
     for (const LoadedPlugin* plugin : loaded_) {
@@ -139,8 +155,10 @@ InProcessUiModule* PluginManager::uiModule(const QString& moduleId) const
     return nullptr;
 }
 
+// 加载一个 DLL：先验证路径和 JSON 元数据，再构造实例、校验基类并注册总线。
 bool PluginManager::loadOne(const ModuleConfig& config, QString* errorMessage)
 {
+    // 文件名必须等于 ModuleId，降低配置指向错误 DLL 但仍能加载的风险。
     const QFileInfo fileInfo(config.filePath);
     if (!fileInfo.exists() || !fileInfo.isFile()) {
         *errorMessage = QString::fromUtf8(u8"模块文件不存在：%1").arg(config.filePath);
@@ -157,6 +175,7 @@ bool PluginManager::loadOne(const ModuleConfig& config, QString* errorMessage)
     plugin->loader = new QPluginLoader(config.filePath);
 
     const QJsonObject rootMetadata = plugin->loader->metaData();
+    // 在 instance() 执行插件代码前先校验 IID、ModuleId 和 ModuleType。
     const QJsonObject moduleMetadata = rootMetadata.value(QStringLiteral("MetaData")).toObject();
     const QString iid = rootMetadata.value(QStringLiteral("IID")).toString();
     const QString metadataId = moduleMetadata.value(QStringLiteral("ModuleId")).toString();
@@ -172,6 +191,7 @@ bool PluginManager::loadOne(const ModuleConfig& config, QString* errorMessage)
     }
 
     plugin->instance = plugin->loader->instance();
+    // instance() 会实际载入 DLL 并构造 Qt 插件对象。
     if (plugin->instance == nullptr) {
         *errorMessage = QString::fromUtf8(u8"加载模块 %1 失败：%2")
             .arg(config.id, plugin->loader->errorString());
@@ -181,6 +201,7 @@ bool PluginManager::loadOne(const ModuleConfig& config, QString* errorMessage)
     }
 
     plugin->endpoint = dynamic_cast<ModuleEndpoint*>(plugin->instance);
+    // 既检查统一接口，也检查 UI/非 UI 具体基类与配置类型是否一致。
     plugin->uiModule = dynamic_cast<InProcessUiModule*>(plugin->instance);
     InProcessNonUiModule* nonUi = dynamic_cast<InProcessNonUiModule*>(plugin->instance);
     const bool typeMatches =
@@ -196,6 +217,7 @@ bool PluginManager::loadOne(const ModuleConfig& config, QString* errorMessage)
     }
 
     QString busError;
+    // 只有元数据和基类均通过后才把主题注册到中央 MessageBus。
     if (!messageBus_->registerModule(config.id, plugin->endpoint, &busError)) {
         *errorMessage = QString::fromUtf8(u8"注册模块 %1 失败：%2")
             .arg(config.id, busError);
@@ -209,8 +231,10 @@ bool PluginManager::loadOne(const ModuleConfig& config, QString* errorMessage)
     return true;
 }
 
+// 运行一个已加载插件的 onStart；异常或 false 都撤销发布权限并返回错误。
 bool PluginManager::startOne(LoadedPlugin* plugin, QString* errorMessage)
 {
+    // onStart 期间允许 publish，因此先把模块标记为运行；失败再撤销。
     messageBus_->setModuleRunning(plugin->config.id, true);
     bool started = false;
     try {
@@ -235,8 +259,10 @@ bool PluginManager::startOne(LoadedPlugin* plugin, QString* errorMessage)
     return true;
 }
 
+// 清理启动失败的单个插件，不影响 loaded_ 中其余有效模块。
 void PluginManager::removeFailed(LoadedPlugin* plugin)
 {
+    // 即使 onStart 失败也尝试一次 onStop，让模块释放已创建的局部资源。
     try {
         plugin->endpoint->onStop();
     } catch (...) {

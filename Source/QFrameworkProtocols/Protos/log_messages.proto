@@ -2,11 +2,16 @@ syntax = "proto3";
 
 package qframework.protocols;
 
-// 日志 UI 使用的结构化显示消息。
+// 日志 UI 使用的结构化显示消息；它在模块间传递，不等同于磁盘日志行。
 message LogDisplayMessage {
+  // 文本级别，例如 INFO、WARNING 或 ERROR。
   string level = 1;
+  // 产生这条日志的模块 ID。
   string module_id = 2;
+  // 面向用户显示的正文。
   string text = 3;
+  // 产生时间，单位为毫秒。
   int64 timestamp_ms = 4;
+  // 产生消息的线程标识，便于排查跨线程调用。
   uint64 thread_id = 5;
 }

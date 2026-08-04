@@ -3,20 +3,32 @@ syntax = "proto3";
 package qframework.protocols;
 
 enum ModuleState {
+  // 未知或尚未初始化状态。
   MODULE_STATE_UNKNOWN = 0;
+  // 模块正在执行 onStart/注册流程。
   MODULE_STATE_STARTING = 1;
+  // 模块已启动并允许发布消息。
   MODULE_STATE_RUNNING = 2;
+  // 模块已停止接受新消息，正在执行 onStop。
   MODULE_STATE_STOPPING = 3;
+  // 模块正常停止。
   MODULE_STATE_STOPPED = 4;
+  // 模块启动或运行失败。
   MODULE_STATE_FAILED = 5;
+  // 监督器已清理旧进程，正在启动替代实例。
   MODULE_STATE_RESTARTING = 6;
 }
 
-// 框架发布的模块状态快照。
+// 框架发布的模块状态快照；订阅者可用它更新 UI 或生成诊断日志。
 message ModuleStatus {
+  // 状态所属模块 ID。
   string module_id = 1;
+  // 当前生命周期枚举。
   ModuleState state = 2;
+  // 可选的人类可读细节，例如失败原因或启动提示。
   string detail = 3;
+  // 状态发生时间，单位为毫秒。
   int64 timestamp_ms = 4;
+  // 在监督器重启窗口内已经重启的次数。
   uint32 restart_count = 5;
 }

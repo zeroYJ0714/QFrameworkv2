@@ -22,24 +22,32 @@
 #include "ProcessWindowHost.h"
 #include "StyleManager.h"
 
+// MainWindow 只做 UI 编排：从管理器接收状态、更新 Dock/菜单，并把用户操作
+// 委托回对应管理器。任何耗时队列或进程等待都不在 UI 控件代码里实现。
+
 namespace qframework
 {
 namespace
 {
+// UI 与进程类型判断集中在此，菜单、Dock 和重启按钮共用同一规则。
 bool isUiType(ModuleType type)
 {
+    // 两种 UI 模块都会拥有菜单项和 Dock。
     return type == ModuleType::InProcessUi || type == ModuleType::ProcessUi;
 }
 
 bool isProcessType(ModuleType type)
 {
+    // 只有子进程类型能响应“重新启动”操作。
     return type == ModuleType::ProcessUi || type == ModuleType::ProcessNonUi;
 }
 
+// 从系统主题取图标，找不到时使用 Qt 标准图标作为跨机器回退。
 QIcon themedIcon(QWidget* widget,
                  const QString& themeName,
                  QStyle::StandardPixmap fallback)
 {
+    // 优先使用系统主题图标，找不到时回退 Qt 标准图标，保证按钮始终可见。
     QIcon icon = QIcon::fromTheme(themeName);
     if (icon.isNull())
         icon = widget->style()->standardIcon(fallback);
@@ -47,6 +55,7 @@ QIcon themedIcon(QWidget* widget,
 }
 }
 
+// 创建主窗口静态控件和模块占位页，并连接三类管理器的状态信号。
 MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
                        PluginManager* pluginManager,
                        ProcessSupervisor* processSupervisor,
@@ -62,6 +71,7 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
       statusSummaryLabel_(new QLabel(this)),
       saveLayoutAction_(nullptr)
 {
+    // 先建立模块状态快照，再创建依赖这些状态的菜单和 Dock。
     setObjectName(QStringLiteral("QFrameworkMainWindow"));
     setWindowTitle(QStringLiteral("QFramework"));
     setDockNestingEnabled(true);
@@ -89,6 +99,7 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
             &ModuleManagerDialog::restartModuleRequested,
             this,
             &MainWindow::onRestartModuleRequested);
+    // 主进程插件和子进程监督器使用同一个状态槽，UI 表现保持一致。
     if (pluginManager_ != nullptr) {
         connect(pluginManager_,
                 &PluginManager::moduleStateChanged,
@@ -111,10 +122,13 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
     }
 }
 
+// 子控件和借用管理器均由 Qt/FrameworkRuntime 按父子及依赖顺序回收。
 MainWindow::~MainWindow() = default;
 
+// 把已成功加载的主进程 QWidget 替换对应占位页并登记为可用。
 void MainWindow::attachInProcessUiModules()
 {
+    // QPluginLoader 拥有模块对象；Dock 只是临时成为 QWidget 父容器。
     if (pluginManager_ == nullptr)
         return;
     for (const ModuleConfig& module : modules_) {
@@ -126,6 +140,7 @@ void MainWindow::attachInProcessUiModules()
             continue;
 
         QWidget* previousWidget = dockWidget->widget();
+        // 替换加载占位符，旧占位符延迟删除以尊重当前事件循环。
         dockWidget->setWidget(widget);
         if (previousWidget != nullptr && previousWidget != widget)
             previousWidget->deleteLater();
@@ -133,8 +148,10 @@ void MainWindow::attachInProcessUiModules()
     }
 }
 
+// 插件 DLL 卸载前移除 QWidget 父关系并换回占位页，避免 DLL 中代码悬空。
 void MainWindow::releaseInProcessUiModules()
 {
+    // DLL 卸载前必须把插件 QWidget 从 Dock 取出并清除 Qt parent。
     if (pluginManager_ == nullptr)
         return;
     for (const ModuleConfig& module : modules_) {
@@ -155,10 +172,12 @@ void MainWindow::releaseInProcessUiModules()
     }
 }
 
+// 委托布局管理器恢复文件，再按当前 UI 可用性隐藏失效 Dock。
 bool MainWindow::loadLayoutFile(const QString& filePath,
                                 QString* errorMessage,
                                 QStringList* unavailableModuleIds)
 {
+    // LayoutManager 可能恢复了不可用模块的 visible 状态，这里再次按运行状态修正。
     const bool loaded = layoutManager_->loadLayout(
         filePath, errorMessage, unavailableModuleIds);
     if (!loaded)
@@ -172,27 +191,36 @@ bool MainWindow::loadLayoutFile(const QString& filePath,
     return true;
 }
 
+// 返回由 MainWindow 拥有的 LayoutManager 借用指针。
 LayoutManager* MainWindow::layoutManager() const
 {
+    // LayoutManager 生命周期跟随 MainWindow，调用方不得删除。
     return layoutManager_;
 }
 
+// 显示单例非模态模块管理对话框。
 void MainWindow::showModuleManager()
 {
+    // 非模态对话框可重复 show/raise，不创建多个实例。
     moduleManagerDialog_->show();
     moduleManagerDialog_->raise();
     moduleManagerDialog_->activateWindow();
 }
 
+// 从 QAction 动态属性解析 moduleId，复用统一显示入口。
 void MainWindow::onModuleActionTriggered()
 {
+    // 每个 QAction 的动态属性保存 moduleId，避免为每个模块创建专用槽。
     QAction* action = qobject_cast<QAction*>(sender());
     if (action != nullptr)
         showModule(action->property("moduleId").toString());
 }
 
+// 把 Dock 的可见性变化反映到对应菜单勾选状态。
 void MainWindow::onDockVisibilityChanged(bool visible)
 {
+    // Dock 的关闭按钮只改变可见性；同步菜单勾选状态时阻塞 action 信号，
+    // 防止 setChecked 反向再次触发 showModule。
     ManagedDockWidget* dockWidget = qobject_cast<ManagedDockWidget*>(sender());
     if (dockWidget == nullptr)
         return;
@@ -204,13 +232,17 @@ void MainWindow::onDockVisibilityChanged(bool visible)
     }
 }
 
+// 处理管理对话框的显示请求。
 void MainWindow::onShowModuleRequested(const QString& moduleId)
 {
+    // 管理对话框和菜单最终复用同一个 showModule 规则。
     showModule(moduleId);
 }
 
+// 处理管理对话框的子进程重启请求并统一呈现错误。
 void MainWindow::onRestartModuleRequested(const QString& moduleId)
 {
+    // restart 内部有超时；失败统一通过日志和对话框报告。
     if (processSupervisor_ == nullptr)
         return;
     QString error;
@@ -218,10 +250,12 @@ void MainWindow::onRestartModuleRequested(const QString& moduleId)
         reportStateFailure(QString::fromUtf8(u8"子进程重启失败"), error);
 }
 
+// 接收插件/监督器状态，更新表格、占位页和状态栏快照。
 void MainWindow::onModuleStateChanged(const QString& moduleId,
                                       const QString& state,
                                       const QString& detail)
 {
+    // 同步三处状态：内部统计、模块管理表格和子进程窗口占位页。
     moduleStates_.insert(moduleId, state);
     moduleManagerDialog_->setModuleState(moduleId, state, detail);
 
@@ -236,15 +270,19 @@ void MainWindow::onModuleStateChanged(const QString& moduleId,
     updateStatusSummary();
 }
 
+// 将监督器最终故障转换成用户可见错误提示。
 void MainWindow::onModuleFault(const QString& moduleId, const QString& detail)
 {
+    // moduleFault 只在自动重启次数耗尽后发出，因此需要用户可见提示。
     reportStateFailure(
         QString::fromUtf8(u8"模块 %1 已停止自动重启").arg(displayName(moduleId)),
         detail);
 }
 
+// 接收子进程原生窗口句柄，完成嵌入并发送尺寸显示命令。
 void MainWindow::onWindowHandleReady(const QString& moduleId, quintptr windowId)
 {
+    // 先包装 HWND，再把容器实际尺寸发回子进程；两步任一失败都恢复占位页。
     ProcessWindowHost* host = processHosts_.value(moduleId, nullptr);
     if (host == nullptr)
         return;
@@ -265,8 +303,10 @@ void MainWindow::onWindowHandleReady(const QString& moduleId, quintptr windowId)
     setUiAvailable(moduleId, true);
 }
 
+// 打开非原生文件选择器，加载用户选择的 .qflayout 并报告不可用模块。
 void MainWindow::loadLayoutFromDialog()
 {
+    // 使用非原生对话框保证测试和不同开发机行为一致。
     const QString filePath = QFileDialog::getOpenFileName(
         this,
         QString::fromUtf8(u8"加载布局"),
@@ -292,8 +332,10 @@ void MainWindow::loadLayoutFromDialog()
     statusBar()->showMessage(QString::fromUtf8(u8"布局已加载：%1").arg(filePath), 5000);
 }
 
+// 保存到当前活动布局；首次保存时转到另存为流程。
 void MainWindow::saveCurrentLayout()
 {
+    // 尚未建立 activeFilePath 时自动转到“另存为”，避免无目标保存。
     if (layoutManager_->activeFilePath().isEmpty()) {
         saveLayoutAs();
         return;
@@ -306,8 +348,10 @@ void MainWindow::saveCurrentLayout()
     statusBar()->showMessage(QString::fromUtf8(u8"当前布局已保存"), 4000);
 }
 
+// 选择新路径并保存布局，必要时自动补齐 .qflayout 后缀。
 void MainWindow::saveLayoutAs()
 {
+    // 用户省略扩展名时自动补 .qflayout，LayoutManager 仍会再次验证。
     QString filePath = QFileDialog::getSaveFileName(
         this,
         QString::fromUtf8(u8"布局另存为"),
@@ -328,8 +372,10 @@ void MainWindow::saveLayoutAs()
     statusBar()->showMessage(QString::fromUtf8(u8"布局已保存：%1").arg(filePath), 5000);
 }
 
+// 选择并应用新的全局 QSS，失败时保留旧样式。
 void MainWindow::selectStyleSheet()
 {
+    // StyleManager 采用成功后替换语义，加载失败不会清掉当前 QSS。
     if (styleManager_ == nullptr)
         return;
     const QString filePath = QFileDialog::getOpenFileName(
@@ -350,8 +396,10 @@ void MainWindow::selectStyleSheet()
     statusBar()->showMessage(QString::fromUtf8(u8"全局样式已切换：%1").arg(filePath), 5000);
 }
 
+// 重新读取最近一次成功的 QSS 文件。
 void MainWindow::reloadStyleSheet()
 {
+    // 重读最近一次成功文件，适合开发时修改样式后快速验证。
     if (styleManager_ == nullptr)
         return;
     QString error;
@@ -362,8 +410,10 @@ void MainWindow::reloadStyleSheet()
     statusBar()->showMessage(QString::fromUtf8(u8"当前 QSS 已重新加载"), 4000);
 }
 
+// 创建文件、模块和样式菜单，并把动作连接到本类槽函数。
 void MainWindow::createActions()
 {
+    // 菜单按文件、模块、样式三组构造；模块菜单项初始禁用，等 UI ready。
     QMenu* fileMenu = menuBar()->addMenu(QString::fromUtf8(u8"文件(&F)"));
     QAction* loadLayoutAction = fileMenu->addAction(
         themedIcon(this, QStringLiteral("document-open"), QStyle::SP_DialogOpenButton),
@@ -386,6 +436,7 @@ void MainWindow::createActions()
     connect(managerAction, &QAction::triggered, this, &MainWindow::showModuleManager);
     moduleMenu->addSeparator();
 
+    // 只给启用的 UI 模块创建可勾选菜单项。
     for (const ModuleConfig& module : modules_) {
         if (!module.enabled || !isUiType(module.type))
             continue;
@@ -410,8 +461,11 @@ void MainWindow::createActions()
 
 }
 
+// 为启用的 UI 模块创建 Dock/占位页，并注册可见性和模块 ID 映射。
 void MainWindow::createModuleDocks()
 {
+    // 每个启用的 UI 模块预先创建 Dock：进程 UI 使用 ProcessWindowHost，
+    // 主进程 UI 先放占位标签，插件启动后再替换。
     ManagedDockWidget* previousDock = nullptr;
     for (const ModuleConfig& module : modules_) {
         if (!module.enabled || !isUiType(module.type))
@@ -421,7 +475,7 @@ void MainWindow::createModuleDocks()
             module.displayName.isEmpty() ? module.id : module.displayName, this);
         dockWidget->setObjectName(QStringLiteral("ModuleDock.%1").arg(module.id));
         dockWidget->setProperty("moduleId", module.id);
-        // Keep enough room for two module docks to be split horizontally.
+        // 保留足够最小尺寸，使两个模块 Dock 水平拆分后仍可操作。
         dockWidget->setMinimumSize(180, 120);
 
         if (module.type == ModuleType::ProcessUi) {
@@ -436,6 +490,7 @@ void MainWindow::createModuleDocks()
             dockWidget->setWidget(placeholder);
         }
 
+        // 初始把多个 Dock 标签化并隐藏，用户或布局文件决定何时显示。
         addDockWidget(Qt::LeftDockWidgetArea, dockWidget);
         if (previousDock != nullptr)
             tabifyDockWidget(previousDock, dockWidget);
@@ -450,8 +505,10 @@ void MainWindow::createModuleDocks()
     }
 }
 
+// 同步菜单、管理对话框和布局注册表中的 UI 可用标志。
 void MainWindow::setUiAvailable(const QString& moduleId, bool available)
 {
+    // 同时更新菜单、管理对话框和布局注册表，避免三处状态不一致。
     uiAvailable_.insert(moduleId, available);
     QAction* action = moduleActions_.value(moduleId, nullptr);
     if (action != nullptr)
@@ -464,8 +521,10 @@ void MainWindow::setUiAvailable(const QString& moduleId, bool available)
     }
 }
 
+// 显示一个已准备好的 Dock；不可用模块请求会被安全忽略。
 void MainWindow::showModule(const QString& moduleId)
 {
+    // 不可用 UI 永远不显示；被用户拖离停靠区时先重新加入主窗口。
     ManagedDockWidget* dockWidget = moduleDocks_.value(moduleId, nullptr);
     if (dockWidget == nullptr || !uiAvailable_.value(moduleId, false))
         return;
@@ -475,8 +534,10 @@ void MainWindow::showModule(const QString& moduleId)
     dockWidget->raise();
 }
 
+// 重新计算状态栏“运行中/启用总数”摘要。
 void MainWindow::updateStatusSummary()
 {
+    // 状态栏分母只统计 enabled 模块，分子只统计精确 Running 状态。
     int enabledCount = 0;
     int runningCount = 0;
     for (const ModuleConfig& module : modules_) {
@@ -490,8 +551,10 @@ void MainWindow::updateStatusSummary()
         QString::fromUtf8(u8"运行中 %1 / %2").arg(runningCount).arg(enabledCount));
 }
 
+// 同时写错误日志并弹出一次用户提示，保证故障既可见又可追溯。
 void MainWindow::reportStateFailure(const QString& title, const QString& detail)
 {
+    // 故障同时写集中日志和显示一次用户提示，便于事后追踪。
     Logger::instance().log(
         LogLevel::Error,
         QStringLiteral("QFrameworkApp"),
@@ -499,15 +562,19 @@ void MainWindow::reportStateFailure(const QString& title, const QString& detail)
     QMessageBox::warning(this, title, detail);
 }
 
+// 取配置 DisplayName；为空时回退稳定 moduleId。
 QString MainWindow::displayName(const QString& moduleId) const
 {
+    // 未配置 DisplayName 时回退稳定 moduleId。
     const ModuleConfig module = modulesById_.value(moduleId);
     return module.displayName.isEmpty() ? moduleId : module.displayName;
 }
 
+// 生成占位页的两行文本：模块显示名 + 当前生命周期原因。
 QString MainWindow::placeholderText(const QString& moduleId,
                                     const QString& detail) const
 {
+    // 两行格式让占位页同时显示模块名和当前原因。
     return QString::fromUtf8(u8"%1\n%2").arg(displayName(moduleId), detail);
 }
 }

@@ -15,15 +15,5 @@ class QFRAMEWORK_EXPORT ManagedDockWidget : public QDockWidget
 public:
     explicit ManagedDockWidget(const QString& title,
                                QMainWindow* mainWindow);
-
-private slots:
-    void onDockLocationChanged(Qt::DockWidgetArea area);
-    void onTopLevelChanged(bool topLevel);
-    void restoreDocking();
-
-private:
-    QMainWindow* mainWindow_;
-    Qt::DockWidgetArea lastDockArea_;
-    bool restoringDock_;
 };
 }

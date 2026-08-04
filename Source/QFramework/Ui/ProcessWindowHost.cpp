@@ -18,7 +18,7 @@ ProcessWindowHost::ProcessWindowHost(QWidget* parent)
     placeholderLabel_->setObjectName(QStringLiteral("ProcessWindowPlaceholder"));
     stackedLayout_->setContentsMargins(0, 0, 0, 0);
     stackedLayout_->addWidget(placeholderLabel_);
-    setMinimumSize(320, 180);
+    setMinimumSize(180, 120);
 }
 
 ProcessWindowHost::~ProcessWindowHost()

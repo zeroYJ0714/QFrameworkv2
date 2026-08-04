@@ -433,7 +433,8 @@ void MainWindow::createModuleDocks()
             module.displayName.isEmpty() ? module.id : module.displayName, this);
         dockWidget->setObjectName(QStringLiteral("ModuleDock.%1").arg(module.id));
         dockWidget->setProperty("moduleId", module.id);
-        dockWidget->setMinimumSize(320, 180);
+        // Keep enough room for two module docks to be split horizontally.
+        dockWidget->setMinimumSize(180, 120);
 
         if (module.type == ModuleType::ProcessUi) {
             ProcessWindowHost* host = new ProcessWindowHost(dockWidget);

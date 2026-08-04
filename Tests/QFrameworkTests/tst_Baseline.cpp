@@ -936,6 +936,7 @@ void BaselineTest::layoutPersistenceAndDockingRules()
     QMainWindow window;
     window.setObjectName(QStringLiteral("LayoutTestWindow"));
     window.resize(900, 600);
+    window.setDockNestingEnabled(true);
     qframework::ManagedDockWidget firstDock(QStringLiteral("First"), &window);
     qframework::ManagedDockWidget secondDock(QStringLiteral("Second"), &window);
     firstDock.setObjectName(QStringLiteral("ModuleDock.First"));
@@ -981,10 +982,22 @@ void BaselineTest::layoutPersistenceAndDockingRules()
     QVERIFY(!secondDock.isVisible());
     QCOMPARE(manager.activeFilePath(), QFileInfo(layoutPath).absoluteFilePath());
 
-    firstDock.setFloating(true);
+    QVERIFY(firstDock.features().testFlag(QDockWidget::DockWidgetMovable));
+    QVERIFY(!firstDock.features().testFlag(QDockWidget::DockWidgetFloatable));
+
+    window.addDockWidget(Qt::LeftDockWidgetArea, &secondDock);
+    secondDock.show();
     QCoreApplication::processEvents();
-    QVERIFY(!firstDock.isFloating());
+
+    window.splitDockWidget(&firstDock, &secondDock, Qt::Horizontal);
+    QCoreApplication::processEvents();
+
+    QVERIFY(window.tabifiedDockWidgets(&firstDock).isEmpty());
     QCOMPARE(window.dockWidgetArea(&firstDock), Qt::LeftDockWidgetArea);
+    QCOMPARE(window.dockWidgetArea(&secondDock), Qt::LeftDockWidgetArea);
+
+    window.tabifyDockWidget(&firstDock, &secondDock);
+    QVERIFY(window.tabifiedDockWidgets(&firstDock).contains(&secondDock));
 
     const QByteArray stateBeforeFailure = window.saveState(1);
     const QString activeBeforeFailure = manager.activeFilePath();

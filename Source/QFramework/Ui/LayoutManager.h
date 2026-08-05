@@ -26,11 +26,14 @@ public:
 
     // save 使用 QSaveFile 原子提交，失败不会破坏原布局文件。
     bool saveLayout(const QString& filePath,
+                    const QHash<QString, bool>& requestedVisibility,
                     QString* errorMessage = nullptr);
     // load 先完整校验；Qt restore 失败会回滚 geometry/state/visibility。
     bool loadLayout(const QString& filePath,
+                    QHash<QString, bool>* requestedVisibility,
                     QString* errorMessage = nullptr,
-                    QStringList* unavailableModuleIds = nullptr);
+                    QStringList* unavailableModuleIds = nullptr,
+                    bool* legacyVisibilitySemantics = nullptr);
 
     // 最近一次成功保存或加载的绝对路径。
     QString activeFilePath() const;

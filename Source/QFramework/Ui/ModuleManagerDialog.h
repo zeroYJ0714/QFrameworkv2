@@ -30,6 +30,8 @@ public:
                         const QString& detail);
     // 只有真实 QWidget/子进程窗口已准备好时才允许“显示”。
     void setUiAvailable(const QString& moduleId, bool available);
+    // 异步 stop/restart 期间锁住对应按钮，最终信号到达后恢复。
+    void setRestartBusy(const QString& moduleId, bool busy);
 
 signals:
     // 控制请求由 MainWindow 接收，保持 UI 展示层和运行时管理层解耦。
@@ -43,10 +45,14 @@ private slots:
 
 private:
     QString moduleTypeText(ModuleType type) const;
+    void updateRestartButton(const QString& moduleId);
 
     // rows_ 加速状态定位；showButtons_ 用于动态启用 UI 操作。
     QTableWidget* tableWidget_;
     QHash<QString, int> rows_;
     QHash<QString, QToolButton*> showButtons_;
+    QHash<QString, QToolButton*> restartButtons_;
+    QHash<QString, QString> moduleStates_;
+    QHash<QString, bool> restartBusy_;
 };
 }

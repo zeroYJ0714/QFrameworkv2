@@ -1,7 +1,10 @@
 #include "FrameworkRuntime.h"
 
 #include <QApplication>
+#include <QDebug>
 #include <QMessageBox>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QObject>
 
 #include "../Process/ProcessSupervisor.h"
@@ -16,6 +19,41 @@
 
 namespace qframework
 {
+namespace
+{
+QMutex failFastMutex;
+ProcessFailFast::Handler failFastHandler = nullptr;
+}
+
+bool ProcessFailFast::requestForHungModules(const QStringList& moduleIds)
+{
+    QStringList uniqueIds = moduleIds;
+    uniqueIds.removeDuplicates();
+    if (uniqueIds.isEmpty())
+        return false;
+    const QString reason = QString::fromUtf8(
+        u8"应用退出时主进程模块消息回调未结束，无法安全卸载 DLL：%1")
+        .arg(uniqueIds.join(QStringLiteral(", ")));
+    Handler handler = nullptr;
+    {
+        QMutexLocker locker(&failFastMutex);
+        handler = failFastHandler;
+    }
+    if (handler != nullptr) {
+        handler(reason);
+        return true;
+    }
+    // qFatal 是整个主进程的隔离边界；此路径只在应用本来已经退出时使用。
+    qFatal("%s", qPrintable(reason));
+    return true;
+}
+
+void ProcessFailFast::setHandlerForTests(Handler handler)
+{
+    QMutexLocker locker(&failFastMutex);
+    failFastHandler = handler;
+}
+
 // 只保存 QApplication 借用指针并初始化所有可选组件为空，实际资源在 initialize 创建。
 FrameworkRuntime::FrameworkRuntime(QApplication* application)
     : application_(application),
@@ -24,6 +62,7 @@ FrameworkRuntime::FrameworkRuntime(QApplication* application)
       processSupervisor_(nullptr),
       styleManager_(nullptr),
       mainWindow_(nullptr),
+      shownStartupWarningCount_(0),
       initialized_(false),
       loggerStarted_(false),
       shutdownComplete_(false)
@@ -63,7 +102,7 @@ bool FrameworkRuntime::initialize(const QString& configFilePath,
             &error)) {
         if (errorMessage != nullptr)
             *errorMessage = error;
-            return false;
+        return false;
     }
     // Logger 必须在创建 MessageBus、插件和子进程监督器之前启动，保证这些
     // 对象在初始化阶段产生的诊断也能进入同一个异步日志队列。
@@ -82,6 +121,16 @@ bool FrameworkRuntime::initialize(const QString& configFilePath,
                      &StyleManager::styleSheetChanged,
                      processSupervisor_,
                      &ProcessSupervisor::applyStyleSheet);
+    QObject::connect(
+        processSupervisor_,
+        &ProcessSupervisor::startupBatchFinished,
+        processSupervisor_,
+        [this](const QStringList& errors) {
+            appendStartupWarnings(errors);
+            if (messageBus_ != nullptr)
+                messageBus_->setDeliveryEnabled(true);
+            showPendingStartupWarnings();
+        });
     // 样式更新由主进程广播给已连接的 UI 子进程。
 
     const QString styleFilePath = config_.style().file;
@@ -99,9 +148,8 @@ bool FrameworkRuntime::initialize(const QString& configFilePath,
 
     moduleErrors.clear();
     processSupervisor_->startAll(config_.modules(), &moduleErrors);
-    appendStartupWarnings(moduleErrors);
-    messageBus_->setDeliveryEnabled(true);
-    // 所有模块完成注册后才统一放开消息投递，避免启动顺序造成丢消息。
+    // 子进程启动已经改成异步批次；即时 errors 只说明请求未被接受，最终错误和
+    // MessageBus 投递闸门都由 startupBatchFinished 在事件循环中统一处理。
 
     const QString layoutFilePath = config_.layout().startupFile;
     if (!layoutFilePath.isEmpty()) {
@@ -131,12 +179,7 @@ void FrameworkRuntime::show()
     if (!initialized_ || mainWindow_ == nullptr)
         return;
     mainWindow_->show();
-    if (!startupWarnings_.isEmpty()) {
-        QMessageBox::warning(
-            mainWindow_,
-            QString::fromUtf8(u8"框架启动警告"),
-            startupWarnings_.join(QLatin1Char('\n')));
-    }
+    showPendingStartupWarnings();
 }
 
 // 按“停止消息生产者 -> 解除 UI -> 删除依赖 -> 最后停日志”的反向顺序关闭。
@@ -146,17 +189,27 @@ void FrameworkRuntime::shutdown()
         return;
     shutdownComplete_ = true;
 
-    // 先拒绝新消息并排空输入队列，再停止生产消息的模块。
+    MessageBusStopReport stopReport;
+    // 只在这里执行一次全局队列停止；PluginManager 和 MessageBus 析构不重复预算。
     if (messageBus_ != nullptr) {
         messageBus_->beginShutdown();
-        messageBus_->stopQueues(config_.messageBus().shutdownDrainTimeoutMs);
+        stopReport = messageBus_->stopQueues(
+            config_.messageBus().shutdownDrainTimeoutMs);
     }
     if (processSupervisor_ != nullptr)
         processSupervisor_->shutdown();
     if (mainWindow_ != nullptr)
         mainWindow_->releaseInProcessUiModules();
-    if (pluginManager_ != nullptr)
-        pluginManager_->shutdown(config_.messageBus().shutdownDrainTimeoutMs);
+    QStringList quarantinedPluginIds;
+    if (pluginManager_ != nullptr) {
+        quarantinedPluginIds = pluginManager_->shutdown(
+            stopReport.timedOutModuleIds);
+    }
+
+    QStringList unsafeModuleIds = quarantinedPluginIds;
+    if (messageBus_ != nullptr)
+        unsafeModuleIds.append(messageBus_->quarantinedModuleIds());
+    unsafeModuleIds.removeDuplicates();
 
     // 按照“使用者先删、被使用者后删”的顺序释放对象。
     delete mainWindow_;
@@ -167,8 +220,13 @@ void FrameworkRuntime::shutdown()
     pluginManager_ = nullptr;
     delete styleManager_;
     styleManager_ = nullptr;
-    delete messageBus_;
-    messageBus_ = nullptr;
+    if (unsafeModuleIds.isEmpty()) {
+        delete messageBus_;
+        messageBus_ = nullptr;
+    } else {
+        // 仍在 onMessage 的线程会继续借用 MessageBus/endpoint；进程终止前故意保留。
+        messageBus_ = nullptr;
+    }
 
     if (loggerStarted_) {
         Logger::instance().uninstallQtMessageHandler();
@@ -178,6 +236,7 @@ void FrameworkRuntime::shutdown()
         loggerStarted_ = false;
     }
     initialized_ = false;
+    ProcessFailFast::requestForHungModules(unsafeModuleIds);
 }
 
 // 返回 MainWindow 借用指针，主要供入口和自动化测试访问。
@@ -193,9 +252,25 @@ void FrameworkRuntime::appendStartupWarnings(const QStringList& warnings)
     for (const QString& warning : warnings) {
         if (warning.isEmpty())
             continue;
+        if (startupWarnings_.contains(warning))
+            continue;
         startupWarnings_.append(warning);
         Logger::instance().log(
             LogLevel::Error, QStringLiteral("QFrameworkApp"), warning);
     }
+}
+
+// 主窗口已经显示时补充呈现异步启动错误；用索引避免同一警告重复弹出。
+void FrameworkRuntime::showPendingStartupWarnings()
+{
+    if (mainWindow_ == nullptr || !mainWindow_->isVisible() ||
+        shownStartupWarningCount_ >= startupWarnings_.size()) {
+        return;
+    }
+    const QStringList pending = startupWarnings_.mid(shownStartupWarningCount_);
+    shownStartupWarningCount_ = startupWarnings_.size();
+    QMessageBox::warning(mainWindow_,
+                         QString::fromUtf8(u8"框架启动警告"),
+                         pending.join(QLatin1Char('\n')));
 }
 }

@@ -3,7 +3,6 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
-#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QLocalServer>
@@ -15,7 +14,6 @@
 #include <QSharedMemory>
 #include <QThread>
 #include <QUuid>
-#include <QWaitCondition>
 
 #include <cstring>
 
@@ -45,6 +43,7 @@ const QString kStop = QStringLiteral("stop");
 const QString kStopAck = QStringLiteral("stopAck");
 const QString kWindowReady = QStringLiteral("windowReady");
 const QString kShowWindow = QStringLiteral("showWindow");
+const QString kResizeWindow = QStringLiteral("resizeWindow");
 const QString kWindowWidth = QStringLiteral("windowWidth");
 const QString kWindowHeight = QStringLiteral("windowHeight");
 const QString kSharedAck = QStringLiteral("sharedAck");
@@ -251,7 +250,6 @@ struct ProcessSupervisor::Entry
     // outgoingQueue 只保存尚未写入 Socket 的消息。它按主题计数，
     // Latest 满时只会删除同主题最旧的等待项。
     QMutex outgoingMutex;
-    QWaitCondition outgoingChanged;
     QQueue<OutgoingMessage> outgoingQueue;
     // 已经写入 Socket、但还没有收到子进程 deliveryAck 的数量。
     // 在途数量也受每个主题的 QueueCapacity 限制，防止 Socket 缓冲无限堆积。
@@ -263,6 +261,7 @@ struct ProcessSupervisor::Entry
     // Latest 覆盖和 Reliable 拒绝的累计计数，仅用于诊断/测试。
     quint64 outgoingDropped = 0;
     quint64 outgoingRejected = 0;
+    quint64 outgoingAbandoned = 0;
     qint64 lastOutgoingWarningMs = 0;
     int outgoingInFlightCount = 0;
     // true 表示已经投递了一个合并后的 drainChildQueue 唤醒事件。
@@ -270,18 +269,21 @@ struct ProcessSupervisor::Entry
     bool outgoingWakeScheduled = false;
     bool outgoingAccepting = false;
     bool outgoingStopping = false;
-    // 下列时间均为统一毫秒时基，用于注册、心跳和延迟重启判断。
-    qint64 registrationDeadlineMs = 0;
+    // 每个 Entry 自己持有 deadline；A 的停止预算不会被 B 的状态转换重置。
+    QDeadlineTimer startupDeadline;
+    QDeadlineTimer stopDeadline;
     qint64 lastPongMs = 0;
     qint64 lastPingMs = 0;
     qint64 restartAtMs = 0;
     qint64 restartWindowStartMs = 0;
     int restartCount = 0;
-    // 生命周期布尔值把协议阶段与对外 state 文本分开，便于快速分支判断。
-    bool registered = false;
-    bool running = false;
-    bool stopping = false;
-    bool faulted = false;
+    LifecyclePhase phase = LifecyclePhase::Stopped;
+    StopPurpose stopPurpose = StopPurpose::None;
+    quint64 generation = 0;
+    quint64 outgoingSummaryGeneration = 0;
+    int stopEscalation = 0;
+    bool pendingStart = false;
+    bool operationBusy = false;
     bool stopAcknowledged = false;
 };
 
@@ -295,7 +297,9 @@ ProcessSupervisor::ProcessSupervisor(MessageBus* messageBus,
       messageBusConfig_(messageBusConfig),
       processConfig_(processConfig),
       supervisionTimer_(new QTimer(this)),
-      shuttingDown_(false)
+      shuttingDown_(false),
+      startupBatchActive_(false),
+      startupBatchSignalScheduled_(false)
 {
     const int interval = qMax(50, qMin(processConfig_.heartbeatIntervalMs, 250));
     supervisionTimer_->setInterval(interval);
@@ -312,43 +316,64 @@ ProcessSupervisor::~ProcessSupervisor()
     entries_.clear();
 }
 
-// 筛选进程型配置、为每个模块建立 Entry，并逐个等待注册/启动结果。
+// 筛选进程型配置并并行提交启动；最终结果由 startupBatchFinished 异步报告。
 bool ProcessSupervisor::startAll(const QVector<ModuleConfig>& modules,
-                                 QStringList* errors)
+                                  QStringList* errors)
 {
+    if (errors != nullptr)
+        errors->clear();
+    if (startupBatchActive_) {
+        if (errors != nullptr)
+            errors->append(QString::fromUtf8(u8"已有一批子进程正在启动"));
+        return false;
+    }
     shuttingDown_ = false;
     if (!supervisionTimer_->isActive())
         supervisionTimer_->start();
-    bool allSucceeded = true;
+    startupBatchActive_ = true;
+    startupPendingModules_.clear();
+    startupErrors_.clear();
+    bool allAccepted = true;
     for (const ModuleConfig& config : modules) {
         if (!config.enabled || !isProcessType(config.type))
             continue;
         if (findEntry(config.id) != nullptr) {
-            allSucceeded = false;
+            allAccepted = false;
+            const QString detail = QString::fromUtf8(u8"子进程模块 ID 重复：%1").arg(config.id);
+            startupErrors_.append(detail);
             if (errors != nullptr)
-                errors->append(QString::fromUtf8(u8"子进程模块 ID 重复：%1").arg(config.id));
+                errors->append(detail);
             continue;
         }
         Entry* entry = new Entry;
         entry->config = config;
         entries_.append(entry);
+        startupPendingModules_.insert(config.id);
         QString error;
-        const int waitTimeout = qMax(1000,
-                                     processConfig_.registrationTimeoutMs +
-                                     (config.waitForDebugger
-                                          ? config.debuggerWaitTimeoutMs
-                                          : 0) + 1000);
-        if (!startEntry(entry, &error) || !waitForRunning(entry, waitTimeout, &error)) {
-            allSucceeded = false;
+        if (!beginStartEntry(entry, &error)) {
+            allAccepted = false;
             if (errors != nullptr)
                 errors->append(error);
         }
     }
-    return allSucceeded;
+    scheduleStartupBatchFinished();
+    return allAccepted;
 }
 
-// 正常停止先关闭消息入口，再发送 stop 并在有限时间内等待 stopAck/退出。
+// 兼容入口现在只提交异步停止请求。
 bool ProcessSupervisor::stop(const QString& moduleId, QString* errorMessage)
+{
+    return requestStop(moduleId, errorMessage);
+}
+
+// 兼容入口现在只提交异步重启请求。
+bool ProcessSupervisor::restart(const QString& moduleId, QString* errorMessage)
+{
+    return requestRestart(moduleId, errorMessage);
+}
+
+// 停止请求关闭入口并发送 stop 后立即返回，QProcess 信号继续推进状态。
+bool ProcessSupervisor::requestStop(const QString& moduleId, QString* errorMessage)
 {
     Entry* entry = findEntry(moduleId);
     if (entry == nullptr) {
@@ -356,87 +381,56 @@ bool ProcessSupervisor::stop(const QString& moduleId, QString* errorMessage)
             *errorMessage = QString::fromUtf8(u8"未找到子进程模块：%1").arg(moduleId);
         return false;
     }
-    if (entry->process == nullptr || entry->process->state() == QProcess::NotRunning) {
-        destroyRuntime(entry);
-        entry->faulted = false;
-        entry->stopping = false;
-        entry->restartAtMs = 0;
-        emitState(entry, QStringLiteral("Stopped"), QString());
-        return true;
+    if (isStoppingPhase(entry->phase) || entry->phase == LifecyclePhase::RestartDelay) {
+        if (errorMessage != nullptr)
+            *errorMessage = QString::fromUtf8(u8"模块操作正在进行：%1").arg(moduleId);
+        return false;
     }
-
-    entry->stopping = true;
-    emitState(entry, QStringLiteral("Stopping"), QString());
-    if (entry->socket != nullptr && entry->socket->state() == QLocalSocket::ConnectedState) {
-        QJsonObject frame;
-        frame.insert(QStringLiteral("type"), kStop);
-        sendFrame(entry, frame);
-    }
-
-    QElapsedTimer timer;
-    timer.start();
-    const int timeout = qMax(1, processConfig_.stopTimeoutMs);
-    while (entry->process != nullptr &&
-           entry->process->state() != QProcess::NotRunning &&
-           timer.elapsed() < timeout) {
-        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
-        QThread::msleep(2);
-    }
-    bool graceful = entry->process == nullptr ||
-                    entry->process->state() == QProcess::NotRunning;
-    if (!graceful && entry->process != nullptr) {
-        entry->process->terminate();
-        if (!entry->process->waitForFinished(250))
-            entry->process->kill();
-        entry->process->waitForFinished(1000);
-        graceful = false;
-    }
-    destroyRuntime(entry);
-    entry->faulted = false;
-    entry->restartAtMs = 0;
-    emitState(entry, QStringLiteral("Stopped"), graceful ? QString() : QString::fromUtf8(u8"停止超时，已强制结束"));
-    if (!graceful && errorMessage != nullptr)
-        *errorMessage = QString::fromUtf8(u8"子进程停止超时");
-    return graceful;
+    entry->pendingStart = false;
+    entry->lastError.clear();
+    setOperationBusy(entry, true);
+    beginStopEntry(entry, StopPurpose::Stop);
+    return true;
 }
 
-// 手动重启复用正常 stop，清空自动重启计数后重新创建全部运行时资源。
-bool ProcessSupervisor::restart(const QString& moduleId, QString* errorMessage)
+// 手动重启只启动状态转换；重复点击不会创建第二轮 generation。
+bool ProcessSupervisor::requestRestart(const QString& moduleId, QString* errorMessage)
 {
     Entry* entry = findEntry(moduleId);
-    if (entry == nullptr)
+    if (entry == nullptr) {
+        if (errorMessage != nullptr)
+            *errorMessage = QString::fromUtf8(u8"未找到子进程模块：%1").arg(moduleId);
         return false;
-    stop(moduleId, errorMessage);
+    }
+    if (shuttingDown_ || entry->operationBusy ||
+        (entry->phase != LifecyclePhase::Running &&
+         entry->phase != LifecyclePhase::Failed &&
+         entry->phase != LifecyclePhase::Stopped)) {
+        if (errorMessage != nullptr)
+            *errorMessage = QString::fromUtf8(u8"模块操作正在进行：%1").arg(moduleId);
+        return false;
+    }
     entry->restartCount = 0;
     entry->restartWindowStartMs = 0;
     entry->restartAtMs = 0;
-    entry->faulted = false;
-    QString error;
-    if (!startEntry(entry, &error) || !waitForRunning(entry,
-                                                       qMax(1000,
-                                                            processConfig_.registrationTimeoutMs +
-                                                            (entry->config.waitForDebugger
-                                                                 ? entry->config.debuggerWaitTimeoutMs
-                                                                 : 0) + 1000),
-                                                       &error)) {
-        if (errorMessage != nullptr)
-            *errorMessage = error;
-        return false;
+    entry->lastError.clear();
+    entry->pendingStart = true;
+    setOperationBusy(entry, true);
+    if (entry->process != nullptr &&
+        entry->process->state() != QProcess::NotRunning) {
+        beginStopEntry(entry, StopPurpose::ManualRestart);
+    } else {
+        destroyRuntime(entry);
+        entry->stopPurpose = StopPurpose::ManualRestart;
+        entry->phase = LifecyclePhase::RestartDelay;
+        entry->restartAtMs = QDateTime::currentMSecsSinceEpoch();
+        emitState(entry, QStringLiteral("Restarting"), QString::fromUtf8(u8"已排队手动重启"));
     }
     return true;
 }
 
-// 无尺寸重载沿用协议默认值，便于只请求“显示”而不调整客户区。
+// 无尺寸重载只请求子进程第一次显示，不携带宿主尺寸。
 bool ProcessSupervisor::showWindow(const QString& moduleId, QString* errorMessage)
-{
-    return showWindow(moduleId, 0, 0, errorMessage);
-}
-
-// 向正在运行的 ProcessUi 发送显示命令和可选客户区尺寸。
-bool ProcessSupervisor::showWindow(const QString& moduleId,
-                                   int width,
-                                   int height,
-                                   QString* errorMessage)
 {
     Entry* entry = findEntry(moduleId);
     if (entry == nullptr) {
@@ -449,7 +443,7 @@ bool ProcessSupervisor::showWindow(const QString& moduleId,
             *errorMessage = QString::fromUtf8(u8"模块不是子进程 UI：%1").arg(moduleId);
         return false;
     }
-    if (!entry->registered || !entry->running) {
+    if (entry->phase != LifecyclePhase::Running) {
         if (errorMessage != nullptr)
             *errorMessage = QString::fromUtf8(u8"子进程 UI 尚未就绪：%1").arg(moduleId);
         return false;
@@ -457,14 +451,64 @@ bool ProcessSupervisor::showWindow(const QString& moduleId,
 
     QJsonObject frame;
     frame.insert(QStringLiteral("type"), kShowWindow);
-    if (width > 0 && height > 0) {
-        frame.insert(kWindowWidth, width);
-        frame.insert(kWindowHeight, height);
-    }
     if (sendFrame(entry, frame))
         return true;
+    handleFault(entry, QString::fromUtf8(u8"子进程窗口显示控制帧发送失败"));
     if (errorMessage != nullptr)
         *errorMessage = QString::fromUtf8(u8"无法向子进程发送窗口显示请求：%1").arg(moduleId);
+    return false;
+}
+
+// 带尺寸的兼容入口按两个有序控制帧发送；尺寸调整不会重复调用 QWidget::show()。
+bool ProcessSupervisor::showWindow(const QString& moduleId,
+                                    int width,
+                                    int height,
+                                    QString* errorMessage)
+{
+    if (!showWindow(moduleId, errorMessage))
+        return false;
+    if (width <= 0 || height <= 0)
+        return true;
+    return resizeWindow(moduleId, width, height, errorMessage);
+}
+
+// 向正在运行的 ProcessUi 发送独立尺寸控制帧；失败才进入子进程故障路径。
+bool ProcessSupervisor::resizeWindow(const QString& moduleId,
+                                      int width,
+                                      int height,
+                                      QString* errorMessage)
+{
+    Entry* entry = findEntry(moduleId);
+    if (entry == nullptr) {
+        if (errorMessage != nullptr)
+            *errorMessage = QString::fromUtf8(u8"未找到子进程模块：%1").arg(moduleId);
+        return false;
+    }
+    if (entry->config.type != ModuleType::ProcessUi) {
+        if (errorMessage != nullptr)
+            *errorMessage = QString::fromUtf8(u8"模块不是子进程 UI：%1").arg(moduleId);
+        return false;
+    }
+    if (width <= 0 || height <= 0) {
+        if (errorMessage != nullptr)
+            *errorMessage = QString::fromUtf8(u8"子进程窗口尺寸必须为正：%1").arg(moduleId);
+        return false;
+    }
+    if (entry->phase != LifecyclePhase::Running) {
+        if (errorMessage != nullptr)
+            *errorMessage = QString::fromUtf8(u8"子进程 UI 尚未就绪：%1").arg(moduleId);
+        return false;
+    }
+
+    QJsonObject frame;
+    frame.insert(QStringLiteral("type"), kResizeWindow);
+    frame.insert(kWindowWidth, width);
+    frame.insert(kWindowHeight, height);
+    if (sendFrame(entry, frame))
+        return true;
+    handleFault(entry, QString::fromUtf8(u8"子进程窗口尺寸控制帧发送失败"));
+    if (errorMessage != nullptr)
+        *errorMessage = QString::fromUtf8(u8"无法向子进程发送窗口尺寸请求：%1").arg(moduleId);
     return false;
 }
 
@@ -475,21 +519,79 @@ bool ProcessSupervisor::terminate(const QString& moduleId)
     if (entry == nullptr || entry->process == nullptr ||
         entry->process->state() == QProcess::NotRunning)
         return false;
-    entry->stopping = false;
     entry->process->kill();
     return true;
 }
 
-// 关闭定时监督，并对全部 Entry 执行一次正常 stop；重复调用直接返回。
+// 先并行发送 stop，再用一个总 QDeadlineTimer 收尾，期间不泵送普通 GUI 事件。
 void ProcessSupervisor::shutdown()
 {
-    if (shuttingDown_ && entries_.isEmpty())
+    if (shuttingDown_)
         return;
     shuttingDown_ = true;
+    startupBatchActive_ = false;
+    startupPendingModules_.clear();
     if (supervisionTimer_ != nullptr)
         supervisionTimer_->stop();
-    for (int index = entries_.size() - 1; index >= 0; --index)
-        stop(entries_.at(index)->config.id, nullptr);
+
+    // 先向全部子进程发 stop，避免逐个等待让后面的模块晚收到停止请求。
+    for (Entry* entry : entries_) {
+        entry->pendingStart = false;
+        beginStopEntry(entry, StopPurpose::Shutdown);
+    }
+
+    // 所有进程共享同一个总预算。轮询只等待 QProcess 自身，不泵送 GUI 事件，
+    // 因而 A 的退出等待不会执行 B 的用户重启槽。
+    QDeadlineTimer totalDeadline(qMax(1, processConfig_.stopTimeoutMs) + 1250);
+    const auto waitForAll = [this, &totalDeadline](int phaseBudgetMs) {
+        const qint64 available = totalDeadline.remainingTime();
+        if (available <= 0 || phaseBudgetMs <= 0)
+            return;
+        QDeadlineTimer phaseDeadline(
+            static_cast<int>(qMin<qint64>(available, phaseBudgetMs)));
+        for (;;) {
+            bool foundRunning = false;
+            for (Entry* entry : entries_) {
+                QProcess* process = entry->process;
+                if (process == nullptr || process->state() == QProcess::NotRunning)
+                    continue;
+                foundRunning = true;
+                const qint64 remaining = qMin(phaseDeadline.remainingTime(),
+                                              totalDeadline.remainingTime());
+                if (remaining <= 0)
+                    return;
+                process->waitForFinished(
+                    static_cast<int>(qMin<qint64>(10, remaining)));
+            }
+            if (!foundRunning || phaseDeadline.hasExpired() || totalDeadline.hasExpired())
+                return;
+        }
+    };
+
+    waitForAll(qMax(1, processConfig_.stopTimeoutMs));
+    for (Entry* entry : entries_) {
+        if (entry->process != nullptr &&
+            entry->process->state() != QProcess::NotRunning)
+            entry->process->terminate();
+    }
+    waitForAll(250);
+    for (Entry* entry : entries_) {
+        if (entry->process != nullptr &&
+            entry->process->state() != QProcess::NotRunning)
+            entry->process->kill();
+    }
+    waitForAll(static_cast<int>(qMax<qint64>(0, totalDeadline.remainingTime())));
+    for (Entry* entry : entries_) {
+        if (entry->process == nullptr ||
+            entry->process->state() == QProcess::NotRunning) {
+            finishEntryAfterProcessExit(entry, QString());
+        } else {
+            entry->pendingStart = false;
+            entry->lastError = QString::fromUtf8(u8"应用退出时子进程在总 deadline 后仍未退出");
+            entry->phase = LifecyclePhase::Failed;
+            emitState(entry, QStringLiteral("Failed"), entry->lastError);
+        }
+    }
 }
 
 // 遍历 Entry 状态生成当前运行模块 ID 快照。
@@ -497,7 +599,7 @@ QStringList ProcessSupervisor::runningModuleIds() const
 {
     QStringList result;
     for (const Entry* entry : entries_) {
-        if (entry->running)
+        if (entry->phase == LifecyclePhase::Running)
             result.append(entry->config.id);
     }
     return result;
@@ -510,17 +612,33 @@ QString ProcessSupervisor::state(const QString& moduleId) const
     return entry == nullptr ? QString() : entry->state;
 }
 
+ProcessQueueStats ProcessSupervisor::queueStats(const QString& moduleId) const
+{
+    ProcessQueueStats result;
+    Entry* entry = findEntry(moduleId);
+    if (entry == nullptr)
+        return result;
+    QMutexLocker locker(&entry->outgoingMutex);
+    result.dropped = entry->outgoingDropped;
+    result.rejected = entry->outgoingRejected;
+    result.abandoned = entry->outgoingAbandoned;
+    result.pending = entry->outgoingQueue.size();
+    result.inFlight = entry->outgoingInFlightCount;
+    return result;
+}
+
 // 保存最新 QSS，并广播给所有已注册且连接正常的 UI 子进程。
 void ProcessSupervisor::applyStyleSheet(const QString& styleSheet)
 {
     styleSheet_ = styleSheet;
     for (Entry* entry : entries_) {
-        if (entry->config.type != ModuleType::ProcessUi || !entry->registered)
+        if (entry->config.type != ModuleType::ProcessUi || !isRegisteredPhase(entry->phase))
             continue;
         QJsonObject frame;
         frame.insert(QStringLiteral("type"), kStyleSheet);
         frame.insert(QStringLiteral("styleSheet"), styleSheet_);
-        sendFrame(entry, frame);
+        if (!sendFrame(entry, frame))
+            handleFault(entry, QString::fromUtf8(u8"子进程样式控制帧发送失败"));
     }
 }
 
@@ -564,16 +682,35 @@ ProcessSupervisor::Entry* ProcessSupervisor::findEntryByProcess(QObject* object)
     return nullptr;
 }
 
-// 为一个 Entry 创建随机服务器名/令牌、QLocalServer 和 QProcess，再等待 Running。
-bool ProcessSupervisor::startEntry(Entry* entry, QString* errorMessage)
+// 为一个 Entry 创建随机服务器名/令牌、QLocalServer 和 QProcess 后立即返回。
+bool ProcessSupervisor::beginStartEntry(Entry* entry, QString* errorMessage)
 {
     if (entry == nullptr)
         return false;
+    if (entry->process != nullptr &&
+        entry->process->state() != QProcess::NotRunning) {
+        const QString detail = QString::fromUtf8(
+            u8"旧子进程尚未退出，拒绝启动下一轮：%1").arg(entry->config.id);
+        if (errorMessage != nullptr)
+            *errorMessage = detail;
+        handleFault(entry, detail);
+        return false;
+    }
     destroyRuntime(entry);
-    entry->state = QStringLiteral("Starting");
+    ++entry->generation;
+    {
+        QMutexLocker locker(&entry->outgoingMutex);
+        // 每个 generation 独立记账；上一轮汇总已在 destroyRuntime 输出。
+        entry->outgoingDropped = 0;
+        entry->outgoingRejected = 0;
+        entry->outgoingAbandoned = 0;
+        entry->lastOutgoingWarningMs = 0;
+    }
+    entry->phase = LifecyclePhase::StartingProcess;
     entry->lastError.clear();
-    entry->faulted = false;
-    entry->stopping = false;
+    entry->stopAcknowledged = false;
+    entry->stopEscalation = 0;
+    entry->pendingStart = false;
     entry->restartAtMs = 0;
     entry->serverName = makeServerName(entry->config.id);
     entry->token = QUuid::createUuid().toString(QUuid::Id128);
@@ -600,6 +737,10 @@ bool ProcessSupervisor::startEntry(Entry* entry, QString* errorMessage)
             this, &ProcessSupervisor::onServerConnection);
 
     entry->process = new QProcess(this);
+    connect(entry->process,
+            &QProcess::started,
+            this,
+            &ProcessSupervisor::onProcessStarted);
     connect(entry->process,
             &QProcess::errorOccurred,
             this,
@@ -634,53 +775,28 @@ bool ProcessSupervisor::startEntry(Entry* entry, QString* errorMessage)
     if (entry->config.waitForDebugger)
         arguments << QStringLiteral("--qframework-wait-for-debugger");
 
-    emitState(entry, QStringLiteral("Starting"), QString());
-    entry->registrationDeadlineMs = QDateTime::currentMSecsSinceEpoch() +
-                                    qMax(1, processConfig_.registrationTimeoutMs);
+    emitState(entry,
+              entry->stopPurpose == StopPurpose::ManualRestart ||
+                      entry->stopPurpose == StopPurpose::AutoRestart
+                  ? QStringLiteral("Restarting") : QStringLiteral("Starting"),
+              QString());
+    entry->startupDeadline = QDeadlineTimer(qMax(1, processConfig_.registrationTimeoutMs));
     entry->lastPongMs = QDateTime::currentMSecsSinceEpoch();
     entry->lastPingMs = 0;
     entry->process->start(entry->config.filePath, arguments);
-    if (!entry->process->waitForStarted(qMin(5000, qMax(1000, processConfig_.registrationTimeoutMs)))) {
-        const QString error = QString::fromUtf8(u8"子进程启动失败：%1")
-            .arg(entry->process->errorString());
-        if (errorMessage != nullptr)
-            *errorMessage = error;
-        handleFault(entry, error);
-        return false;
-    }
     return true;
-}
-
-// 在有限预算内泵送 Qt 事件，等待注册帧和 started；不会使用阻塞队列连接。
-bool ProcessSupervisor::waitForRunning(Entry* entry,
-                                       int timeoutMs,
-                                       QString* errorMessage)
-{
-    if (entry == nullptr)
-        return false;
-    QElapsedTimer timer;
-    timer.start();
-    while (!entry->running && !entry->faulted && timer.elapsed() < timeoutMs) {
-        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
-        QThread::msleep(2);
-    }
-    if (entry->running)
-        return true;
-    const QString detail = entry->lastError.isEmpty()
-        ? QString::fromUtf8(u8"等待子进程注册或启动超时")
-        : entry->lastError;
-    if (errorMessage != nullptr)
-        *errorMessage = detail;
-    return false;
 }
 
 // 编码并写入已连接 Socket；这里只判断写入是否被 Qt 接受。
 bool ProcessSupervisor::sendFrame(Entry* entry, const QJsonObject& frame)
 {
+    Q_ASSERT(QThread::currentThread() == thread());
     if (entry == nullptr || entry->socket == nullptr ||
         entry->socket->state() != QLocalSocket::ConnectedState)
         return false;
-    return entry->socket->write(process::encodeFrame(frame)) >= 0;
+    Q_ASSERT(entry->socket->thread() == QThread::currentThread());
+    const QByteArray encoded = process::encodeFrame(frame);
+    return entry->socket->write(encoded) == encoded.size();
 }
 
 // 接受第一个合法待连接 Socket；同一 Entry 的额外连接立即拒绝。
@@ -727,7 +843,9 @@ void ProcessSupervisor::onSocketReadyRead()
             return;
         }
         handleFrame(entry, frame);
-        if (entry->faulted || entry->stopping)
+        if (isStoppingPhase(entry->phase) ||
+            entry->phase == LifecyclePhase::Failed ||
+            entry->phase == LifecyclePhase::RestartDelay)
             return;
     }
 }
@@ -736,16 +854,26 @@ void ProcessSupervisor::onSocketReadyRead()
 void ProcessSupervisor::onSocketDisconnected()
 {
     Entry* entry = findEntryBySocket(sender());
-    if (entry == nullptr || entry->stopping || entry->faulted || shuttingDown_)
+    if (entry == nullptr || isStoppingPhase(entry->phase) ||
+        entry->phase == LifecyclePhase::Failed ||
+        entry->phase == LifecyclePhase::RestartDelay || shuttingDown_)
         return;
     handleFault(entry, QString::fromUtf8(u8"子进程 IPC 连接断开"));
+}
+
+// QProcess 已启动后进入注册阶段；这里只推进当前 generation。
+void ProcessSupervisor::onProcessStarted()
+{
+    Entry* entry = findEntryByProcess(sender());
+    if (entry != nullptr && entry->phase == LifecyclePhase::StartingProcess)
+        entry->phase = LifecyclePhase::WaitingRegistration;
 }
 
 // 只把无法启动和崩溃升级为监督器故障，其他状态由 finished/Socket 路径处理。
 void ProcessSupervisor::onProcessError(QProcess::ProcessError error)
 {
     Entry* entry = findEntryByProcess(sender());
-    if (entry == nullptr || entry->stopping || entry->faulted || shuttingDown_)
+    if (entry == nullptr || isStoppingPhase(entry->phase) || shuttingDown_)
         return;
     if (error == QProcess::FailedToStart || error == QProcess::Crashed)
         handleFault(entry, QString::fromUtf8(u8"子进程启动或运行失败"));
@@ -755,8 +883,13 @@ void ProcessSupervisor::onProcessError(QProcess::ProcessError error)
 void ProcessSupervisor::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
 {
     Entry* entry = findEntryByProcess(sender());
-    if (entry == nullptr || entry->stopping || entry->faulted || shuttingDown_)
+    if (entry == nullptr)
         return;
+    if (isStoppingPhase(entry->phase) ||
+        entry->stopPurpose != StopPurpose::None || shuttingDown_) {
+        finishEntryAfterProcessExit(entry, entry->lastError);
+        return;
+    }
     const QString detail = exitStatus == QProcess::CrashExit
         ? QString::fromUtf8(u8"子进程异常退出")
         : QString::fromUtf8(u8"子进程退出，代码 %1").arg(exitCode);
@@ -770,7 +903,9 @@ void ProcessSupervisor::handleFrame(Entry* entry, const QJsonObject& frame)
         return;
     const QString type = frame.value(QStringLiteral("type")).toString();
     if (type == kRegister) {
-        if (entry->registered) {
+        if (entry->bridge != nullptr ||
+            (entry->phase != LifecyclePhase::WaitingRegistration &&
+             entry->phase != LifecyclePhase::StartingProcess)) {
             handleFault(entry, QString::fromUtf8(u8"子进程重复注册"));
             return;
         }
@@ -787,8 +922,11 @@ void ProcessSupervisor::handleFrame(Entry* entry, const QJsonObject& frame)
             QJsonObject rejected;
             rejected.insert(QStringLiteral("type"), kRegisterAck);
             rejected.insert(QStringLiteral("accepted"), false);
-            sendFrame(entry, rejected);
-            handleFault(entry, QString::fromUtf8(u8"子进程注册信息校验失败"));
+            handleFault(
+                entry,
+                sendFrame(entry, rejected)
+                    ? QString::fromUtf8(u8"子进程注册信息校验失败")
+                    : QString::fromUtf8(u8"子进程注册拒绝帧发送失败"));
             return;
         }
 
@@ -803,11 +941,18 @@ void ProcessSupervisor::handleFrame(Entry* entry, const QJsonObject& frame)
             QJsonObject rejected;
             rejected.insert(QStringLiteral("type"), kRegisterAck);
             rejected.insert(QStringLiteral("accepted"), false);
-            sendFrame(entry, rejected);
-            handleFault(entry, detailWithPrefix(QString::fromUtf8(u8"子进程注册失败"), busError));
+            handleFault(
+                entry,
+                sendFrame(entry, rejected)
+                    ? detailWithPrefix(QString::fromUtf8(u8"子进程注册失败"), busError)
+                    : QString::fromUtf8(u8"子进程注册失败且拒绝帧发送失败"));
             return;
         }
-        entry->registered = true;
+        entry->phase = LifecyclePhase::WaitingStarted;
+        entry->startupDeadline = QDeadlineTimer(
+            qMax(1, processConfig_.registrationTimeoutMs) +
+            (entry->config.waitForDebugger
+                 ? qMax(1, entry->config.debuggerWaitTimeoutMs) : 0));
         entry->lastPongMs = QDateTime::currentMSecsSinceEpoch();
         // 允许 onStart() 发布，交付是否开始仍由上层统一控制。
         messageBus_->setModuleRunning(entry->config.id, true);
@@ -815,7 +960,6 @@ void ProcessSupervisor::handleFrame(Entry* entry, const QJsonObject& frame)
             QMutexLocker locker(&entry->outgoingMutex);
             entry->outgoingAccepting = true;
             entry->outgoingStopping = false;
-            entry->outgoingChanged.wakeAll();
         }
         // 注册确认不仅表示“可以启动”，还把父进程最终采用的队列规则
         // 下发给子进程。父、子两侧因此使用同一份 QueueCapacity、大小上限
@@ -836,17 +980,25 @@ void ProcessSupervisor::handleFrame(Entry* entry, const QJsonObject& frame)
         accepted.insert(QStringLiteral("topicConfigs"), topicConfigs);
         if (entry->config.type == ModuleType::ProcessUi)
             accepted.insert(QStringLiteral("styleSheet"), styleSheet_);
-        sendFrame(entry, accepted);
+        if (!sendFrame(entry, accepted))
+            handleFault(entry, QString::fromUtf8(u8"子进程注册确认帧发送失败"));
         return;
     }
-    if (!entry->registered)
+    if (!isRegisteredPhase(entry->phase))
         return;
     if (type == kStarted) {
-        entry->running = true;
-        entry->faulted = false;
+        if (entry->phase != LifecyclePhase::WaitingStarted)
+            return;
+        const StopPurpose completedPurpose = entry->stopPurpose;
+        entry->phase = LifecyclePhase::Running;
+        entry->stopPurpose = StopPurpose::None;
         entry->lastPongMs = QDateTime::currentMSecsSinceEpoch();
         entry->lastPingMs = 0;
         emitState(entry, QStringLiteral("Running"), QString());
+        settleStartupEntry(entry, QString());
+        if (completedPurpose == StopPurpose::ManualRestart)
+            emit restartFinished(entry->config.id, true, QString());
+        setOperationBusy(entry, false);
         return;
     }
     if (type == kStartFailed) {
@@ -862,6 +1014,12 @@ void ProcessSupervisor::handleFrame(Entry* entry, const QJsonObject& frame)
     }
     if (type == kStopAck) {
         entry->stopAcknowledged = true;
+        if (frame.contains(QStringLiteral("clean")) &&
+            !frame.value(QStringLiteral("clean")).toBool()) {
+            entry->lastError = frame.value(QStringLiteral("detail")).toString(
+                QString::fromUtf8(u8"子进程未干净停止"));
+        }
+        advanceStopEntry(entry);
         return;
     }
     if (type == kDebugWaitTimeout) {
@@ -954,40 +1112,76 @@ void ProcessSupervisor::handleFrame(Entry* entry, const QJsonObject& frame)
     ack.insert(QStringLiteral("type"), kPublishAck);
     ack.insert(QStringLiteral("messageId"), messageId);
     ack.insert(QStringLiteral("accepted"), accepted);
-    sendFrame(entry, ack);
+    if (!sendFrame(entry, ack) && !isStoppingPhase(entry->phase))
+        handleFault(entry, QString::fromUtf8(u8"子进程 publishAck 发送失败"));
 }
 
-// 定时执行延迟重启、注册超时、ping 发送和 pong 超时检查。
+// 定时推进每个 Entry 自己的 deadline；不进入嵌套事件循环，也不借用别人的预算。
 void ProcessSupervisor::onSupervisionTick()
 {
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
     for (Entry* entry : entries_) {
-        if (entry->restartAtMs > 0 && now >= entry->restartAtMs && !shuttingDown_) {
+        if (entry->phase == LifecyclePhase::RestartDelay &&
+            entry->restartAtMs > 0 && now >= entry->restartAtMs && !shuttingDown_) {
             entry->restartAtMs = 0;
             QString error;
-            if (!startEntry(entry, &error))
+            if (!beginStartEntry(entry, &error))
                 entry->lastError = error;
             continue;
         }
-        if (entry->faulted || entry->stopping || entry->process == nullptr)
-            continue;
-        if (!entry->registered) {
-            if (now > entry->registrationDeadlineMs)
-                handleFault(entry, QString::fromUtf8(u8"子进程注册超时"));
+        if ((entry->phase == LifecyclePhase::StartingProcess ||
+             entry->phase == LifecyclePhase::WaitingRegistration ||
+             entry->phase == LifecyclePhase::WaitingStarted) &&
+            entry->startupDeadline.hasExpired()) {
+            handleFault(
+                entry,
+                entry->phase == LifecyclePhase::WaitingStarted
+                    ? QString::fromUtf8(u8"等待子进程 onStart 完成超时")
+                    : QString::fromUtf8(u8"子进程注册超时"));
             continue;
         }
+        if (isStoppingPhase(entry->phase)) {
+            advanceStopEntry(entry);
+            if (!entry->stopDeadline.hasExpired())
+                continue;
+            if (entry->process == nullptr ||
+                entry->process->state() == QProcess::NotRunning) {
+                finishEntryAfterProcessExit(entry, entry->lastError);
+                continue;
+            }
+            if (entry->stopEscalation == 0) {
+                entry->process->terminate();
+                entry->stopEscalation = 1;
+                entry->phase = LifecyclePhase::WaitingProcessExit;
+                entry->stopDeadline = QDeadlineTimer(250);
+            } else if (entry->stopEscalation == 1) {
+                // QProcess::kill() 结束完整子进程隔离边界，不会强杀其中一条线程。
+                entry->process->kill();
+                entry->stopEscalation = 2;
+                entry->stopDeadline = QDeadlineTimer(1000);
+            } else {
+                entry->pendingStart = false;
+                entry->lastError = QString::fromUtf8(u8"子进程强制结束后仍未退出");
+                entry->phase = LifecyclePhase::Failed;
+                emitState(entry, QStringLiteral("Failed"), entry->lastError);
+                if (entry->stopPurpose == StopPurpose::ManualRestart)
+                    emit restartFinished(entry->config.id, false, entry->lastError);
+                setOperationBusy(entry, false);
+            }
+            continue;
+        }
+        if (entry->phase != LifecyclePhase::Running || entry->process == nullptr)
+            continue;
         if (entry->socket == nullptr || entry->socket->state() != QLocalSocket::ConnectedState)
             continue;
-        if (entry->config.waitForDebugger &&
-            !entry->running &&
-            now <= entry->registrationDeadlineMs +
-                       qMax(1, entry->config.debuggerWaitTimeoutMs)) {
-            continue;
-        }
         if (now - entry->lastPingMs >= qMax(1, processConfig_.heartbeatIntervalMs)) {
             QJsonObject ping;
             ping.insert(QStringLiteral("type"), kPing);
-            sendFrame(entry, ping);
+            if (!sendFrame(entry, ping)) {
+                handleFault(entry, QString::fromUtf8(u8"子进程心跳帧发送失败"));
+                continue;
+            }
+            // 只有 Qt Socket 接受了完整帧才开始等待 pong，不掩盖立即写失败。
             entry->lastPingMs = now;
         }
         if (now - entry->lastPongMs > qMax(1, processConfig_.heartbeatTimeoutMs))
@@ -1006,68 +1200,83 @@ bool ProcessSupervisor::enqueueMessageToChild(const QString& moduleId,
         return false;
 
     const TopicConfig config = effectiveTopicConfig(messageBusConfig_, topic);
-    if (data.size() > config.maxMessageBytes)
-        return false;
-
     bool schedule = false;
+    bool accepted = true;
+    bool logWarning = false;
+    quint64 dropped = 0;
+    quint64 rejected = 0;
     {
         QMutexLocker locker(&entry->outgoingMutex);
         // 这里是父进程到子进程的“第一道闸门”。停止、断线或重启会把
-        // outgoingAccepting 置为 false，并唤醒等待者，所以生产者不会在
-        // 生命周期结束后继续把消息塞进旧队列。
-        if (!entry->outgoingAccepting || entry->outgoingStopping) {
+        // outgoingAccepting 置为 false，所以生产者不会进入旧 generation。
+        if (data.size() > config.maxMessageBytes ||
+            !entry->outgoingAccepting || entry->outgoingStopping) {
             ++entry->outgoingRejected;
-            return false;
-        }
-
-        int topicCount = queuedTopicCount(entry->outgoingQueue, topic);
-        if (topicCount >= config.queueCapacity) {
+            accepted = false;
+        } else if (queuedTopicCount(entry->outgoingQueue, topic) >=
+                   config.queueCapacity) {
             if (config.policy == QueuePolicy::Reliable) {
                 // Reliable 的契约是“宁可拒绝，也不能覆盖”。注意这里的
-                // topicCount 只统计等待队列；在途计数会在 drain 时另行限制。
+                // 等待队列与在途计数分开限制，旧消息绝不被新消息覆盖。
                 ++entry->outgoingRejected;
-                return false;
-            }
-
-            // Latest 只覆盖同主题仍在等待发送的最旧帧，绝不会触碰别的主题，
-            // 也不会覆盖已经写入 Socket、正在等待 ACK 的帧。
-            int oldestIndex = -1;
-            for (int index = 0; index < entry->outgoingQueue.size(); ++index) {
-                if (entry->outgoingQueue.at(index).topic == topic) {
-                    oldestIndex = index;
-                    break;
+                accepted = false;
+            } else {
+                // Latest 只覆盖同主题仍在等待发送的最旧帧，绝不会触碰别的主题，
+                // 也不会覆盖已经写入 Socket、正在等待 ACK 的帧。
+                int oldestIndex = -1;
+                for (int index = 0; index < entry->outgoingQueue.size(); ++index) {
+                    if (entry->outgoingQueue.at(index).topic == topic) {
+                        oldestIndex = index;
+                        break;
+                    }
+                }
+                if (oldestIndex < 0) {
+                    ++entry->outgoingRejected;
+                    accepted = false;
+                } else {
+                    entry->outgoingQueue.removeAt(oldestIndex);
+                    ++entry->outgoingDropped;
                 }
             }
-            if (oldestIndex < 0) {
-                ++entry->outgoingRejected;
-                return false;
-            }
-            entry->outgoingQueue.removeAt(oldestIndex);
-            ++entry->outgoingDropped;
-            --topicCount;
         }
 
-        OutgoingMessage message;
-        message.topic = topic;
-        message.senderModuleId = senderModuleId;
-        message.data = data;
-        entry->outgoingQueue.enqueue(message);
-        entry->outgoingChanged.wakeOne();
-        if (!entry->outgoingWakeScheduled) {
-            // 用一个布尔标记把很多并发入队合并为一次 Qt 唤醒事件。
-            // 事件只携带 moduleId；真正的 QByteArray 留在受锁保护的 QQueue 中。
-            entry->outgoingWakeScheduled = true;
-            schedule = true;
+        if (accepted) {
+            OutgoingMessage message;
+            message.topic = topic;
+            message.senderModuleId = senderModuleId;
+            message.data = data;
+            entry->outgoingQueue.enqueue(message);
+            if (!entry->outgoingWakeScheduled) {
+                // 用一个布尔标记把很多并发入队合并为一次 Qt 唤醒事件。
+                entry->outgoingWakeScheduled = true;
+                schedule = true;
+            }
+        }
+        dropped = entry->outgoingDropped;
+        rejected = entry->outgoingRejected;
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if ((dropped > 0 || rejected > 0) &&
+            now - entry->lastOutgoingWarningMs >= 1000) {
+            entry->lastOutgoingWarningMs = now;
+            logWarning = true;
         }
     }
 
+    if (logWarning) {
+        Logger::instance().log(
+            LogLevel::Warning,
+            entry->config.id,
+            QString::fromUtf8(u8"父到子发送队列发生丢弃/拒绝：dropped=%1，rejected=%2")
+                .arg(dropped)
+                .arg(rejected));
+    }
     if (schedule) {
         QMetaObject::invokeMethod(this,
                                   "drainChildQueue",
                                   Qt::QueuedConnection,
                                   Q_ARG(QString, moduleId));
     }
-    return true;
+    return accepted;
 }
 
 // 在监督器 Qt 线程中有限批次写 Socket，并建立等待 deliveryAck 的在途记录。
@@ -1138,13 +1347,13 @@ void ProcessSupervisor::drainChildQueue(const QString& moduleId)
             QSharedMemory* shared = new QSharedMemory(key, this);
             if (!shared->create(message.data.size())) {
                 delete shared;
-                acknowledgeChildMessage(entry, messageId, false);
+                discardChildMessageBeforeSend(entry, messageId);
                 continue;
             }
             if (!shared->lock()) {
                 shared->detach();
                 delete shared;
-                acknowledgeChildMessage(entry, messageId, false);
+                discardChildMessageBeforeSend(entry, messageId);
                 continue;
             }
             std::memcpy(shared->data(),
@@ -1167,7 +1376,7 @@ void ProcessSupervisor::drainChildQueue(const QString& moduleId)
         }
 
         if (!sendFrame(entry, frame)) {
-            acknowledgeChildMessage(entry, messageId, false);
+            discardChildMessageBeforeSend(entry, messageId);
             handleFault(entry, QString::fromUtf8(u8"无法向子进程发送消息"));
             return;
         }
@@ -1203,6 +1412,32 @@ void ProcessSupervisor::drainChildQueue(const QString& moduleId)
                                   "drainChildQueue",
                                   Qt::QueuedConnection,
                                   Q_ARG(QString, moduleId));
+}
+
+void ProcessSupervisor::discardChildMessageBeforeSend(Entry* entry,
+                                                       const QString& messageId)
+{
+    if (entry == nullptr || messageId.isEmpty())
+        return;
+    QSharedMemory* shared = nullptr;
+    {
+        QMutexLocker locker(&entry->outgoingMutex);
+        const QString topic = entry->outgoingMessageTopics.take(messageId);
+        if (topic.isEmpty())
+            return;
+        const int count = entry->outgoingInFlightByTopic.value(topic, 0);
+        if (count <= 1)
+            entry->outgoingInFlightByTopic.remove(topic);
+        else
+            entry->outgoingInFlightByTopic.insert(topic, count - 1);
+        entry->outgoingInFlightCount = qMax(0, entry->outgoingInFlightCount - 1);
+        ++entry->outgoingDropped;
+        shared = entry->outgoingShared.take(messageId);
+    }
+    if (shared != nullptr) {
+        shared->detach();
+        delete shared;
+    }
 }
 
 // 根据 deliveryAck 回收父到子的在途槽位、主题计数和共享段。
@@ -1243,7 +1478,6 @@ void ProcessSupervisor::acknowledgeChildMessage(Entry* entry,
         // 无论 ACK 表示接收还是拒绝，都必须释放一个在途槽位；只有 accepted
         // 影响统计和限频日志，不影响槽位回收。
         shared = entry->outgoingShared.take(messageId);
-        entry->outgoingChanged.wakeAll();
 
         if (!entry->outgoingWakeScheduled && entry->outgoingAccepting &&
             !entry->outgoingStopping && entry->socket != nullptr &&
@@ -1280,33 +1514,209 @@ void ProcessSupervisor::acknowledgeChildMessage(Entry* entry,
                                   Q_ARG(QString, entry->config.id));
 }
 
+// 停止入口的顺序固定为：父到子闸门 -> MessageBus 单模块入口 -> 清等待队列。
+void ProcessSupervisor::closeEntryIngress(Entry* entry)
+{
+    if (entry == nullptr)
+        return;
+    {
+        QMutexLocker locker(&entry->outgoingMutex);
+        entry->outgoingAccepting = false;
+        entry->outgoingStopping = true;
+    }
+    if (entry->bridge != nullptr)
+        messageBus_->beginModuleStop(entry->config.id, true);
+    {
+        QMutexLocker locker(&entry->outgoingMutex);
+        // 闸门关闭后，这些项已经没有机会写入 Socket，只在第一次清理时计数。
+        entry->outgoingDropped += static_cast<quint64>(entry->outgoingQueue.size());
+        entry->outgoingQueue.clear();
+        entry->outgoingWakeScheduled = false;
+    }
+}
+
+// 建立单个 Entry 的停止 deadline；函数不等待 QProcess 或 Socket。
+void ProcessSupervisor::beginStopEntry(Entry* entry, StopPurpose purpose)
+{
+    if (entry == nullptr)
+        return;
+    entry->stopPurpose = purpose;
+    entry->stopAcknowledged = false;
+    entry->stopEscalation = 0;
+    // 先关闭两层消息入口并记账，再建立停止阶段和 deadline；stop 帧永远最后发送。
+    closeEntryIngress(entry);
+    entry->phase = LifecyclePhase::StopRequested;
+    entry->stopDeadline = QDeadlineTimer(qMax(1, processConfig_.stopTimeoutMs));
+
+    emitState(entry,
+              purpose == StopPurpose::ManualRestart
+                  ? QStringLiteral("Restarting") : QStringLiteral("Stopping"),
+              QString());
+    if (entry->process == nullptr ||
+        entry->process->state() == QProcess::NotRunning) {
+        finishEntryAfterProcessExit(entry, QString());
+        return;
+    }
+
+    entry->phase = LifecyclePhase::WaitingStopAck;
+    QJsonObject frame;
+    frame.insert(QStringLiteral("type"), kStop);
+    if (!sendFrame(entry, frame)) {
+        // 没有可用控制通道时不能等不存在的 ACK，直接推进整个进程的终止阶段。
+        entry->phase = LifecyclePhase::WaitingProcessExit;
+        entry->process->terminate();
+        entry->stopEscalation = 1;
+        entry->stopDeadline = QDeadlineTimer(250);
+    }
+}
+
+// stopAcknowledged 是真实状态机输入：ACK 到达后不再停留在 WaitingStopAck。
+void ProcessSupervisor::advanceStopEntry(Entry* entry)
+{
+    if (entry != nullptr &&
+        entry->phase == LifecyclePhase::WaitingStopAck &&
+        entry->stopAcknowledged) {
+        entry->phase = LifecyclePhase::WaitingProcessExit;
+        emitState(entry,
+                  entry->stopPurpose == StopPurpose::ManualRestart
+                      ? QStringLiteral("Restarting") : QStringLiteral("Stopping"),
+                  QString::fromUtf8(u8"已收到 stopAck，等待子进程退出"));
+    }
+}
+
+// QProcess 已退出后清理本轮资源，并按 StopPurpose 决定停止、失败或下一次启动。
+void ProcessSupervisor::finishEntryAfterProcessExit(Entry* entry, const QString& detail)
+{
+    if (entry == nullptr)
+        return;
+    const StopPurpose purpose = entry->stopPurpose;
+    const bool shouldRestart = entry->pendingStart && !shuttingDown_ &&
+        (purpose == StopPurpose::ManualRestart || purpose == StopPurpose::AutoRestart);
+    const QString finalDetail = detail.isEmpty() ? entry->lastError : detail;
+    destroyRuntime(entry);
+
+    if (shouldRestart) {
+        entry->phase = LifecyclePhase::RestartDelay;
+        entry->restartAtMs = QDateTime::currentMSecsSinceEpoch() +
+            (purpose == StopPurpose::AutoRestart
+                 ? qMax(0, processConfig_.restartDelayMs) : 0);
+        emitState(entry,
+                  QStringLiteral("Restarting"),
+                  purpose == StopPurpose::AutoRestart
+                      ? QString::fromUtf8(u8"已排队自动重启")
+                      : QString::fromUtf8(u8"已排队手动重启"));
+        return;
+    }
+
+    entry->pendingStart = false;
+    entry->restartAtMs = 0;
+    entry->stopPurpose = StopPurpose::None;
+    if (!finalDetail.isEmpty() && purpose != StopPurpose::Stop &&
+        purpose != StopPurpose::Shutdown) {
+        entry->phase = LifecyclePhase::Failed;
+        emitState(entry, QStringLiteral("Failed"), finalDetail);
+    } else {
+        entry->phase = LifecyclePhase::Stopped;
+        emitState(entry, QStringLiteral("Stopped"), finalDetail);
+    }
+    setOperationBusy(entry, false);
+}
+
+void ProcessSupervisor::setOperationBusy(Entry* entry, bool busy)
+{
+    if (entry == nullptr || entry->operationBusy == busy)
+        return;
+    entry->operationBusy = busy;
+    emit operationBusyChanged(entry->config.id, busy);
+}
+
+// 初始启动批次只在每个模块第一次达到 Running 或 Failed 后结算一次。
+void ProcessSupervisor::settleStartupEntry(Entry* entry, const QString& error)
+{
+    if (entry == nullptr || !startupPendingModules_.remove(entry->config.id))
+        return;
+    if (!error.isEmpty())
+        startupErrors_.append(QStringLiteral("%1: %2").arg(entry->config.id, error));
+    scheduleStartupBatchFinished();
+}
+
+void ProcessSupervisor::scheduleStartupBatchFinished()
+{
+    if (!startupBatchActive_ || !startupPendingModules_.isEmpty() ||
+        startupBatchSignalScheduled_)
+        return;
+    startupBatchSignalScheduled_ = true;
+    QTimer::singleShot(0, this, [this]() {
+        startupBatchSignalScheduled_ = false;
+        if (!startupBatchActive_ || !startupPendingModules_.isEmpty())
+            return;
+        startupBatchActive_ = false;
+        emit startupBatchFinished(startupErrors_);
+    });
+}
+
+bool ProcessSupervisor::isStoppingPhase(LifecyclePhase phase) const
+{
+    return phase == LifecyclePhase::StopRequested ||
+           phase == LifecyclePhase::WaitingStopAck ||
+           phase == LifecyclePhase::WaitingProcessExit;
+}
+
+bool ProcessSupervisor::isRegisteredPhase(LifecyclePhase phase) const
+{
+    return phase == LifecyclePhase::WaitingStarted ||
+           phase == LifecyclePhase::Running ||
+           isStoppingPhase(phase);
+}
+
 // 防重复地标记失败、销毁旧运行时，并按时间窗口决定是否自动重启。
 void ProcessSupervisor::handleFault(Entry* entry, const QString& detail)
 {
-    if (entry == nullptr || entry->faulted)
+    if (entry == nullptr || shuttingDown_ ||
+        (entry->phase == LifecyclePhase::Failed && entry->process == nullptr))
         return;
-    entry->faulted = true;
-    entry->running = false;
+    if (entry->stopPurpose == StopPurpose::Stop ||
+        entry->stopPurpose == StopPurpose::Shutdown)
+        return;
+
     entry->lastError = detail;
-    destroyRuntime(entry);
+    closeEntryIngress(entry);
+    settleStartupEntry(entry, detail);
     emitState(entry, QStringLiteral("Failed"), detail);
 
-    if (shuttingDown_ || !entry->config.enabled)
-        return;
-
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    if (entry->restartWindowStartMs == 0 ||
-        now - entry->restartWindowStartMs > qMax(1, processConfig_.restartWindowMs)) {
-        entry->restartWindowStartMs = now;
-        entry->restartCount = 0;
+    const bool manualRestartFailed = entry->stopPurpose == StopPurpose::ManualRestart;
+    bool autoRestart = false;
+    if (!manualRestartFailed && entry->config.enabled) {
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (entry->restartWindowStartMs == 0 ||
+            now - entry->restartWindowStartMs >= qMax(1, processConfig_.restartWindowMs)) {
+            entry->restartWindowStartMs = now;
+            entry->restartCount = 0;
+        }
+        if (entry->restartCount < qMax(0, processConfig_.maxRestartCount)) {
+            ++entry->restartCount;
+            autoRestart = true;
+        }
     }
-    if (entry->restartCount < qMax(0, processConfig_.maxRestartCount)) {
-        ++entry->restartCount;
-        entry->restartAtMs = now + qMax(0, processConfig_.restartDelayMs);
-        emitState(entry,
-                  QStringLiteral("Restarting"),
-                  QString::fromUtf8(u8"已排队自动重启"));
+    entry->pendingStart = autoRestart;
+    if (autoRestart)
+        entry->stopPurpose = StopPurpose::AutoRestart;
+
+    if (entry->process != nullptr &&
+        entry->process->state() != QProcess::NotRunning) {
+        entry->phase = LifecyclePhase::WaitingProcessExit;
+        entry->stopEscalation = 2;
+        entry->stopDeadline = QDeadlineTimer(1000);
+        // 故障时结束完整 QProcess；不会对其中某条 QThread 调用 terminate()。
+        entry->process->kill();
     } else {
+        finishEntryAfterProcessExit(entry, detail);
+    }
+    if (manualRestartFailed) {
+        entry->pendingStart = false;
+        emit restartFinished(entry->config.id, false, detail);
+        setOperationBusy(entry, false);
+    } else if (!autoRestart) {
         emit moduleFault(entry->config.id, detail);
     }
 }
@@ -1319,15 +1729,17 @@ void ProcessSupervisor::destroyRuntime(Entry* entry)
     {
         QMutexLocker locker(&entry->outgoingMutex);
         // 故障、断开、重启和正常停止共用这一条清理路径。先禁止生产者，
-        // 再清空等待/在途索引并 wakeAll，保证任何将来的等待都有机会醒来。
+        // 再对等待/在途项各记一次账；容器清空后重复进入不会重复累计。
         entry->outgoingAccepting = false;
         entry->outgoingStopping = true;
+        entry->outgoingDropped += static_cast<quint64>(entry->outgoingQueue.size());
+        entry->outgoingAbandoned +=
+            static_cast<quint64>(entry->outgoingMessageTopics.size());
         entry->outgoingQueue.clear();
         entry->outgoingInFlightByTopic.clear();
         entry->outgoingMessageTopics.clear();
         entry->outgoingInFlightCount = 0;
         entry->outgoingWakeScheduled = false;
-        entry->outgoingChanged.wakeAll();
     }
     ProcessBridge* bridge = entry->bridge;
     QLocalSocket* socket = entry->socket;
@@ -1340,8 +1752,15 @@ void ProcessSupervisor::destroyRuntime(Entry* entry)
 
     if (bridge != nullptr) {
         messageBus_->setModuleRunning(entry->config.id, false);
-        messageBus_->unregisterModule(entry->config.id, false);
-        delete bridge;
+        if (messageBus_->unregisterModule(entry->config.id, false)) {
+            delete bridge;
+        } else {
+            // 极端情况下桥接回调仍在执行；保留 endpoint，绝不删除其借用对象。
+            Logger::instance().log(
+                LogLevel::Error,
+                entry->config.id,
+                QString::fromUtf8(u8"进程桥接消息线程未停止，已隔离 endpoint"));
+        }
     }
     if (socket != nullptr) {
         socket->disconnect(this);
@@ -1358,17 +1777,35 @@ void ProcessSupervisor::destroyRuntime(Entry* entry)
     }
     if (process != nullptr) {
         process->disconnect(this);
-        if (process->state() != QProcess::NotRunning) {
+        // 正常路径只会清理已经退出的 QProcess。兜底 kill 作用于完整子进程，
+        // 但这里不再同步等待，避免普通重启重新引入 GUI 阻塞。
+        if (process->state() != QProcess::NotRunning)
             process->kill();
-            process->waitForFinished(1000);
-        }
         process->deleteLater();
     }
     clearOutgoingShared(entry);
     entry->inputBuffer.clear();
-    entry->registered = false;
-    entry->running = false;
     entry->stopAcknowledged = false;
+    if (entry->generation > 0 &&
+        entry->outgoingSummaryGeneration != entry->generation) {
+        ProcessQueueStats stats;
+        {
+            QMutexLocker locker(&entry->outgoingMutex);
+            entry->outgoingSummaryGeneration = entry->generation;
+            stats.dropped = entry->outgoingDropped;
+            stats.rejected = entry->outgoingRejected;
+            stats.abandoned = entry->outgoingAbandoned;
+        }
+        Logger::instance().log(
+            stats.dropped == 0 && stats.rejected == 0 && stats.abandoned == 0
+                ? LogLevel::Info : LogLevel::Warning,
+            entry->config.id,
+            QString::fromUtf8(
+                u8"父到子发送队列汇总：dropped=%1，rejected=%2，abandoned=%3")
+                .arg(stats.dropped)
+                .arg(stats.rejected)
+                .arg(stats.abandoned));
+    }
 }
 
 // 收集锁内共享段指针，锁外 detach/delete，缩短队列互斥锁持有时间。
@@ -1379,7 +1816,6 @@ void ProcessSupervisor::clearOutgoingShared(Entry* entry)
         QMutexLocker locker(&entry->outgoingMutex);
         segments = entry->outgoingShared.values();
         entry->outgoingShared.clear();
-        entry->outgoingChanged.wakeAll();
     }
     for (QSharedMemory* shared : segments) {
         // 这里处理的是 ACK 尚未到达就发生故障/停止的剩余段；它们已经不再

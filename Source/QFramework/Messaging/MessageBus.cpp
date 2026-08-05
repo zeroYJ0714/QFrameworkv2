@@ -1,6 +1,6 @@
 #include "MessageBus.h"
 
-#include <QElapsedTimer>
+#include <QDeadlineTimer>
 #include <QMutexLocker>
 #include <QQueue>
 #include <QSet>
@@ -103,22 +103,22 @@ public:
         available_.wakeOne();
     }
 
-    // 等待线程结束并返回是否在预算内排空；既有超时后的回收语义保持不变。
-    bool finishStop(int timeoutMs)
+    // 只做一次有界等待；超时表示回调仍在执行，调用方不得删除本 QThread。
+    ModuleQueueStopResult finishStop(int timeoutMs)
     {
-        // 正常路径等待有限时间；超时后按既有停止策略丢弃剩余消息并结束线程。
-        if (wait(static_cast<unsigned long>(qMax(1, timeoutMs))))
-            return true;
+        if (isFinished() ||
+            (timeoutMs > 0 && wait(static_cast<unsigned long>(timeoutMs)))) {
+            return ModuleQueueStopResult::Stopped;
+        }
 
         {
             QMutexLocker locker(&mutex_);
+            // 只能丢弃尚未开始执行的等待项；锁外正在运行的 onMessage 仍被隔离。
             stats_.dropped += static_cast<quint64>(queue_.size());
             queue_.clear();
             available_.wakeOne();
         }
-        // 这里保留原有的线程回收语义，注释不改变 MessageBus 既有等待行为。
-        wait();
-        return false;
+        return ModuleQueueStopResult::TimedOut;
     }
 
     // 返回统计快照，避免调用方持有队列内部锁。
@@ -190,24 +190,28 @@ struct MessageBus::Registration
     QSet<QString> publishedTopics;
     QSet<QString> subscribedTopics;
     bool publishingEnabled = false;
+    bool quarantined = false;
 };
 
 // 保存配置快照；初始允许注册/发布，但消息投递保持暂停直到框架统一放行。
 MessageBus::MessageBus(const MessageBusConfig& config)
     : config_(config),
       accepting_(true),
-      deliveryEnabled_(false)
+      deliveryEnabled_(false),
+      stopQueuesRequested_(false)
 {
 }
 
 MessageBus::~MessageBus()
 {
-    // 析构时先停投递，再按当前注册表逐个解绑，避免队列线程访问已销毁总线。
+    // 正常 FrameworkRuntime 会在析构前完成唯一一次停止；这里仅做兜底。
     beginShutdown();
-    stopQueues(config_.shutdownDrainTimeoutMs);
+    const MessageBusStopReport report = stopQueues(config_.shutdownDrainTimeoutMs);
     const QStringList ids = moduleIds();
-    for (const QString& id : ids)
-        unregisterModule(id, false);
+    for (const QString& id : ids) {
+        if (!report.timedOutModuleIds.contains(id))
+            unregisterModule(id, false);
+    }
 }
 
 // 校验模块 ID 与主题声明，创建专属 ModuleQueue，并把 ModuleEndpoint 绑定到总线。
@@ -235,6 +239,11 @@ bool MessageBus::registerModule(const QString& moduleId,
     }
 
     QMutexLocker locker(&mutex_);
+    if (!accepting_) {
+        if (errorMessage != nullptr)
+            *errorMessage = QString::fromUtf8(u8"消息总线正在停止，拒绝新模块注册");
+        return false;
+    }
     if (modules_.contains(moduleId)) {
         if (errorMessage != nullptr)
             *errorMessage = QString::fromUtf8(u8"模块 ID 重复：%1").arg(moduleId);
@@ -266,6 +275,19 @@ bool MessageBus::setModuleRunning(const QString& moduleId, bool running)
     return true;
 }
 
+// 单模块停止先关闭入口，不等待其消息线程；ProcessSupervisor 必须在发送 stop 前调用。
+bool MessageBus::beginModuleStop(const QString& moduleId, bool discardPendingMessages)
+{
+    QMutexLocker locker(&mutex_);
+    Registration* registration = modules_.value(moduleId, nullptr);
+    if (registration == nullptr)
+        return false;
+    registration->publishingEnabled = false;
+    registration->endpoint->setRunning(false);
+    registration->queue->beginStop(discardPendingMessages);
+    return true;
+}
+
 // 一次性暂停或恢复所有模块消费者，主要用于确定性的启动阶段。
 void MessageBus::setDeliveryEnabled(bool enabled)
 {
@@ -290,28 +312,39 @@ void MessageBus::beginShutdown()
     }
 }
 
-// 在一份总超时预算内依次回收全部模块线程，返回是否全部及时排空。
-bool MessageBus::stopQueues(int drainTimeoutMs)
+// 在一份总 deadline 内回收全部模块线程；超时队列留在注册表中 quarantine。
+MessageBusStopReport MessageBus::stopQueues(int drainTimeoutMs)
 {
-    QVector<ModuleQueue*> queues;
+    QVector<QPair<QString, ModuleQueue*>> queues;
     {
         QMutexLocker locker(&mutex_);
         for (Registration* registration : modules_) {
-            registration->queue->beginStop(false);
-            queues.append(registration->queue);
+            if (!stopQueuesRequested_)
+                registration->queue->beginStop(false);
         }
+        for (QHash<QString, Registration*>::const_iterator iterator = modules_.constBegin();
+             iterator != modules_.constEnd(); ++iterator) {
+            queues.append(qMakePair(iterator.key(), iterator.value()->queue));
+        }
+        stopQueuesRequested_ = true;
     }
 
-    // 多个队列共享一个总时间预算，而不是每个队列都重新获得完整 timeout。
-    QElapsedTimer timer;
-    timer.start();
-    bool drained = true;
-    for (ModuleQueue* queue : queues) {
-        const int remaining = qMax(1, drainTimeoutMs - static_cast<int>(timer.elapsed()));
-        if (!queue->finishStop(remaining))
-            drained = false;
+    MessageBusStopReport report;
+    QDeadlineTimer deadline(qMax(1, drainTimeoutMs));
+    for (const QPair<QString, ModuleQueue*>& item : queues) {
+        const int remaining = static_cast<int>(qMax<qint64>(0, deadline.remainingTime()));
+        const ModuleQueueStopResult result = item.second->finishStop(remaining);
+        if (result == ModuleQueueStopResult::Stopped)
+            report.stoppedModuleIds.append(item.first);
+        else
+            report.timedOutModuleIds.append(item.first);
+
+        QMutexLocker locker(&mutex_);
+        Registration* registration = modules_.value(item.first, nullptr);
+        if (registration != nullptr)
+            registration->quarantined = result == ModuleQueueStopResult::TimedOut;
     }
-    return drained;
+    return report;
 }
 
 // 从路由表移除模块、停止专属线程、解绑宿主并释放 Registration。
@@ -320,17 +353,28 @@ bool MessageBus::unregisterModule(const QString& moduleId, bool drainPendingMess
     Registration* registration = nullptr;
     {
         QMutexLocker locker(&mutex_);
-        registration = modules_.take(moduleId);
+        registration = modules_.value(moduleId, nullptr);
     }
     if (registration == nullptr)
         return false;
 
-    // 先从注册表摘除，阻止新发布找到它，再停止线程并解除 endpoint 宿主绑定。
+    // 先关闭入口，但只有线程确定停止后才从注册表摘除并删除对象。
     registration->publishingEnabled = false;
     registration->endpoint->setRunning(false);
     if (registration->queue->isRunning()) {
         registration->queue->beginStop(!drainPendingMessages);
-        registration->queue->finishStop(config_.shutdownDrainTimeoutMs);
+        if (registration->queue->finishStop(config_.shutdownDrainTimeoutMs) ==
+            ModuleQueueStopResult::TimedOut) {
+            QMutexLocker locker(&mutex_);
+            registration->quarantined = true;
+            return false;
+        }
+    }
+    {
+        QMutexLocker locker(&mutex_);
+        if (modules_.value(moduleId, nullptr) != registration)
+            return false;
+        modules_.remove(moduleId);
     }
     registration->endpoint->bindHost(QString(), nullptr);
     delete registration->queue;
@@ -351,6 +395,25 @@ ModuleQueueStats MessageBus::queueStats(const QString& moduleId) const
     QMutexLocker locker(&mutex_);
     Registration* registration = modules_.value(moduleId, nullptr);
     return registration == nullptr ? ModuleQueueStats() : registration->queue->stats();
+}
+
+bool MessageBus::isModuleQueueStopped(const QString& moduleId) const
+{
+    QMutexLocker locker(&mutex_);
+    Registration* registration = modules_.value(moduleId, nullptr);
+    return registration == nullptr || !registration->queue->isRunning();
+}
+
+QStringList MessageBus::quarantinedModuleIds() const
+{
+    QStringList result;
+    QMutexLocker locker(&mutex_);
+    for (QHash<QString, Registration*>::const_iterator iterator = modules_.constBegin();
+         iterator != modules_.constEnd(); ++iterator) {
+        if (iterator.value()->quarantined && iterator.value()->queue->isRunning())
+            result.append(iterator.key());
+    }
+    return result;
 }
 
 // 执行发布权限、主题大小和订阅路由检查，再把值对象复制进各订阅者队列。

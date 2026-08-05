@@ -14,6 +14,21 @@
 
 namespace qframework
 {
+enum class ModuleQueueStopResult
+{
+    Stopped,
+    TimedOut
+};
+
+struct MessageBusStopReport
+{
+    QStringList stoppedModuleIds;
+    QStringList timedOutModuleIds;
+
+    bool allStopped() const { return timedOutModuleIds.isEmpty(); }
+    explicit operator bool() const { return allStopped(); }
+};
+
 struct ModuleQueueStats
 {
     // delivered 是已调用 onMessage 的数量；dropped 是 Latest/停止丢弃数量；
@@ -36,18 +51,22 @@ public:
                         QString* errorMessage = nullptr);
     // 设置 publish 是否可用，不等于是否已经收到消息。
     bool setModuleRunning(const QString& moduleId, bool running);
+    // 立即关闭单个模块的发布和接收入口；线程回收留给后续有界停止流程。
+    bool beginModuleStop(const QString& moduleId, bool discardPendingMessages);
     // 启动阶段先暂停队列，所有模块注册完成后一次性开启投递。
     void setDeliveryEnabled(bool enabled);
     // 关闭发布入口并唤醒所有暂停队列。
     void beginShutdown();
-    // 在给定预算内停止所有模块队列，返回是否全部排空。
-    bool stopQueues(int drainTimeoutMs);
+    // 在一个总预算内停止全部队列，并区分已停止与仍在回调中的模块。
+    MessageBusStopReport stopQueues(int drainTimeoutMs);
     // 移除一个模块；drainPendingMessages 决定停止前是否保留待处理消息。
     bool unregisterModule(const QString& moduleId, bool drainPendingMessages);
 
     // 以下查询只返回快照，不把内部锁或队列所有权交给调用方。
     QStringList moduleIds() const;
     ModuleQueueStats queueStats(const QString& moduleId) const;
+    bool isModuleQueueStopped(const QString& moduleId) const;
+    QStringList quarantinedModuleIds() const;
 
     // ModuleEndpoint::publish 的宿主实现：校验发布权限和大小后，
     // 把同一消息复制到所有订阅者各自的有界队列。
@@ -71,5 +90,6 @@ private:
     QHash<QString, Registration*> modules_;
     bool accepting_;
     bool deliveryEnabled_;
+    bool stopQueuesRequested_;
 };
 }

@@ -28,11 +28,14 @@ public:
     bool loadAndStart(const QVector<ModuleConfig>& modules,
                       QStringList* errors = nullptr,
                       bool enableDeliveryAfterStart = true);
-    // 按加载的反向顺序调用 onStop、注销总线并卸载 DLL；可重复调用。
-    void shutdown(int drainTimeoutMs);
+    // 队列已停止的插件才调用 onStop/卸载；超时 ID 保留在 quarantine。
+    QStringList shutdown(const QStringList& timedOutModuleIds = QStringList());
+    // 测试替代 fail-fast 或协作回调稍后返回时，可再次回收已经安全停止的隔离项。
+    QStringList retryQuarantinedShutdown();
 
     // 查询结果是快照；uiModule 返回借用指针，所有权仍在 QPluginLoader。
     QStringList runningModuleIds() const;
+    QStringList quarantinedModuleIds() const;
     InProcessUiModule* uiModule(const QString& moduleId) const;
 
 signals:
@@ -46,6 +49,7 @@ private:
     bool loadOne(const ModuleConfig& config, QString* errorMessage);
     bool startOne(LoadedPlugin* plugin, QString* errorMessage);
     void removeFailed(LoadedPlugin* plugin);
+    bool releasePlugin(LoadedPlugin* plugin);
 
     // loaded_ 中的记录和 QPluginLoader 由本类拥有；endpoint/instance 只是视图。
     MessageBus* messageBus_;

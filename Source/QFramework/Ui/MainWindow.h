@@ -6,6 +6,7 @@
 
 #include <QHash>
 #include <QMainWindow>
+#include <QSize>
 #include <QVector>
 
 #include "FrameworkConfig.h"
@@ -51,27 +52,45 @@ public:
 private slots:
     // 槽把菜单/对话框/监督器信号转换成具体 UI 状态变化。
     void showModuleManager();
-    void onModuleActionTriggered();
-    void onDockVisibilityChanged(bool visible);
+    void onModuleActionTriggered(bool checked);
+    void onDockCloseRequested();
     void onShowModuleRequested(const QString& moduleId);
     void onRestartModuleRequested(const QString& moduleId);
+    void onRestartFinished(const QString& moduleId,
+                           bool success,
+                           const QString& detail);
     void onModuleStateChanged(const QString& moduleId,
                               const QString& state,
                               const QString& detail);
     void onModuleFault(const QString& moduleId, const QString& detail);
     void onWindowHandleReady(const QString& moduleId, quintptr windowId);
+    void onProcessWindowSizeChanged(const QString& moduleId, const QSize& size);
     void loadLayoutFromDialog();
     void saveCurrentLayout();
     void saveLayoutAs();
     void selectStyleSheet();
     void reloadStyleSheet();
+    void setUiAvailable(const QString& moduleId, bool available);
 
 private:
+    enum class VisibilityOrigin
+    {
+        UserAction,
+        LayoutRestore,
+        WindowReady,
+        RuntimeState,
+        CloseButton
+    };
+
     // 构建固定菜单和模块 Dock；运行期间只更新可见性和状态。
     void createActions();
     void createModuleDocks();
-    void setUiAvailable(const QString& moduleId, bool available);
-    void showModule(const QString& moduleId);
+    void setRequestedDockVisible(const QString& moduleId,
+                                 bool visible,
+                                 VisibilityOrigin origin);
+    void applyRequestedDockVisibility(const QString& moduleId,
+                                      VisibilityOrigin origin);
+    void syncModuleAction(const QString& moduleId);
     void updateStatusSummary();
     void reportStateFailure(const QString& title, const QString& detail);
     QString displayName(const QString& moduleId) const;
@@ -90,6 +109,8 @@ private:
     QHash<QString, ManagedDockWidget*> moduleDocks_;
     QHash<QString, ProcessWindowHost*> processHosts_;
     QHash<QString, QAction*> moduleActions_;
+    // 用户显示意图独立于 Qt 当前标签是否正在绘制，也独立于模块是否 ready。
+    QHash<QString, bool> requestedDockVisibility_;
     QHash<QString, bool> uiAvailable_;
     QHash<QString, QString> moduleStates_;
     QLabel* statusSummaryLabel_;

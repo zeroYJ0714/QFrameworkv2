@@ -5,6 +5,7 @@
 
 #include <QHash>
 #include <QJsonObject>
+#include <QMutex>
 #include <QObject>
 #include <QLocalSocket>
 
@@ -69,13 +70,15 @@ private:
     void handleFrame(const QJsonObject& frame);
     // 发送只写入 QLocalSocket；payload 是否走共享内存由 drainPublishQueue 决定。
     // 只负责控制帧编码和 Socket 写入；业务大负载由调用方先放入共享段。
-    void sendFrame(const QJsonObject& frame);
+    bool sendFrame(const QJsonObject& frame);
     // 父到子：消息进入子进程输入队列后立即确认，不等待 onMessage()。
-    void sendDeliveryAck(const QString& messageId, bool accepted);
+    bool sendDeliveryAck(const QString& messageId, bool accepted);
     // 子到父：父进程 MessageBus 接收/拒绝后确认，释放本地在途槽位。
     void handlePublishAck(const QJsonObject& frame);
     // 记录第一次退出原因并请求 Qt 事件循环结束，析构负责最终资源回收。
     void finish(int exitCode);
+    // 退出前协作停止消息线程；false 表示必须让整个子进程结束且不能析构模块。
+    bool prepareForExit();
     void clearSharedSegments();
     // 读取主题专用设置，不存在时返回经过正值保护的默认设置。
     TopicSettings topicConfig(const QString& topic) const;
@@ -85,6 +88,10 @@ private:
     bool queuePublish(const QString& topic, const QByteArray& data);
     // 从任意模块线程安全地排队一条小型日志。
     void queueLog(LogLevel level, const QString& text);
+    // 只允许 Runtime 所属线程访问 QLocalSocket；Debug 测试靠断言守住边界。
+    void assertSocketThread() const;
+    // 在指针互斥下关闭发布闸门；可选汇总只从 Runtime 线程发送。
+    bool stopPublishQueue(const QString& reason, bool report);
 
     // application_ 和 module_ 由 run() 的调用方创建，ProcessRuntime 负责 module_
     // 的最终销毁；其余对象由当前运行时拥有并在析构时释放。
@@ -94,6 +101,8 @@ private:
     RuntimeHost* host_;
     // 父到子输入线程和子到父发送队列，均在停止时显式清空/唤醒。
     MessageQueue* messageQueue_;
+    // 与业务线程的 enqueue 同步，防止 stop/delete 与正在进入队列的生产者竞态。
+    QMutex publishQueueMutex_;
     PublishQueue* publishQueue_;
     // Socket 由当前 Qt 事件循环线程拥有，其他线程不直接写它。
     QLocalSocket* socket_;
@@ -118,9 +127,13 @@ private:
     bool registrationAcknowledged_;
     bool running_;
     bool stopping_;
+    bool unsafeMessageThread_;
     int exitCode_;
     // 父进程拒绝统计用于限频诊断，不改变 publish() 的同步返回语义。
     quint64 publishRejectedCount_;
+    quint64 publishDroppedCount_;
+    quint64 publishLocalRejectedCount_;
+    quint64 publishAbandonedCount_;
     qint64 lastPublishRejectWarningMs_;
     QHash<QString, TopicSettings> topicConfigs_;
     // messageId -> 共享内存句柄；直到 publishAck 或故障清理前保持所有权。

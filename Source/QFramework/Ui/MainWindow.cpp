@@ -119,6 +119,14 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
                 &ProcessSupervisor::windowHandleReady,
                 this,
                 &MainWindow::onWindowHandleReady);
+        connect(processSupervisor_,
+                &ProcessSupervisor::operationBusyChanged,
+                moduleManagerDialog_,
+                &ModuleManagerDialog::setRestartBusy);
+        connect(processSupervisor_,
+                &ProcessSupervisor::restartFinished,
+                this,
+                &MainWindow::onRestartFinished);
     }
 }
 
@@ -157,6 +165,7 @@ void MainWindow::releaseInProcessUiModules()
     for (const ModuleConfig& module : modules_) {
         if (module.type != ModuleType::InProcessUi)
             continue;
+        setUiAvailable(module.id, false);
         InProcessUiModule* widget = pluginManager_->uiModule(module.id);
         ManagedDockWidget* dockWidget = moduleDocks_.value(module.id, nullptr);
         if (widget == nullptr || dockWidget == nullptr || dockWidget->widget() != widget)
@@ -177,16 +186,32 @@ bool MainWindow::loadLayoutFile(const QString& filePath,
                                 QString* errorMessage,
                                 QStringList* unavailableModuleIds)
 {
-    // LayoutManager 可能恢复了不可用模块的 visible 状态，这里再次按运行状态修正。
+    QHash<QString, bool> loadedRequestedVisibility;
+    bool legacyVisibilitySemantics = false;
     const bool loaded = layoutManager_->loadLayout(
-        filePath, errorMessage, unavailableModuleIds);
+        filePath,
+        &loadedRequestedVisibility,
+        errorMessage,
+        unavailableModuleIds,
+        &legacyVisibilitySemantics);
     if (!loaded)
         return false;
 
+    // 只有 geometry/state 和全部元数据都恢复成功，才整体替换显示意图。
     for (QHash<QString, ManagedDockWidget*>::const_iterator iterator =
              moduleDocks_.constBegin(); iterator != moduleDocks_.constEnd(); ++iterator) {
-        if (!uiAvailable_.value(iterator.key(), false) && iterator.value() != nullptr)
-            iterator.value()->hide();
+        requestedDockVisibility_.insert(
+            iterator.key(), loadedRequestedVisibility.value(iterator.key(), false));
+        syncModuleAction(iterator.key());
+        applyRequestedDockVisibility(iterator.key(), VisibilityOrigin::LayoutRestore);
+    }
+    if (legacyVisibilitySemantics) {
+        Logger::instance().log(
+            LogLevel::Warning,
+            QStringLiteral("QFrameworkApp"),
+            QString::fromUtf8(u8"已加载旧版布局；请确认模块显示状态后重新保存"));
+        statusBar()->showMessage(
+            QString::fromUtf8(u8"旧版布局已加载，请确认显示状态后重新保存"), 8000);
     }
     return true;
 }
@@ -208,46 +233,59 @@ void MainWindow::showModuleManager()
 }
 
 // 从 QAction 动态属性解析 moduleId，复用统一显示入口。
-void MainWindow::onModuleActionTriggered()
+void MainWindow::onModuleActionTriggered(bool checked)
 {
     // 每个 QAction 的动态属性保存 moduleId，避免为每个模块创建专用槽。
     QAction* action = qobject_cast<QAction*>(sender());
-    if (action != nullptr)
-        showModule(action->property("moduleId").toString());
+    if (action != nullptr) {
+        setRequestedDockVisible(action->property("moduleId").toString(),
+                                checked,
+                                VisibilityOrigin::UserAction);
+    }
 }
 
-// 把 Dock 的可见性变化反映到对应菜单勾选状态。
-void MainWindow::onDockVisibilityChanged(bool visible)
+// 只有 Dock 关闭按钮才撤销显示意图；标签切换不会经过这里。
+void MainWindow::onDockCloseRequested()
 {
-    // Dock 的关闭按钮只改变可见性；同步菜单勾选状态时阻塞 action 信号，
-    // 防止 setChecked 反向再次触发 showModule。
     ManagedDockWidget* dockWidget = qobject_cast<ManagedDockWidget*>(sender());
     if (dockWidget == nullptr)
         return;
-    QAction* action = moduleActions_.value(
-        dockWidget->property("moduleId").toString(), nullptr);
-    if (action != nullptr) {
-        const QSignalBlocker blocker(action);
-        action->setChecked(visible);
-    }
+    setRequestedDockVisible(dockWidget->property("moduleId").toString(),
+                            false,
+                            VisibilityOrigin::CloseButton);
 }
 
 // 处理管理对话框的显示请求。
 void MainWindow::onShowModuleRequested(const QString& moduleId)
 {
-    // 管理对话框和菜单最终复用同一个 showModule 规则。
-    showModule(moduleId);
+    setRequestedDockVisible(moduleId, true, VisibilityOrigin::UserAction);
 }
 
 // 处理管理对话框的子进程重启请求并统一呈现错误。
 void MainWindow::onRestartModuleRequested(const QString& moduleId)
 {
-    // restart 内部有超时；失败统一通过日志和对话框报告。
+    // 这里只提交状态转换；QProcess/Socket 信号在后续事件循环中完成重启。
     if (processSupervisor_ == nullptr)
         return;
     QString error;
-    if (!processSupervisor_->restart(moduleId, &error))
-        reportStateFailure(QString::fromUtf8(u8"子进程重启失败"), error);
+    if (!processSupervisor_->requestRestart(moduleId, &error))
+        reportStateFailure(QString::fromUtf8(u8"子进程重启请求失败"), error);
+}
+
+// 最终结果只从状态机 signal 进入 UI，避免请求函数返回值被误当成重启完成。
+void MainWindow::onRestartFinished(const QString& moduleId,
+                                   bool success,
+                                   const QString& detail)
+{
+    if (success) {
+        statusBar()->showMessage(
+            QString::fromUtf8(u8"模块 %1 已重新启动").arg(displayName(moduleId)),
+            5000);
+        return;
+    }
+    reportStateFailure(
+        QString::fromUtf8(u8"模块 %1 重启失败").arg(displayName(moduleId)),
+        detail);
 }
 
 // 接收插件/监督器状态，更新表格、占位页和状态栏快照。
@@ -265,6 +303,7 @@ void MainWindow::onModuleStateChanged(const QString& moduleId,
          state == QStringLiteral("Restarting") ||
          state == QStringLiteral("Failed") ||
          state == QStringLiteral("Stopped"))) {
+        setUiAvailable(moduleId, false);
         host->showPlaceholder(placeholderText(moduleId, detail.isEmpty() ? state : detail));
     }
     updateStatusSummary();
@@ -279,10 +318,10 @@ void MainWindow::onModuleFault(const QString& moduleId, const QString& detail)
         detail);
 }
 
-// 接收子进程原生窗口句柄，完成嵌入并发送尺寸显示命令。
+// 接收子进程原生窗口句柄；是否发送显示命令仍由用户/布局意图决定。
 void MainWindow::onWindowHandleReady(const QString& moduleId, quintptr windowId)
 {
-    // 先包装 HWND，再把容器实际尺寸发回子进程；两步任一失败都恢复占位页。
+    // 先包装 HWND，再把 ready 状态交给统一显示入口；明确隐藏时不补发 showWindow。
     ProcessWindowHost* host = processHosts_.value(moduleId, nullptr);
     if (host == nullptr)
         return;
@@ -291,16 +330,34 @@ void MainWindow::onWindowHandleReady(const QString& moduleId, quintptr windowId)
         reportStateFailure(QString::fromUtf8(u8"子进程窗口嵌入失败"), error);
         return;
     }
-    if (processSupervisor_ == nullptr ||
-        !processSupervisor_->showWindow(moduleId,
-                                        host->width(),
-                                        host->height(),
-                                        &error)) {
-        host->showPlaceholder(placeholderText(moduleId, error));
-        reportStateFailure(QString::fromUtf8(u8"子进程窗口显示失败"), error);
+    setUiAvailable(moduleId, true);
+}
+
+// 宿主连续 resize 合并后只把最终客户区尺寸转发给仍在显示的当前 generation。
+void MainWindow::onProcessWindowSizeChanged(const QString& moduleId,
+                                            const QSize& size)
+{
+    ProcessWindowHost* host = processHosts_.value(moduleId, nullptr);
+    ManagedDockWidget* dockWidget = moduleDocks_.value(moduleId, nullptr);
+    if (host == nullptr || dockWidget == nullptr || processSupervisor_ == nullptr ||
+        !host->hasEmbeddedWindow() || !dockWidget->isVisible() ||
+        !requestedDockVisibility_.value(moduleId, false) ||
+        !uiAvailable_.value(moduleId, false) ||
+        processSupervisor_->state(moduleId) != QStringLiteral("Running") ||
+        size.width() <= 0 || size.height() <= 0) {
         return;
     }
-    setUiAvailable(moduleId, true);
+
+    QString error;
+    if (!processSupervisor_->resizeWindow(moduleId,
+                                          size.width(),
+                                          size.height(),
+                                          &error)) {
+        // 发送失败由 ProcessSupervisor 进入故障/重启状态；resize 路径不弹重复对话框。
+        Logger::instance().log(LogLevel::Error,
+                               QStringLiteral("QFrameworkApp"),
+                               QString::fromUtf8(u8"子进程窗口尺寸同步失败：%1").arg(error));
+    }
 }
 
 // 打开非原生文件选择器，加载用户选择的 .qflayout 并报告不可用模块。
@@ -341,7 +398,9 @@ void MainWindow::saveCurrentLayout()
         return;
     }
     QString error;
-    if (!layoutManager_->saveLayout(layoutManager_->activeFilePath(), &error)) {
+    if (!layoutManager_->saveLayout(layoutManager_->activeFilePath(),
+                                    requestedDockVisibility_,
+                                    &error)) {
         reportStateFailure(QString::fromUtf8(u8"布局保存失败"), error);
         return;
     }
@@ -365,7 +424,7 @@ void MainWindow::saveLayoutAs()
         filePath.append(QStringLiteral(".qflayout"));
 
     QString error;
-    if (!layoutManager_->saveLayout(filePath, &error)) {
+    if (!layoutManager_->saveLayout(filePath, requestedDockVisibility_, &error)) {
         reportStateFailure(QString::fromUtf8(u8"布局保存失败"), error);
         return;
     }
@@ -413,7 +472,7 @@ void MainWindow::reloadStyleSheet()
 // 创建文件、模块和样式菜单，并把动作连接到本类槽函数。
 void MainWindow::createActions()
 {
-    // 菜单按文件、模块、样式三组构造；模块菜单项初始禁用，等 UI ready。
+    // 菜单按文件、模块、样式三组构造；模块菜单可提前记录晚到窗口的显示意图。
     QMenu* fileMenu = menuBar()->addMenu(QString::fromUtf8(u8"文件(&F)"));
     QAction* loadLayoutAction = fileMenu->addAction(
         themedIcon(this, QStringLiteral("document-open"), QStyle::SP_DialogOpenButton),
@@ -443,7 +502,8 @@ void MainWindow::createActions()
         QAction* action = moduleMenu->addAction(
             module.displayName.isEmpty() ? module.id : module.displayName);
         action->setCheckable(true);
-        action->setEnabled(false);
+        action->setEnabled(true);
+        action->setObjectName(QStringLiteral("ModuleAction.%1").arg(module.id));
         action->setProperty("moduleId", module.id);
         connect(action, &QAction::triggered, this, &MainWindow::onModuleActionTriggered);
         moduleActions_.insert(module.id, action);
@@ -481,6 +541,12 @@ void MainWindow::createModuleDocks()
         if (module.type == ModuleType::ProcessUi) {
             ProcessWindowHost* host = new ProcessWindowHost(dockWidget);
             dockWidget->setWidget(host);
+            connect(host,
+                    &ProcessWindowHost::clientSizeChanged,
+                    this,
+                    [this, module](const QSize& size) {
+                        onProcessWindowSizeChanged(module.id, size);
+                    });
             processHosts_.insert(module.id, host);
         } else {
             QLabel* placeholder = new QLabel(
@@ -496,11 +562,13 @@ void MainWindow::createModuleDocks()
             tabifyDockWidget(previousDock, dockWidget);
         dockWidget->hide();
         connect(dockWidget,
-                &QDockWidget::visibilityChanged,
+                &ManagedDockWidget::closeRequested,
                 this,
-                &MainWindow::onDockVisibilityChanged);
+                &MainWindow::onDockCloseRequested);
         moduleDocks_.insert(module.id, dockWidget);
+        requestedDockVisibility_.insert(module.id, false);
         uiAvailable_.insert(module.id, false);
+        layoutManager_->registerModuleDock(module.id, dockWidget);
         previousDock = dockWidget;
     }
 }
@@ -508,30 +576,80 @@ void MainWindow::createModuleDocks()
 // 同步菜单、管理对话框和布局注册表中的 UI 可用标志。
 void MainWindow::setUiAvailable(const QString& moduleId, bool available)
 {
-    // 同时更新菜单、管理对话框和布局注册表，避免三处状态不一致。
+    // ready 只决定此刻能否显示；不能覆盖用户或布局保存的显示意图。
     uiAvailable_.insert(moduleId, available);
-    QAction* action = moduleActions_.value(moduleId, nullptr);
-    if (action != nullptr)
-        action->setEnabled(available);
     moduleManagerDialog_->setUiAvailable(moduleId, available);
-    if (available) {
-        ManagedDockWidget* dockWidget = moduleDocks_.value(moduleId, nullptr);
-        if (dockWidget != nullptr)
-            layoutManager_->registerModuleDock(moduleId, dockWidget);
-    }
+    syncModuleAction(moduleId);
+    applyRequestedDockVisibility(
+        moduleId, available ? VisibilityOrigin::WindowReady : VisibilityOrigin::RuntimeState);
 }
 
-// 显示一个已准备好的 Dock；不可用模块请求会被安全忽略。
-void MainWindow::showModule(const QString& moduleId)
+// 写入用户/布局意图后再统一计算实际可见性。
+void MainWindow::setRequestedDockVisible(const QString& moduleId,
+                                         bool visible,
+                                         VisibilityOrigin origin)
 {
-    // 不可用 UI 永远不显示；被用户拖离停靠区时先重新加入主窗口。
-    ManagedDockWidget* dockWidget = moduleDocks_.value(moduleId, nullptr);
-    if (dockWidget == nullptr || !uiAvailable_.value(moduleId, false))
+    if (!moduleDocks_.contains(moduleId))
         return;
+    requestedDockVisibility_.insert(moduleId, visible);
+    syncModuleAction(moduleId);
+    applyRequestedDockVisibility(moduleId, origin);
+}
+
+// 实际显示必须同时满足“用户希望显示”和“模块界面已经 ready”。
+void MainWindow::applyRequestedDockVisibility(const QString& moduleId,
+                                              VisibilityOrigin origin)
+{
+    ManagedDockWidget* dockWidget = moduleDocks_.value(moduleId, nullptr);
+    if (dockWidget == nullptr)
+        return;
+    if (!requestedDockVisibility_.value(moduleId, false) ||
+        !uiAvailable_.value(moduleId, false)) {
+        dockWidget->hide();
+        return;
+    }
     if (dockWidgetArea(dockWidget) == Qt::NoDockWidgetArea)
         addDockWidget(Qt::LeftDockWidgetArea, dockWidget);
+
+    // 布局恢复或窗口晚到时，记住当前标签，show 后再抬回，避免抢走用户焦点。
+    ManagedDockWidget* activeTab = nullptr;
+    if (origin != VisibilityOrigin::UserAction) {
+        const QList<QDockWidget*> siblings = tabifiedDockWidgets(dockWidget);
+        for (QDockWidget* sibling : siblings) {
+            if (sibling != nullptr && sibling->isVisible()) {
+                activeTab = qobject_cast<ManagedDockWidget*>(sibling);
+                break;
+            }
+        }
+    }
     dockWidget->show();
-    dockWidget->raise();
+
+    // ProcessUi 只有在显示意图和 ready 同时成立时才收到 showWindow；后续
+    // resizeEvent 使用独立 resizeWindow 帧，不会重复调用子进程 QWidget::show()。
+    ProcessWindowHost* host = processHosts_.value(moduleId, nullptr);
+    if (host != nullptr && host->hasEmbeddedWindow()) {
+        QString error;
+        if (processSupervisor_ == nullptr ||
+            !processSupervisor_->showWindow(moduleId, &error)) {
+            host->showPlaceholder(placeholderText(moduleId, error));
+            reportStateFailure(QString::fromUtf8(u8"子进程窗口显示失败"), error);
+            return;
+        }
+    }
+    if (origin == VisibilityOrigin::UserAction)
+        dockWidget->raise();
+    else if (activeTab != nullptr)
+        activeTab->raise();
+}
+
+// 程序同步 QAction 时阻塞信号，避免把状态回写误当成一次用户操作。
+void MainWindow::syncModuleAction(const QString& moduleId)
+{
+    QAction* action = moduleActions_.value(moduleId, nullptr);
+    if (action == nullptr)
+        return;
+    const QSignalBlocker blocker(action);
+    action->setChecked(requestedDockVisibility_.value(moduleId, false));
 }
 
 // 重新计算状态栏“运行中/启用总数”摘要。

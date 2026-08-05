@@ -1,7 +1,10 @@
 #include "ProcessWindowHost.h"
 
 #include <QLabel>
+#include <QResizeEvent>
+#include <QSizePolicy>
 #include <QStackedLayout>
+#include <QTimer>
 #include <QWindow>
 
 // 主进程只包装 HWND，不拥有子进程业务 QWidget；子进程退出时必须先清除
@@ -15,7 +18,8 @@ ProcessWindowHost::ProcessWindowHost(QWidget* parent)
       stackedLayout_(new QStackedLayout(this)),
       placeholderLabel_(new QLabel(QString::fromUtf8(u8"等待子进程窗口"), this)),
       windowContainer_(nullptr),
-      foreignWindow_(nullptr)
+      foreignWindow_(nullptr),
+      resizeTimer_(new QTimer(this))
 {
     // 初始状态没有子窗口，先显示居中且可换行的等待说明。
     placeholderLabel_->setAlignment(Qt::AlignCenter);
@@ -23,7 +27,12 @@ ProcessWindowHost::ProcessWindowHost(QWidget* parent)
     placeholderLabel_->setObjectName(QStringLiteral("ProcessWindowPlaceholder"));
     stackedLayout_->setContentsMargins(0, 0, 0, 0);
     stackedLayout_->addWidget(placeholderLabel_);
+    resizeTimer_->setSingleShot(true);
+    resizeTimer_->setInterval(50);
+    connect(resizeTimer_, &QTimer::timeout,
+            this, &ProcessWindowHost::flushClientSizeNotification);
     setMinimumSize(180, 120);
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 }
 
 // 析构前解除外部窗口容器，避免 Qt 在宿主销毁后保留悬空 HWND。
@@ -63,9 +72,16 @@ bool ProcessWindowHost::attachWindow(quintptr windowId, QString* errorMessage)
         return false;
     }
 
+    // 外部 QWindow 的 sizeHint 可能把 QDockWidget 最小尺寸放大到屏幕之外；
+    // 宿主尺寸由自己的客户区决定，不能让外部窗口反向污染布局约束。
+    windowContainer_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+    windowContainer_->setMinimumSize(0, 0);
+    windowContainer_->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
     windowContainer_->setFocusPolicy(Qt::StrongFocus);
     stackedLayout_->addWidget(windowContainer_);
     stackedLayout_->setCurrentWidget(windowContainer_);
+    windowContainer_->setGeometry(rect());
+    scheduleClientSizeNotification();
     return true;
 }
 
@@ -73,6 +89,7 @@ bool ProcessWindowHost::attachWindow(quintptr windowId, QString* errorMessage)
 void ProcessWindowHost::showPlaceholder(const QString& detail)
 {
     // 故障/重启时先断开旧窗口，再切回占位页。
+    resizeTimer_->stop();
     clearEmbeddedWindow();
     placeholderLabel_->setText(detail.isEmpty()
         ? QString::fromUtf8(u8"等待子进程窗口") : detail);
@@ -86,6 +103,50 @@ bool ProcessWindowHost::hasEmbeddedWindow() const
     return windowContainer_ != nullptr;
 }
 
+void ProcessWindowHost::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    if (windowContainer_ != nullptr)
+        windowContainer_->setGeometry(rect());
+    scheduleClientSizeNotification();
+}
+
+void ProcessWindowHost::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    if (windowContainer_ != nullptr)
+        windowContainer_->setGeometry(rect());
+    scheduleClientSizeNotification();
+}
+
+QSize ProcessWindowHost::sizeHint() const
+{
+    // 固定宿主提示尺寸，避免 foreign QWindow 的历史尺寸把整个 Dock 拉长。
+    return QSize(320, 240);
+}
+
+QSize ProcessWindowHost::minimumSizeHint() const
+{
+    return QSize(180, 120);
+}
+
+void ProcessWindowHost::scheduleClientSizeNotification()
+{
+    if (windowContainer_ == nullptr || !isVisible())
+        return;
+    resizeTimer_->start();
+}
+
+void ProcessWindowHost::flushClientSizeNotification()
+{
+    if (windowContainer_ == nullptr || !isVisible())
+        return;
+    windowContainer_->setGeometry(rect());
+    const QSize clientSize = rect().size();
+    if (clientSize.width() > 0 && clientSize.height() > 0)
+        emit clientSizeChanged(clientSize);
+}
+
 // 从布局移除并销毁容器；容器拥有的 QWindow 随之失效，指针必须清零。
 void ProcessWindowHost::clearEmbeddedWindow()
 {
@@ -94,10 +155,13 @@ void ProcessWindowHost::clearEmbeddedWindow()
         return;
     }
 
-    // 先从布局移除再 delete，避免布局保存悬空控件指针。
-    stackedLayout_->removeWidget(windowContainer_);
-    delete windowContainer_;
+    // 先隐藏并从布局移除，再延迟销毁。旧进程的 HWND 可能仍在处理原生
+    // resize/paint 事件，同步 delete 会让 Qt 容器在重启边界访问失效句柄。
+    QWidget* retiredContainer = windowContainer_;
     windowContainer_ = nullptr;
+    stackedLayout_->removeWidget(retiredContainer);
+    retiredContainer->hide();
+    retiredContainer->deleteLater();
     // createWindowContainer 持有 QWindow，容器析构后该指针不再有效。
     foreignWindow_ = nullptr;
 }

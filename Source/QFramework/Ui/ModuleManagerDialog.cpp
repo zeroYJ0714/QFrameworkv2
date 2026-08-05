@@ -61,6 +61,9 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
     int row = 0;
     for (const ModuleConfig& module : modules) {
         rows_.insert(module.id, row);
+        moduleStates_.insert(
+            module.id,
+            module.enabled ? QString::fromUtf8(u8"等待启动") : QString::fromUtf8(u8"已禁用"));
         QTableWidgetItem* nameItem = new QTableWidgetItem(
             module.displayName.isEmpty() ? module.id : module.displayName);
         nameItem->setToolTip(module.id);
@@ -107,12 +110,15 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
             restartButton->setAutoRaise(true);
             restartButton->setFixedSize(28, 28);
             restartButton->setProperty("moduleId", module.id);
+            restartButton->setProperty("configuredEnabled", module.enabled);
             restartButton->setEnabled(module.enabled);
             connect(restartButton,
                     &QToolButton::clicked,
                     this,
                     &ModuleManagerDialog::onRestartButtonClicked);
             actionLayout->addWidget(restartButton);
+            restartButtons_.insert(module.id, restartButton);
+            restartBusy_.insert(module.id, false);
         }
         actionLayout->addStretch();
         tableWidget_->setCellWidget(row, 3, actionWidget);
@@ -139,6 +145,8 @@ void ModuleManagerDialog::setModuleState(const QString& moduleId,
         return;
     item->setText(state);
     item->setToolTip(detail);
+    moduleStates_.insert(moduleId, state);
+    updateRestartButton(moduleId);
 }
 
 // 切换对应“显示”按钮；非 UI 模块没有按钮且无需处理。
@@ -148,6 +156,15 @@ void ModuleManagerDialog::setUiAvailable(const QString& moduleId, bool available
     QToolButton* button = showButtons_.value(moduleId, nullptr);
     if (button != nullptr)
         button->setEnabled(available);
+}
+
+// operationBusyChanged 与状态文本共同决定按钮；任一仍在进行都不能重复提交。
+void ModuleManagerDialog::setRestartBusy(const QString& moduleId, bool busy)
+{
+    if (!restartButtons_.contains(moduleId))
+        return;
+    restartBusy_.insert(moduleId, busy);
+    updateRestartButton(moduleId);
 }
 
 // 从点击按钮的动态属性取出 moduleId，再发出纯请求信号。
@@ -166,6 +183,20 @@ void ModuleManagerDialog::onRestartButtonClicked()
     QObject* button = sender();
     if (button != nullptr)
         emit restartModuleRequested(button->property("moduleId").toString());
+}
+
+void ModuleManagerDialog::updateRestartButton(const QString& moduleId)
+{
+    QToolButton* button = restartButtons_.value(moduleId, nullptr);
+    if (button == nullptr)
+        return;
+    const QString state = moduleStates_.value(moduleId);
+    const bool lifecycleBusy = state == QStringLiteral("Starting") ||
+                               state == QStringLiteral("Stopping") ||
+                               state == QStringLiteral("Restarting");
+    button->setEnabled(button->property("configuredEnabled").toBool() &&
+                       !restartBusy_.value(moduleId, false) &&
+                       !lifecycleBusy);
 }
 
 // 把枚举转换成和 INI 相同的稳定文本，便于用户对照配置。

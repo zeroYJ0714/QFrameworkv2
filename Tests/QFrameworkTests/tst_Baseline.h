@@ -42,10 +42,35 @@ private slots:
     void processHeartbeatTimeout();
     // 检查调试器等待阶段不会被普通心跳误杀。
     void processDebuggerWaitDefersHeartbeat();
+    void processRestartRequestDoesNotBlockGui();
+    void processRejectsDuplicateRestartRequest();
+    void processStopClosesIngressImmediately();
+    void processDeadlinesAreIndependentPerEntry();
+    void processStopAckAdvancesState();
+    void processShutdownUsesOneTotalDeadline();
+    void processStartupBatchCompletesAsynchronously();
+    void messageBusStopTimeoutIsBounded();
+    void timedOutQueueIsNotDeletedOrUnloaded();
+    void processHungCallbackEndsWholeChild();
+    void shutdownRequestsFailFastForHungInProcessModule();
+    void messageQueueNeverUsesThreadTerminate();
+    void processPublishGateIsThreadSafeDuringStop();
+    void processControlWriteFailureTriggersFaultImmediately();
+    void processStopAccountingIncludesDiscardedMessages();
+    void processRestartWindowBoundaryIsInclusive();
+    void processSocketAccessStaysOnRuntimeThread();
     // 检查同一部署目录只能持有一个实例互斥量。
     void singleInstancePerDirectory();
     // 检查 Dock 布局保存、恢复和不可用模块处理。
     void layoutPersistenceAndDockingRules();
+    void moduleMenuTogglesRequestedVisibility();
+    void dockCloseClearsRequestedVisibility();
+    void tabSwitchKeepsRequestedVisibility();
+    void layoutPreservesTabbedVisibilityIntent();
+    void layoutDefersUnavailableDockUntilReady();
+    void layoutHiddenDockStaysHiddenAfterReady();
+    void processUiLateWindowHonorsLayoutVisibility();
+    void legacyLayoutLoadsWithoutCorruptingCurrentState();
     // 检查 QSS 重载和失败时保留旧样式。
     void styleSheetReloadAndFailureRecovery();
     // 检查默认/非法配置回退 100 ms，并由后台线程自动落盘。

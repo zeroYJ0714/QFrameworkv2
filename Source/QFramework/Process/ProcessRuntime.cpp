@@ -45,6 +45,7 @@ const QString kStop = QStringLiteral("stop");
 const QString kStopAck = QStringLiteral("stopAck");
 const QString kWindowReady = QStringLiteral("windowReady");
 const QString kShowWindow = QStringLiteral("showWindow");
+const QString kResizeWindow = QStringLiteral("resizeWindow");
 const QString kWindowWidth = QStringLiteral("windowWidth");
 const QString kWindowHeight = QStringLiteral("windowHeight");
 const QString kSharedAck = QStringLiteral("sharedAck");
@@ -72,15 +73,21 @@ QString sharedKey(const QString& prefix)
         .arg(prefix, QUuid::createUuid().toString(QUuid::Id128));
 }
 
-void showEmbeddedWidget(QWidget* widget, int width, int height)
+void showEmbeddedWidget(QWidget* widget)
 {
-    // 主进程要求显示时，子进程先 show，再按正尺寸更新客户区。
+    // showWindow 只负责改变可见状态；尺寸变化由独立 resizeWindow 帧处理。
     if (widget == nullptr)
         return;
 
     widget->show();
-    if (width > 0 && height > 0)
-        widget->resize(width, height);
+}
+
+void resizeEmbeddedWidget(QWidget* widget, int width, int height)
+{
+    // resizeWindow 不重复 show，避免拖动 Dock 时触发重入的窗口生命周期事件。
+    if (widget == nullptr || width <= 0 || height <= 0)
+        return;
+    widget->resize(width, height);
 }
 
 struct OutboundMessage
@@ -144,6 +151,13 @@ private:
 class ProcessRuntime::PublishQueue final
 {
 public:
+    struct Stats
+    {
+        quint64 dropped = 0;
+        quint64 rejected = 0;
+        quint64 abandoned = 0;
+    };
+
     // runtime 用于安排合并后的 drainPublishQueue 唤醒事件。
     explicit PublishQueue(ProcessRuntime* runtime)
         : runtime_(runtime),
@@ -157,21 +171,48 @@ public:
     // 从任意模块线程入队；满队列按 TopicSettings 选择覆盖或拒绝。
     bool enqueue(const QString& topic,
                  const QByteArray& data,
-                 const ProcessRuntime::TopicSettings& config)
+                 const ProcessRuntime::TopicSettings& config,
+                 bool* logWarning,
+                 Stats* stats)
     {
         bool schedule = false;
+        bool changed = false;
         {
             QMutexLocker locker(&mutex_);
+            const auto finish = [this, &changed, logWarning, stats](bool result) {
+                if (logWarning != nullptr) {
+                    *logWarning = false;
+                    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+                    if (changed && now - lastWarningMs_ >= 1000) {
+                        lastWarningMs_ = now;
+                        *logWarning = true;
+                    }
+                }
+                if (stats != nullptr)
+                    *stats = stats_;
+                return result;
+            };
             // accepting_ 在断线、stop 和析构时会被关闭；所有生产者都先检查它，
             // 因此停止过程不需要依赖一个可能永远不返回的阻塞发送。
-            if (!accepting_)
-                return false;
+            if (!accepting_) {
+                ++stats_.rejected;
+                changed = true;
+                return finish(false);
+            }
+            if (data.size() > config.maxMessageBytes) {
+                ++stats_.rejected;
+                changed = true;
+                return finish(false);
+            }
 
             int topicCount = queuedTopicCount(queue_, topic);
             if (topicCount >= config.queueCapacity) {
-                if (!config.latest)
+                if (!config.latest) {
                     // Reliable 的“满”是明确拒绝，不允许用新帧覆盖旧帧。
-                    return false;
+                    ++stats_.rejected;
+                    changed = true;
+                    return finish(false);
+                }
                 int oldestIndex = -1;
                 for (int index = 0; index < queue_.size(); ++index) {
                     if (queue_.at(index).topic == topic) {
@@ -179,24 +220,29 @@ public:
                         break;
                     }
                 }
-                if (oldestIndex < 0)
-                    return false;
+                if (oldestIndex < 0) {
+                    ++stats_.rejected;
+                    changed = true;
+                    return finish(false);
+                }
                 // Latest 只替换同主题等待队列中最早的一项；已经发出并等待
                 // publishAck 的项不在 queue_ 中，所以不会被覆盖。
                 queue_.removeAt(oldestIndex);
+                ++stats_.dropped;
+                changed = true;
             }
 
             OutboundMessage message;
             message.topic = topic;
             message.data = data;
             queue_.enqueue(message);
-            available_.wakeOne();
             if (!wakeScheduled_) {
                 // 只安排一次无参数 Qt 唤醒。后续消息仍留在 queue_，由 drain
                 // 以有限批次取走，避免“一次 publish 一个 queued event”。
                 wakeScheduled_ = true;
                 schedule = true;
             }
+            finish(true);
         }
         if (schedule)
             QMetaObject::invokeMethod(runtime_,
@@ -256,8 +302,23 @@ public:
         else
             inFlightByTopic_.insert(topic, count - 1);
         inFlightCount_ = qMax(0, inFlightCount_ - 1);
-        available_.wakeAll();
         return true;
+    }
+
+    // Socket/共享内存尚未接受这一项时按 dropped 回收，不把它算成远端拒绝。
+    void discardBeforeSend(const QString& messageId)
+    {
+        QMutexLocker locker(&mutex_);
+        const QString topic = messageTopics_.take(messageId);
+        if (topic.isEmpty())
+            return;
+        const int count = inFlightByTopic_.value(topic, 0);
+        if (count <= 1)
+            inFlightByTopic_.remove(topic);
+        else
+            inFlightByTopic_.insert(topic, count - 1);
+        inFlightCount_ = qMax(0, inFlightCount_ - 1);
+        ++stats_.dropped;
     }
 
     // ACK 释放槽位后判断是否需要再次安排合并唤醒。
@@ -302,11 +363,12 @@ public:
     }
 
     // 停止时原子切断生产、清空等待/在途状态并唤醒所有潜在等待者。
-    void stop()
+    Stats stop()
     {
         QMutexLocker locker(&mutex_);
-        // stop 不等待任何生产者。清空等待队列、ACK 映射和计数后 wakeAll，
-        // 让可能正在等待 ACK/槽位的逻辑在有限生命周期内结束。
+        // 同一轮可能从 stop、断线和析构重复进入；容器清空后再次调用不会重复计数。
+        stats_.dropped += static_cast<quint64>(queue_.size());
+        stats_.abandoned += static_cast<quint64>(messageTopics_.size());
         accepting_ = false;
         stopping_ = true;
         queue_.clear();
@@ -314,15 +376,14 @@ public:
         messageTopics_.clear();
         inFlightCount_ = 0;
         wakeScheduled_ = false;
-        available_.wakeAll();
+        return stats_;
     }
 
 private:
     // runtime_ 只用于投递合并唤醒，队列本身不拥有运行时。
     ProcessRuntime* runtime_;
-    // mutex_ 保护等待队列、在途表和状态标志；available_ 唤醒 ACK/停止相关路径。
+    // mutex_ 保护等待队列、在途表、统计和状态标志；本队列没有阻塞等待者。
     QMutex mutex_;
-    QWaitCondition available_;
     // 尚未写入 Socket 的业务消息。
     QQueue<OutboundMessage> queue_;
     // 每主题在途数和 messageId -> topic 反向索引。
@@ -334,6 +395,8 @@ private:
     bool wakeScheduled_;
     // 仅用于诊断和清理一致性检查，不直接决定容量。
     int inFlightCount_;
+    Stats stats_;
+    qint64 lastWarningMs_ = 0;
 };
 
 // 父到子的线程安全输入队列。收到消息后可立即 deliveryAck，消费者速度不再
@@ -341,6 +404,12 @@ private:
 class ProcessRuntime::MessageQueue final : public QThread
 {
 public:
+    enum class StopResult
+    {
+        Stopped,
+        TimedOut
+    };
+
     // 保存模块借用指针和 registerAck 下发的主题快照。
     MessageQueue(ModuleEndpoint* module,
                  const QHash<QString, ProcessRuntime::TopicSettings>& topicConfigs,
@@ -393,7 +462,7 @@ public:
     }
 
     // 禁止新入队并在有限时间内等待 onMessage 线程结束。
-    bool stopAndDrain(int timeoutMs)
+    StopResult stopAndDrain(int timeoutMs)
     {
         {
             QMutexLocker locker(&mutex_);
@@ -404,11 +473,9 @@ public:
             available_.wakeAll();
         }
         if (wait(static_cast<unsigned long>(qMax(1, timeoutMs))))
-            return true;
-        // 模块回调若卡住，停止边界仍不得无限等待；正常路径总会先走上面的
-        // 有限等待，只有故障注入才会到这里。
-        terminate();
-        return wait(static_cast<unsigned long>(qMax(1, timeoutMs)));
+            return StopResult::Stopped;
+        // 回调超时后保留线程和模块对象；调用方将结束整个子进程隔离边界。
+        return StopResult::TimedOut;
     }
 
 protected:
@@ -480,8 +547,12 @@ ProcessRuntime::ProcessRuntime(QCoreApplication* application, ModuleEndpoint* mo
       registrationAcknowledged_(false),
       running_(false),
       stopping_(false),
+      unsafeMessageThread_(false),
       exitCode_(0),
       publishRejectedCount_(0),
+      publishDroppedCount_(0),
+      publishLocalRejectedCount_(0),
+      publishAbandonedCount_(0),
       lastPublishRejectWarningMs_(0)
 {
     connect(socket_, &QLocalSocket::connected,
@@ -496,39 +567,90 @@ ProcessRuntime::ProcessRuntime(QCoreApplication* application, ModuleEndpoint* mo
             &ProcessRuntime::onSocketError);
 }
 
+void ProcessRuntime::assertSocketThread() const
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    Q_ASSERT(socket_ == nullptr || socket_->thread() == QThread::currentThread());
+}
+
+bool ProcessRuntime::stopPublishQueue(const QString& reason, bool report)
+{
+    PublishQueue::Stats stats;
+    {
+        QMutexLocker locker(&publishQueueMutex_);
+        if (publishQueue_ == nullptr)
+            return true;
+        stats = publishQueue_->stop();
+    }
+    publishDroppedCount_ = stats.dropped;
+    publishLocalRejectedCount_ = stats.rejected;
+    publishAbandonedCount_ = stats.abandoned;
+    if (!report || (stats.dropped == 0 && stats.rejected == 0 &&
+                    stats.abandoned == 0 && publishRejectedCount_ == 0)) {
+        return true;
+    }
+
+    // 汇总帧只从 Runtime 线程发送；传输本身失败时由调用者进入统一 fault/finish。
+    assertSocketThread();
+    QJsonObject frame;
+    frame.insert(QStringLiteral("type"), kLog);
+    frame.insert(QStringLiteral("level"), static_cast<int>(LogLevel::Warning));
+    frame.insert(
+        QStringLiteral("text"),
+        QString::fromUtf8(
+            u8"子进程发送队列汇总（%1）：dropped=%2，rejected=%3，abandoned=%4，remoteRejected=%5")
+            .arg(reason)
+            .arg(stats.dropped)
+            .arg(stats.rejected)
+            .arg(stats.abandoned)
+            .arg(publishRejectedCount_));
+    return sendFrame(frame);
+}
+
 // 析构是所有退出路径的统一资源兜底，包括正常 stop、断线和协议错误。
 ProcessRuntime::~ProcessRuntime()
 {
     // 析构顺序与数据流相反：先停止生产者和消息线程，再释放模块，最后
     // 清理尚未收到 ACK 的共享内存。这样模块不会在 host 已失效后继续 publish。
-    if (publishQueue_ != nullptr)
-        publishQueue_->stop();
+    if (module_ != nullptr)
+        module_->setRunning(false);
+    stopPublishQueue(QString(), false);
     if (messageQueue_ != nullptr) {
-        if (messageQueue_->isRunning())
-            messageQueue_->stopAndDrain(shutdownDrainTimeoutMs_);
+        Q_ASSERT(!messageQueue_->isRunning());
         delete messageQueue_;
         messageQueue_ = nullptr;
     }
-    if (publishQueue_ != nullptr) {
-        delete publishQueue_;
-        publishQueue_ = nullptr;
-    }
     if (module_ != nullptr) {
-        module_->setRunning(false);
         module_->bindHost(QString(), nullptr);
         delete module_;
         module_ = nullptr;
     }
+    delete host_;
+    host_ = nullptr;
+    {
+        // queuePublish() 持有同一把锁直到 enqueue 返回，故此处不会删除在用指针。
+        QMutexLocker locker(&publishQueueMutex_);
+        delete publishQueue_;
+        publishQueue_ = nullptr;
+    }
     clearSharedSegments();
 }
 
-// 对外唯一入口：用栈对象保证 execute 返回时一定执行完整析构。
+// 对外唯一入口：安全停止时正常析构；卡死回调时泄漏到进程退出，避免删除活线程。
 int ProcessRuntime::run(QCoreApplication* application, ModuleEndpoint* module)
 {
     if (application == nullptr || module == nullptr)
         return 2;
-    ProcessRuntime runtime(application, module);
-    return runtime.execute();
+    ProcessRuntime* runtime = new ProcessRuntime(application, module);
+    const int result = runtime->execute();
+    if (!runtime->prepareForExit()) {
+        // 解除 QObject 父子关系，防止 QCoreApplication 析构时删除仍被回调借用的对象。
+        runtime->setParent(nullptr);
+        return result == 0 ? 7 : result;
+    }
+    runtime->setParent(nullptr);
+    delete runtime;
+    return result;
 }
 
 // 参数有效后连接父进程并进入现有 Qt 事件循环，最终返回内部退出码。
@@ -662,6 +784,7 @@ bool ProcessRuntime::parseTopicConfigs(const QJsonObject& frame)
 // Socket 建立后首先发送身份、随机令牌以及发布/订阅主题声明。
 void ProcessRuntime::onSocketConnected()
 {
+    assertSocketThread();
     QJsonObject frame;
     frame.insert(QStringLiteral("type"), kRegister);
     frame.insert(QStringLiteral("moduleId"), moduleId_);
@@ -676,12 +799,14 @@ void ProcessRuntime::onSocketConnected()
         subscribed.append(topic);
     frame.insert(QStringLiteral("publishedTopics"), published);
     frame.insert(QStringLiteral("subscribedTopics"), subscribed);
-    sendFrame(frame);
+    if (!sendFrame(frame))
+        finish(4);
 }
 
 // 累积任意长度的 Socket 数据，循环取出所有完整帧；半帧留到下一次 readyRead。
 void ProcessRuntime::onSocketReadyRead()
 {
+    assertSocketThread();
     inputBuffer_.append(socket_->readAll());
     for (;;) {
         QJsonObject frame;
@@ -707,6 +832,7 @@ void ProcessRuntime::onSocketReadyRead()
 // 非正常停止期间断线视为运行故障，使用专用退出码结束子进程。
 void ProcessRuntime::onSocketDisconnected()
 {
+    assertSocketThread();
     if (!stopping_)
         finish(4);
 }
@@ -714,6 +840,7 @@ void ProcessRuntime::onSocketDisconnected()
 // 注册前的连接错误无法恢复；注册后的断线会由 disconnected 路径处理。
 void ProcessRuntime::onSocketError(QLocalSocket::LocalSocketError error)
 {
+    assertSocketThread();
     Q_UNUSED(error)
     if (!registrationAcknowledged_)
         finish(3);
@@ -752,7 +879,10 @@ void ProcessRuntime::handleFrame(const QJsonObject& frame)
             } else {
                 QJsonObject timeoutFrame;
                 timeoutFrame.insert(QStringLiteral("type"), kDebugWaitTimeout);
-                sendFrame(timeoutFrame);
+                if (!sendFrame(timeoutFrame)) {
+                    finish(4);
+                    return;
+                }
             }
         }
 #endif
@@ -766,29 +896,29 @@ void ProcessRuntime::handleFrame(const QJsonObject& frame)
             QJsonObject failure;
             failure.insert(QStringLiteral("type"), kStartFailed);
             failure.insert(QStringLiteral("detail"), QString::fromUtf8(exception.what()));
-            sendFrame(failure);
+            const bool sent = sendFrame(failure);
             module_->setRunning(false);
             running_ = false;
-            finish(6);
+            finish(sent ? 6 : 4);
             return;
         } catch (...) {
             QJsonObject failure;
             failure.insert(QStringLiteral("type"), kStartFailed);
             failure.insert(QStringLiteral("detail"), QString::fromUtf8(u8"未知启动异常"));
-            sendFrame(failure);
+            const bool sent = sendFrame(failure);
             module_->setRunning(false);
             running_ = false;
-            finish(6);
+            finish(sent ? 6 : 4);
             return;
         }
         if (!started) {
             QJsonObject failure;
             failure.insert(QStringLiteral("type"), kStartFailed);
             failure.insert(QStringLiteral("detail"), QString::fromUtf8(u8"onStart 返回 false"));
-            sendFrame(failure);
+            const bool sent = sendFrame(failure);
             module_->setRunning(false);
             running_ = false;
-            finish(6);
+            finish(sent ? 6 : 4);
             return;
         }
         messageQueue_ = new MessageQueue(module_,
@@ -797,21 +927,28 @@ void ProcessRuntime::handleFrame(const QJsonObject& frame)
         messageQueue_->start();
         QJsonObject startedFrame;
         startedFrame.insert(QStringLiteral("type"), kStarted);
-        sendFrame(startedFrame);
+        if (!sendFrame(startedFrame)) {
+            finish(4);
+            return;
+        }
         QWidget* widget = dynamic_cast<QWidget*>(module_);
         if (widget != nullptr) {
             QJsonObject windowFrame;
             windowFrame.insert(QStringLiteral("type"), kWindowReady);
             windowFrame.insert(QStringLiteral("windowId"),
                                QString::number(static_cast<qulonglong>(widget->winId())));
-            sendFrame(windowFrame);
+            if (!sendFrame(windowFrame)) {
+                finish(4);
+                return;
+            }
         }
         return;
     }
     if (type == kPing) {
         QJsonObject pong;
         pong.insert(QStringLiteral("type"), kPong);
-        sendFrame(pong);
+        if (!sendFrame(pong))
+            finish(4);
         return;
     }
     if (type == kStyleSheet) {
@@ -823,21 +960,46 @@ void ProcessRuntime::handleFrame(const QJsonObject& frame)
     }
     if (type == kShowWindow && running_) {
         QWidget* widget = dynamic_cast<QWidget*>(module_);
-        showEmbeddedWidget(widget,
-                           frame.value(kWindowWidth).toInt(),
-                           frame.value(kWindowHeight).toInt());
+        showEmbeddedWidget(widget);
+        return;
+    }
+    if (type == kResizeWindow && running_) {
+        QWidget* widget = dynamic_cast<QWidget*>(module_);
+        resizeEmbeddedWidget(widget,
+                             frame.value(kWindowWidth).toInt(),
+                             frame.value(kWindowHeight).toInt());
         return;
     }
     if (type == kStop) {
         // 停止消息先关闭两个有界队列，再等待输入回调在限定时间内排空；
         // 无论 onStop() 是否抛异常，都要给父进程发送 stopAck，随后退出事件循环。
         stopping_ = true;
-        if (publishQueue_ != nullptr)
-            publishQueue_->stop();
         module_->setRunning(false);
         running_ = false;
+        if (!stopPublishQueue(QString::fromUtf8(u8"stop"), true)) {
+            finish(4);
+            return;
+        }
+        MessageQueue::StopResult queueStop = MessageQueue::StopResult::Stopped;
         if (messageQueue_ != nullptr)
-            messageQueue_->stopAndDrain(shutdownDrainTimeoutMs_);
+            queueStop = messageQueue_->stopAndDrain(shutdownDrainTimeoutMs_);
+        if (queueStop == MessageQueue::StopResult::TimedOut) {
+            unsafeMessageThread_ = true;
+            QJsonObject ack;
+            ack.insert(QStringLiteral("type"), kStopAck);
+            ack.insert(QStringLiteral("clean"), false);
+            ack.insert(QStringLiteral("detail"),
+                       QString::fromUtf8(u8"子进程消息回调停止超时，将结束整个进程"));
+            if (!sendFrame(ack)) {
+                finish(4);
+                return;
+            }
+            socket_->flush();
+            socket_->waitForBytesWritten(500);
+            // 不调用 onStop，不删除 MessageQueue/ModuleEndpoint；main 返回后整个进程结束。
+            finish(7);
+            return;
+        }
         try {
             module_->onStop();
         } catch (...) {
@@ -845,7 +1007,11 @@ void ProcessRuntime::handleFrame(const QJsonObject& frame)
         }
         QJsonObject ack;
         ack.insert(QStringLiteral("type"), kStopAck);
-        sendFrame(ack);
+        ack.insert(QStringLiteral("clean"), true);
+        if (!sendFrame(ack)) {
+            finish(4);
+            return;
+        }
         socket_->flush();
         socket_->waitForBytesWritten(500);
         finish(0);
@@ -900,12 +1066,14 @@ void ProcessRuntime::handleFrame(const QJsonObject& frame)
                           messageQueue_->enqueue(topic, sender, data);
     // delivery ACK 表示消息已经进入子进程有界队列；不等待慢消费者的
     // onMessage() 返回，父进程即可释放在途槽位和共享内存。
-    sendDeliveryAck(messageId, accepted);
+    if (!sendDeliveryAck(messageId, accepted))
+        finish(4);
 }
 
 // 从子到父发送队列取有限批次，并按大小选择 inline 或 shared 传输。
 void ProcessRuntime::drainPublishQueue()
 {
+    assertSocketThread();
     if (publishQueue_ == nullptr)
         return;
 
@@ -938,13 +1106,13 @@ void ProcessRuntime::drainPublishQueue()
             QSharedMemory* shared = new QSharedMemory(key, this);
             if (!shared->create(message.data.size())) {
                 delete shared;
-                publishQueue_->acknowledge(messageId, false);
+                publishQueue_->discardBeforeSend(messageId);
                 continue;
             }
             if (!shared->lock()) {
                 shared->detach();
                 delete shared;
-                publishQueue_->acknowledge(messageId, false);
+                publishQueue_->discardBeforeSend(messageId);
                 continue;
             }
             std::memcpy(shared->data(),
@@ -962,8 +1130,8 @@ void ProcessRuntime::drainPublishQueue()
             frame.insert(QStringLiteral("data"),
                          QString::fromLatin1(message.data.toBase64()));
         }
-        if (socket_->write(process::encodeFrame(frame)) < 0) {
-            publishQueue_->acknowledge(messageId, false);
+        if (!sendFrame(frame)) {
+            publishQueue_->discardBeforeSend(messageId);
             QSharedMemory* shared = outgoingSharedSegments_.take(messageId);
             if (shared != nullptr) {
                 shared->detach();
@@ -983,27 +1151,39 @@ void ProcessRuntime::drainPublishQueue()
 // 在运行时 Qt 线程中把模块日志编码成控制帧，避免跨线程直接使用 Socket。
 void ProcessRuntime::onSendLog(int level, const QString& text)
 {
-    if (socket_->state() != QLocalSocket::ConnectedState)
-        return;
+    assertSocketThread();
     QJsonObject frame;
     frame.insert(QStringLiteral("type"), kLog);
     frame.insert(QStringLiteral("level"), level);
     frame.insert(QStringLiteral("text"), text);
-    sendFrame(frame);
+    if (!sendFrame(frame))
+        finish(4);
 }
 
-// ModuleHost 的发布入口：只做生命周期/大小检查和本地有界入队。
+// ModuleHost 的发布入口：业务线程只进入受锁保护的本地有界队列。
 bool ProcessRuntime::queuePublish(const QString& topic, const QByteArray& data)
 {
-    if (!running_ || publishQueue_ == nullptr ||
-        socket_->state() != QLocalSocket::ConnectedState)
-        return false;
-    const ProcessRuntime::TopicSettings config = topicConfig(topic);
-    if (data.size() > maxMessageBytes_ || data.size() > config.maxMessageBytes)
-        return false;
+    bool logWarning = false;
+    PublishQueue::Stats stats;
+    bool accepted = false;
+    {
+        // 这把指针锁只包住一次非阻塞 enqueue；stop/delete 使用同一把锁。
+        QMutexLocker locker(&publishQueueMutex_);
+        if (publishQueue_ == nullptr)
+            return false;
+        ProcessRuntime::TopicSettings config = topicConfig(topic);
+        config.maxMessageBytes = qMin(config.maxMessageBytes, maxMessageBytes_);
+        accepted = publishQueue_->enqueue(topic, data, config, &logWarning, &stats);
+    }
+    if (logWarning) {
+        queueLog(LogLevel::Warning,
+                 QString::fromUtf8(u8"子进程发送队列发生丢弃/拒绝：dropped=%1，rejected=%2")
+                     .arg(stats.dropped)
+                     .arg(stats.rejected));
+    }
     // 返回值只代表“本地发送队列收下了”。跨进程的最终结果稍后由
     // handlePublishAck() 处理，publish() 本身不会同步等待父进程。
-    return publishQueue_->enqueue(topic, data, config);
+    return accepted;
 }
 
 // 日志体较小，使用 queued 调用切回 socket_ 所属线程发送。
@@ -1018,24 +1198,26 @@ void ProcessRuntime::queueLog(LogLevel level, const QString& text)
 }
 
 // 所有控制帧最终经过同一个编码函数写入 QLocalSocket。
-void ProcessRuntime::sendFrame(const QJsonObject& frame)
+bool ProcessRuntime::sendFrame(const QJsonObject& frame)
 {
+    assertSocketThread();
     if (socket_->state() != QLocalSocket::ConnectedState)
-        return;
-    socket_->write(process::encodeFrame(frame));
+        return false;
+    const QByteArray encoded = process::encodeFrame(frame);
+    return socket_->write(encoded) == encoded.size();
 }
 
 // 向父进程确认“父到子消息是否进入本地输入队列”。
-void ProcessRuntime::sendDeliveryAck(const QString& messageId, bool accepted)
+bool ProcessRuntime::sendDeliveryAck(const QString& messageId, bool accepted)
 {
     if (messageId.isEmpty())
-        return;
+        return true;
     QJsonObject ack;
     // ACK 很小，只包含 ID 和结果；它不携带 payload，因此不会反向扩大队列。
     ack.insert(QStringLiteral("type"), kDeliveryAck);
     ack.insert(QStringLiteral("messageId"), messageId);
     ack.insert(QStringLiteral("accepted"), accepted);
-    sendFrame(ack);
+    return sendFrame(ack);
 }
 
 // 处理“子到父消息”的最终结果，并回收在途计数和共享内存。
@@ -1078,10 +1260,31 @@ void ProcessRuntime::finish(int exitCode)
     // 让后续 publish() 立即失败，并由析构路径释放剩余共享段。
     exitCode_ = exitCode;
     stopping_ = true;
-    if (publishQueue_ != nullptr)
-        publishQueue_->stop();
+    running_ = false;
+    if (module_ != nullptr)
+        module_->setRunning(false);
+    stopPublishQueue(QString(), false);
     if (application_ != nullptr)
         application_->quit();
+}
+
+bool ProcessRuntime::prepareForExit()
+{
+    stopPublishQueue(QString(), false);
+    if (module_ != nullptr)
+        module_->setRunning(false);
+    running_ = false;
+    if (unsafeMessageThread_)
+        return false;
+    if (messageQueue_ != nullptr && messageQueue_->isRunning() &&
+        messageQueue_->stopAndDrain(shutdownDrainTimeoutMs_) ==
+            MessageQueue::StopResult::TimedOut) {
+        unsafeMessageThread_ = true;
+        if (exitCode_ == 0)
+            exitCode_ = 7;
+        return false;
+    }
+    return true;
 }
 
 // 清理断线/停止时仍未收到 ACK 的所有子进程所有共享段。

@@ -40,6 +40,7 @@ struct PluginManager::LoadedPlugin
     ModuleEndpoint* endpoint = nullptr;
     InProcessUiModule* uiModule = nullptr;
     bool started = false;
+    bool quarantined = false;
 };
 
 // 保存中央 MessageBus 借用指针；实际 DLL 直到 loadAndStart() 才加载。
@@ -53,8 +54,11 @@ PluginManager::PluginManager(MessageBus* messageBus, QObject* parent)
 PluginManager::~PluginManager()
 {
     // 正常 FrameworkRuntime 会显式 shutdown；析构兜底防止插件 DLL 留在内存中。
-    if (!shutdownComplete_)
-        shutdown(3000);
+    if (!shutdownComplete_) {
+        messageBus_->beginShutdown();
+        const MessageBusStopReport report = messageBus_->stopQueues(3000);
+        shutdown(report.timedOutModuleIds);
+    }
 }
 
 // 按配置顺序分两阶段加载和启动全部主进程插件；单个失败不会中止后续项。
@@ -96,42 +100,43 @@ bool PluginManager::loadAndStart(const QVector<ModuleConfig>& modules,
     return allSucceeded;
 }
 
-// 幂等地停止消息、反向调用 onStop、注销并卸载全部 DLL。
-void PluginManager::shutdown(int drainTimeoutMs)
+// 只回收消息线程已经停止的插件；超时插件保留 loader/endpoint，不并发 onStop。
+QStringList PluginManager::shutdown(const QStringList& timedOutModuleIds)
 {
     if (shutdownComplete_)
-        return;
-    messageBus_->beginShutdown();
-    messageBus_->stopQueues(drainTimeoutMs);
+        return quarantinedModuleIds();
 
-    // 反向关闭与构造依赖顺序一致，后加载模块先停止。
+    QVector<LoadedPlugin*> quarantinedPlugins;
     for (int i = loaded_.size() - 1; i >= 0; --i) {
         LoadedPlugin* plugin = loaded_.at(i);
-        if (plugin->started) {
-            try {
-                // 隔离插件异常，保证后续模块和 DLL 仍能继续清理。
-                plugin->endpoint->onStop();
-            } catch (const std::exception& exception) {
-                Logger::instance().log(
-                    LogLevel::Error,
-                    plugin->config.id,
-                    QString::fromUtf8(u8"onStop 异常：%1")
-                        .arg(QString::fromUtf8(exception.what())));
-            } catch (...) {
-                Logger::instance().log(
-                    LogLevel::Error,
-                    plugin->config.id,
-                    QString::fromUtf8(u8"onStop 未知异常"));
-            }
-            plugin->started = false;
+        if (timedOutModuleIds.contains(plugin->config.id) ||
+            !messageBus_->isModuleQueueStopped(plugin->config.id) ||
+            !releasePlugin(plugin)) {
+            plugin->quarantined = true;
+            quarantinedPlugins.prepend(plugin);
+            emit moduleStateChanged(
+                plugin->config.id,
+                QStringLiteral("Quarantined"),
+                QString::fromUtf8(u8"消息回调未在退出 deadline 内结束，保留 DLL"));
         }
-        messageBus_->unregisterModule(plugin->config.id, false);
-        plugin->loader->unload();
-        delete plugin->loader;
-        delete plugin;
     }
-    loaded_.clear();
+    loaded_ = quarantinedPlugins;
     shutdownComplete_ = true;
+    return quarantinedModuleIds();
+}
+
+QStringList PluginManager::retryQuarantinedShutdown()
+{
+    QVector<LoadedPlugin*> remaining;
+    for (int i = loaded_.size() - 1; i >= 0; --i) {
+        LoadedPlugin* plugin = loaded_.at(i);
+        if (!messageBus_->isModuleQueueStopped(plugin->config.id) ||
+            !releasePlugin(plugin)) {
+            remaining.prepend(plugin);
+        }
+    }
+    loaded_ = remaining;
+    return quarantinedModuleIds();
 }
 
 // 按 loaded_ 顺序返回已成功执行 onStart 的模块 ID。
@@ -140,6 +145,16 @@ QStringList PluginManager::runningModuleIds() const
     QStringList result;
     for (const LoadedPlugin* plugin : loaded_) {
         if (plugin->started)
+            result.append(plugin->config.id);
+    }
+    return result;
+}
+
+QStringList PluginManager::quarantinedModuleIds() const
+{
+    QStringList result;
+    for (const LoadedPlugin* plugin : loaded_) {
+        if (plugin->quarantined)
             result.append(plugin->config.id);
     }
     return result;
@@ -256,6 +271,36 @@ bool PluginManager::startOne(LoadedPlugin* plugin, QString* errorMessage)
 
     plugin->started = true;
     emit moduleStateChanged(plugin->config.id, QStringLiteral("Running"), QString());
+    return true;
+}
+
+// 前置条件是消息队列已经停止；否则绝不能并发调用 onStop 或卸载其 DLL。
+bool PluginManager::releasePlugin(LoadedPlugin* plugin)
+{
+    if (plugin == nullptr)
+        return true;
+    if (plugin->started) {
+        try {
+            plugin->endpoint->onStop();
+        } catch (const std::exception& exception) {
+            Logger::instance().log(
+                LogLevel::Error,
+                plugin->config.id,
+                QString::fromUtf8(u8"onStop 异常：%1")
+                    .arg(QString::fromUtf8(exception.what())));
+        } catch (...) {
+            Logger::instance().log(
+                LogLevel::Error,
+                plugin->config.id,
+                QString::fromUtf8(u8"onStop 未知异常"));
+        }
+        plugin->started = false;
+    }
+    if (!messageBus_->unregisterModule(plugin->config.id, false))
+        return false;
+    plugin->loader->unload();
+    delete plugin->loader;
+    delete plugin;
     return true;
 }
 

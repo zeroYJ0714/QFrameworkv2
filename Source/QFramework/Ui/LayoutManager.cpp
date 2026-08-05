@@ -64,6 +64,7 @@ void LayoutManager::unregisterModuleDock(const QString& moduleId)
 
 // 把窗口几何、Qt Dock 状态和模块可见性写成带版本 JSON，并原子提交。
 bool LayoutManager::saveLayout(const QString& filePath,
+                               const QHash<QString, bool>& requestedVisibility,
                                QString* errorMessage)
 {
     // 扩展名和主窗口都有效后才调用 Qt saveGeometry/saveState。
@@ -79,7 +80,10 @@ bool LayoutManager::saveLayout(const QString& filePath,
         if (dockWidget == nullptr)
             continue;
         QJsonObject state;
-        state.insert(QStringLiteral("visible"), dockWidget->isVisible());
+        const bool requestedVisible = requestedVisibility.value(moduleId, false);
+        // visible 保留给旧程序读取；requestedVisible 才是用户的显示意图。
+        state.insert(QStringLiteral("visible"), requestedVisible);
+        state.insert(QStringLiteral("requestedVisible"), requestedVisible);
         modules.insert(moduleId, state);
     }
 
@@ -87,6 +91,7 @@ bool LayoutManager::saveLayout(const QString& filePath,
     // format/version 是兼容性门槛；geometry/state 是 Qt 的不透明字节。
     root.insert(QStringLiteral("format"), QStringLiteral("QFrameworkLayout"));
     root.insert(QStringLiteral("version"), kLayoutVersion);
+    root.insert(QStringLiteral("visibilitySemantics"), QStringLiteral("userIntent"));
     root.insert(QStringLiteral("geometry"),
                 QString::fromLatin1(mainWindow_->saveGeometry().toBase64()));
     root.insert(QStringLiteral("state"),
@@ -120,14 +125,18 @@ bool LayoutManager::saveLayout(const QString& filePath,
 
 // 完整解析并校验布局后尝试恢复；Qt 任一步失败都会回滚到调用前状态。
 bool LayoutManager::loadLayout(const QString& filePath,
+                               QHash<QString, bool>* requestedVisibility,
                                QString* errorMessage,
-                               QStringList* unavailableModuleIds)
+                               QStringList* unavailableModuleIds,
+                               bool* legacyVisibilitySemantics)
 {
     // 输出列表每次调用先清空，避免调用方误用上一次结果。
     if (!validateFilePath(filePath, errorMessage) || mainWindow_ == nullptr)
         return false;
     if (unavailableModuleIds != nullptr)
         unavailableModuleIds->clear();
+    if (legacyVisibilitySemantics != nullptr)
+        *legacyVisibilitySemantics = false;
 
     QFile file(filePath);
     if (!file.open(QIODevice::ReadOnly)) {
@@ -171,21 +180,36 @@ bool LayoutManager::loadLayout(const QString& filePath,
     }
 
     const QJsonObject modules = root.value(QStringLiteral("modules")).toObject();
+    const bool usesUserIntent =
+        root.value(QStringLiteral("visibilitySemantics")).toString() ==
+        QStringLiteral("userIntent");
+    if (root.contains(QStringLiteral("visibilitySemantics")) && !usesUserIntent) {
+        setError(errorMessage, QString::fromUtf8(u8"布局可见性语义不受支持"));
+        return false;
+    }
     // 先验证所有模块元数据，确认无误后才改动主窗口。
-    QHash<QString, bool> requestedVisibility;
+    QHash<QString, bool> loadedRequestedVisibility;
+    QStringList loadedUnavailableModules;
     for (QJsonObject::const_iterator iterator = modules.constBegin();
          iterator != modules.constEnd(); ++iterator) {
-        if (!iterator.value().isObject() ||
-            !iterator.value().toObject().value(QStringLiteral("visible")).isBool()) {
+        if (!iterator.value().isObject()) {
             setError(errorMessage,
                      QString::fromUtf8(u8"模块 %1 的布局元数据无效").arg(iterator.key()));
             return false;
         }
-        requestedVisibility.insert(
-            iterator.key(),
-            iterator.value().toObject().value(QStringLiteral("visible")).toBool());
-        if (!moduleDocks_.contains(iterator.key()) && unavailableModuleIds != nullptr)
-            unavailableModuleIds->append(iterator.key());
+        const QJsonObject moduleState = iterator.value().toObject();
+        const QString visibilityKey = usesUserIntent
+            ? QStringLiteral("requestedVisible") : QStringLiteral("visible");
+        if (!moduleState.value(visibilityKey).isBool() ||
+            (usesUserIntent && !moduleState.value(QStringLiteral("visible")).isBool())) {
+            setError(errorMessage,
+                     QString::fromUtf8(u8"模块 %1 的布局可见性无效").arg(iterator.key()));
+            return false;
+        }
+        loadedRequestedVisibility.insert(
+            iterator.key(), moduleState.value(visibilityKey).toBool());
+        if (!moduleDocks_.contains(iterator.key()))
+            loadedUnavailableModules.append(iterator.key());
     }
 
     // 保存完整旧状态，用于 restoreGeometry/restoreState 任一失败时回滚。
@@ -214,15 +238,35 @@ bool LayoutManager::loadLayout(const QString& filePath,
         return false;
     }
 
-    // Qt state 恢复后再应用显式可见性，缺失模块默认隐藏。
+    // Qt state 恢复后再应用用户意图；显示 Dock 时保留标签组当前页。
     for (QHash<QString, QDockWidget*>::const_iterator iterator = moduleDocks_.constBegin();
          iterator != moduleDocks_.constEnd(); ++iterator) {
-        if (iterator.value() != nullptr) {
-            iterator.value()->setVisible(
-                requestedVisibility.value(iterator.key(), false));
+        QDockWidget* dockWidget = iterator.value();
+        if (dockWidget == nullptr)
+            continue;
+        if (!loadedRequestedVisibility.value(iterator.key(), false)) {
+            dockWidget->hide();
+            continue;
         }
+        QDockWidget* activeTab = nullptr;
+        const QList<QDockWidget*> tabSiblings = mainWindow_->tabifiedDockWidgets(dockWidget);
+        for (QDockWidget* sibling : tabSiblings) {
+            if (sibling != nullptr && sibling->isVisible()) {
+                activeTab = sibling;
+                break;
+            }
+        }
+        dockWidget->show();
+        if (activeTab != nullptr)
+            activeTab->raise();
     }
 
+    if (requestedVisibility != nullptr)
+        *requestedVisibility = loadedRequestedVisibility;
+    if (unavailableModuleIds != nullptr)
+        *unavailableModuleIds = loadedUnavailableModules;
+    if (legacyVisibilitySemantics != nullptr)
+        *legacyVisibilitySemantics = !usesUserIntent;
     activeFilePath_ = QFileInfo(filePath).absoluteFilePath();
     return true;
 }

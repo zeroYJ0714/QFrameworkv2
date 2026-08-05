@@ -4,12 +4,24 @@
 #include <QLabel>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QSizePolicy>
 #include <QVariant>
 #include <QVBoxLayout>
 
 #include "Generated/status_messages.pb.h"
 #include "Generated/log_messages.pb.h"
 #include "MessageTopics.h"
+
+namespace
+{
+QString boundedStatusPreview(const QString& text)
+{
+    const int maximumPreviewLength = 160;
+    if (text.size() <= maximumPreviewLength)
+        return text;
+    return text.left(maximumPreviewLength) + QStringLiteral("...");
+}
+}
 
 // 子进程 UI 示例的业务代码与主进程 UI 示例保持相同 API；
 // 进程边界、共享内存和 ACK 都隐藏在 ProcessRuntime 中。
@@ -21,6 +33,11 @@ ProcessUiExample::ProcessUiExample(QWidget* parent)
     // 所有控件以 this 为父对象，窗口关闭时由 Qt 统一释放。
     setObjectName(QStringLiteral("ProcessUiExample"));
     setProperty("receivedMessageCount", QVariant(receivedMessageCount_));
+    // 子进程窗口嵌入后仍由自身布局计算最小尺寸，必须隔离超长业务文本。
+    statusLabel_->setTextFormat(Qt::PlainText);
+    statusLabel_->setWordWrap(true);
+    statusLabel_->setMinimumWidth(0);
+    statusLabel_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
 
     QPushButton* modalButton = new QPushButton(QString::fromUtf8(u8"打开模态对话框"), this);
     QPushButton* nonModalButton = new QPushButton(QString::fromUtf8(u8"打开非模态对话框"), this);
@@ -100,10 +117,10 @@ void ProcessUiExample::onMessage(const QString& topic,
 
 void ProcessUiExample::updateLogDisplay(const QString& text)
 {
-    // UI 线程槽：记录接收数量并刷新标签。
+    // 完整消息已经完成解码和计数；只把有界预览交给 QLabel 的布局系统。
     ++receivedMessageCount_;
     setProperty("receivedMessageCount", QVariant(receivedMessageCount_));
-    statusLabel_->setText(text);
+    statusLabel_->setText(boundedStatusPreview(text));
 }
 
 void ProcessUiExample::showModalDialog()

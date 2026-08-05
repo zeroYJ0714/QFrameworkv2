@@ -20,6 +20,17 @@ class PluginManager;
 class ProcessSupervisor;
 class StyleManager;
 
+// 应用已经处于退出边界且主进程 DLL 回调仍未结束时，集中执行进程级 fail-fast。
+class QFRAMEWORK_EXPORT ProcessFailFast
+{
+public:
+    using Handler = void (*)(const QString& reason);
+
+    static bool requestForHungModules(const QStringList& moduleIds);
+    // 仅供 Qt Test 替换真正的进程终止；传 nullptr 恢复默认处理。
+    static void setHandlerForTests(Handler handler);
+};
+
 class QFRAMEWORK_EXPORT FrameworkRuntime
 {
 public:
@@ -40,6 +51,7 @@ public:
 
 private:
     void appendStartupWarnings(const QStringList& warnings);
+    void showPendingStartupWarnings();
 
     // application_ 是借用指针；其余带 * 的组件都由 FrameworkRuntime 创建和删除。
     QApplication* application_;
@@ -51,6 +63,7 @@ private:
     MainWindow* mainWindow_;
     // 非致命启动问题同时写日志并在 show() 后集中提示。
     QStringList startupWarnings_;
+    int shownStartupWarningCount_;
     bool initialized_;
     bool loggerStarted_;
     bool shutdownComplete_;

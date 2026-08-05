@@ -51,7 +51,7 @@ public:
     virtual QStringList publishedTopics() const;
     // 声明本模块需要接收的主题。每个主题都会得到独立的有界输入队列。
     virtual QStringList subscribedTopics() const;
-    // 启动回调在模块可发布前执行；返回 false 会让当前模块启动失败。
+    // 启动回调期间允许 publish；返回 false 会撤销发布权限并让当前模块启动失败。
     virtual bool onStart();
     // 停止回调在框架停止接受新消息后执行；应尽快返回。
     virtual void onStop();
@@ -62,6 +62,8 @@ public:
 
     // 发布消息。返回 false 表示未运行、主题未声明、大小超限或有界队列已满。
     bool publish(const QString& topic, const QByteArray& data);
+    // 长循环可定期查询；停止开始后返回 true，便于协作退出 onMessage。
+    bool isStopRequested() const;
     // 四个日志快捷方法最终都会进入同一个集中日志线程。
     void logDebug(const QString& text);
     void logInfo(const QString& text);

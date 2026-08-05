@@ -2,6 +2,7 @@
 .DS_Store
 Thumbs.db
 Desktop.ini
+*.reasonix
 
 # Visual Studio and local user state
 .vs/

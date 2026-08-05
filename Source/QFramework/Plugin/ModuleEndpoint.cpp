@@ -77,6 +77,13 @@ bool ModuleEndpoint::publish(const QString& topic, const QByteArray& data)
     return host->publishFromModule(id, topic, data);
 }
 
+// 与 publish 使用同一把 mutex_ 读取运行态，不增加 ABI 数据成员。
+bool ModuleEndpoint::isStopRequested() const
+{
+    QMutexLocker locker(&mutex_);
+    return !running_;
+}
+
 // 四个公开快捷函数只选择级别，公共的宿主转发集中在私有 log() 中。
 void ModuleEndpoint::logDebug(const QString& text)
 {

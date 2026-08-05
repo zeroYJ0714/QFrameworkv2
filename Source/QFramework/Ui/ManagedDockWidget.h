@@ -8,6 +8,7 @@
 #include "QFrameworkGlobal.h"
 
 class QMainWindow;
+class QCloseEvent;
 
 namespace qframework
 {
@@ -19,5 +20,12 @@ public:
     // mainWindow 同时作为 QObject 父对象和 QDockWidget 宿主。
     explicit ManagedDockWidget(const QString& title,
                                QMainWindow* mainWindow);
+
+signals:
+    // 只表示用户按下 Dock 关闭按钮；标签切换不会发出该信号。
+    void closeRequested();
+
+protected:
+    void closeEvent(QCloseEvent* event) override;
 };
 }

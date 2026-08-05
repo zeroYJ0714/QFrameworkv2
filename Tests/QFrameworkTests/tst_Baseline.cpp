@@ -7,6 +7,7 @@
 #include "tst_Baseline.h"
 
 #include <QApplication>
+#include <QAction>
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
@@ -24,6 +25,7 @@
 #include <QTemporaryDir>
 #include <QTest>
 #include <QThread>
+#include <QTimer>
 #include <QWaitCondition>
 
 #ifdef Q_OS_WIN
@@ -31,12 +33,14 @@
 #endif
 
 #include "FrameworkConfig.h"
+#include "FrameworkRuntime.h"
 #include "InProcessUiModule.h"
 #include "InProcessNonUiModule.h"
 #include "ProcessNonUiModule.h"
 #include "ProcessRuntime.h"
 #include "Logger.h"
 #include "LayoutManager.h"
+#include "MainWindow.h"
 #include "ManagedDockWidget.h"
 #include "MessageBus.h"
 #include "PluginManager.h"
@@ -66,6 +70,14 @@ QSize nativeWindowClientSize(quintptr windowId)
     if (handle == nullptr || !IsWindow(handle) || !GetClientRect(handle, &rect))
         return QSize();
     return QSize(rect.right - rect.left, rect.bottom - rect.top);
+}
+
+// 原生可见性可区分“只收到 windowReady 并完成嵌入”和“随后真正执行 showWindow”。
+// IsWindowVisible 会同时考虑父窗口链，因此隐藏 Dock 中的子窗口仍按不可见处理。
+bool nativeWindowVisible(quintptr windowId)
+{
+    const HWND handle = reinterpret_cast<HWND>(windowId);
+    return handle != nullptr && IsWindow(handle) && IsWindowVisible(handle);
 }
 #endif
 
@@ -199,6 +211,94 @@ private:
     QVector<ReceivedMessage> received_;
 };
 
+// 主进程卡死回调替身：进入 onMessage 后等待测试显式 release，模拟 DLL 业务卡死。
+class BlockingBusModule : public qframework::InProcessNonUiModule
+{
+public:
+    QStringList subscribedTopics() const override
+    {
+        return QStringList() << QStringLiteral("TEST_BLOCKING_CALLBACK");
+    }
+
+    void onMessage(const QString&, const QString&, const QByteArray&) override
+    {
+        QMutexLocker locker(&mutex_);
+        entered_ = true;
+        changed_.wakeAll();
+        while (!released_)
+            changed_.wait(&mutex_);
+    }
+
+    bool waitUntilEntered(int timeoutMs)
+    {
+        QMutexLocker locker(&mutex_);
+        if (!entered_)
+            changed_.wait(&mutex_, static_cast<unsigned long>(qMax(1, timeoutMs)));
+        return entered_;
+    }
+
+    void release()
+    {
+        QMutexLocker locker(&mutex_);
+        released_ = true;
+        changed_.wakeAll();
+    }
+
+private:
+    QMutex mutex_;
+    QWaitCondition changed_;
+    bool entered_ = false;
+    bool released_ = false;
+};
+
+QMutex failFastRecordMutex;
+bool failFastRequested = false;
+QString failFastReason;
+
+void recordFailFastRequest(const QString& reason)
+{
+    QMutexLocker locker(&failFastRecordMutex);
+    failFastRequested = true;
+    failFastReason = reason;
+}
+
+// 测试子进程中的生产者只调用公开 publish()；停止标志由 Qt 互斥锁保护。
+class RuntimePublishWorker final : public QThread
+{
+public:
+    explicit RuntimePublishWorker(qframework::ModuleEndpoint* module)
+        : module_(module)
+    {
+    }
+
+    void requestFinish()
+    {
+        QMutexLocker locker(&mutex_);
+        finishing_ = true;
+    }
+
+protected:
+    void run() override
+    {
+        quint64 sequence = 0;
+        for (;;) {
+            {
+                QMutexLocker locker(&mutex_);
+                if (finishing_)
+                    return;
+            }
+            module_->publish(QStringLiteral("TEST_CHILD_STRESS"),
+                             QByteArray::number(++sequence));
+            QThread::msleep(1);
+        }
+    }
+
+private:
+    qframework::ModuleEndpoint* module_;
+    QMutex mutex_;
+    bool finishing_ = false;
+};
+
 // 运行在测试子进程中的模块。
 //
 // mode_ 由模块 ID 决定，同一个轻量实现可覆盖 Latest、Reliable、inline 和
@@ -214,9 +314,18 @@ public:
     {
     }
 
+    ~RuntimeQueueTestModule() override
+    {
+        stopPublishWorkers();
+    }
+
     // 只声明当前场景需要的发布主题，顺便验证框架的主题权限检查没有被绕过。
     QStringList publishedTopics() const override
     {
+        if (mode_ == QStringLiteral("RuntimeHungCallback"))
+            return QStringList() << QStringLiteral("TEST_CHILD_HUNG_ENTERED");
+        if (mode_ == QStringLiteral("RuntimePublishStress"))
+            return QStringList() << QStringLiteral("TEST_CHILD_STRESS");
         if (mode_ == QStringLiteral("RuntimeQueueLatest"))
             return QStringList() << QStringLiteral("TEST_CHILD_RESULT")
                                  << QStringLiteral("TEST_CHILD_LATEST");
@@ -234,6 +343,8 @@ public:
     // 父到子测试需要订阅父进程主题；子到父启动发布场景不需要额外订阅。
     QStringList subscribedTopics() const override
     {
+        if (mode_ == QStringLiteral("RuntimeHungCallback"))
+            return QStringList() << QStringLiteral("TEST_PARENT_HUNG");
         if (mode_ == QStringLiteral("RuntimeQueueLatest"))
             return QStringList() << QStringLiteral("TEST_PARENT_LATEST");
         if (mode_ == QStringLiteral("RuntimeQueueReliable"))
@@ -245,6 +356,16 @@ public:
     // 模块进入 Running 前执行一次场景初始化；返回 false 会被框架视为启动失败。
     bool onStart() override
     {
+        if (mode_ == QStringLiteral("RuntimeHungCallback"))
+            return true;
+        if (mode_ == QStringLiteral("RuntimePublishStress")) {
+            for (int index = 0; index < 4; ++index) {
+                RuntimePublishWorker* worker = new RuntimePublishWorker(this);
+                publishWorkers_.append(worker);
+                worker->start();
+            }
+            return true;
+        }
         if (mode_ == QStringLiteral("RuntimeQueueLatest")) {
             // 子进程启动时连续产生 100 帧；父进程的输入队列容量为 1，
             // 配合下面 120 ms 的慢回调，足以让覆盖逻辑而不是“消费者速度”成为主因。
@@ -278,6 +399,11 @@ public:
         return false;
     }
 
+    void onStop() override
+    {
+        stopPublishWorkers();
+    }
+
     // 在锁内复制消息并唤醒等待者，确保测试线程看见一份完整快照。
     // 收到父进程消息后按主题选择慢消费或原样回显，用回包证明数据真正到达。
     void onMessage(const QString& topic,
@@ -285,7 +411,12 @@ public:
                    const QByteArray& data) override
     {
         Q_UNUSED(senderModuleId)
-        if (topic == QStringLiteral("TEST_PARENT_LATEST")) {
+        if (topic == QStringLiteral("TEST_PARENT_HUNG")) {
+            publish(QStringLiteral("TEST_CHILD_HUNG_ENTERED"), QByteArrayLiteral("entered"));
+            QMutexLocker locker(&hungMutex_);
+            while (!hungReleased_)
+                hungCondition_.wait(&hungMutex_);
+        } else if (topic == QStringLiteral("TEST_PARENT_LATEST")) {
             // 人为放慢消费者，让父到子等待队列在 ACK 释放之前达到容量。
             QThread::msleep(120);
             publish(QStringLiteral("TEST_CHILD_RESULT"),
@@ -303,8 +434,25 @@ public:
     }
 
 private:
+    void stopPublishWorkers()
+    {
+        for (RuntimePublishWorker* worker : publishWorkers_)
+            worker->requestFinish();
+        for (RuntimePublishWorker* worker : publishWorkers_) {
+            // 测试模块也遵守有界等待；失败就让子进程测试明确失败，不强杀线程。
+            if (!worker->wait(2000))
+                qFatal("RuntimePublishWorker did not stop within 2000 ms");
+            delete worker;
+        }
+        publishWorkers_.clear();
+    }
+
     // 保存构造时选定的测试模式，子进程生命周期内不再修改。
     QString mode_;
+    QVector<RuntimePublishWorker*> publishWorkers_;
+    QMutex hungMutex_;
+    QWaitCondition hungCondition_;
+    bool hungReleased_ = false;
 };
 
 // 返回测试使用的只读 INI 路径。
@@ -437,7 +585,9 @@ int runFaultProcessClient(int argc, char* argv[])
     // 20 表示监督器注入参数不完整，属于测试客户端自身启动错误。
     if (serverName.isEmpty() || token.isEmpty() || moduleId.isEmpty() || moduleType.isEmpty())
         return 20;
-    if (moduleId.startsWith(QStringLiteral("RuntimeQueue"))) {
+    if (moduleId.startsWith(QStringLiteral("RuntimeQueue")) ||
+        moduleId == QStringLiteral("RuntimeHungCallback") ||
+        moduleId == QStringLiteral("RuntimePublishStress")) {
         // 队列专项场景必须走真实 ProcessRuntime，才能覆盖内部 ACK 和共享内存。
         return qframework::ProcessRuntime::run(
             &application,
@@ -464,7 +614,12 @@ int runFaultProcessClient(int argc, char* argv[])
             ? QStringLiteral("invalid-token")
             : token);
     registration.insert(QStringLiteral("publishedTopics"), QJsonArray());
-    registration.insert(QStringLiteral("subscribedTopics"), QJsonArray());
+    QJsonArray subscribedTopics;
+    if (moduleId == QStringLiteral("IngressGateModule"))
+        subscribedTopics.append(QStringLiteral("TEST_STOP_GATE"));
+    if (moduleId == QStringLiteral("AccountingModule"))
+        subscribedTopics.append(QStringLiteral("TEST_ACCOUNTING"));
+    registration.insert(QStringLiteral("subscribedTopics"), subscribedTopics);
     // 22 表示注册帧没有完整写入本地 Socket。
     if (!writeFaultProcessFrame(&socket, registration))
         return 22;
@@ -512,6 +667,78 @@ int runFaultProcessClient(int argc, char* argv[])
     started.insert(QStringLiteral("type"), QStringLiteral("started"));
     if (!writeFaultProcessFrame(&socket, started))
         return 25;
+
+    const bool lifecycleClient =
+        moduleId == QStringLiteral("AsyncRestartModule") ||
+        moduleId == QStringLiteral("DuplicateRestartModule") ||
+        moduleId == QStringLiteral("IngressGateModule") ||
+        moduleId == QStringLiteral("DeadlineModuleA") ||
+        moduleId == QStringLiteral("DeadlineModuleB") ||
+        moduleId == QStringLiteral("StopAckModule") ||
+        moduleId == QStringLiteral("AccountingModule") ||
+        moduleId == QStringLiteral("StartupAsyncModule") ||
+        moduleId.startsWith(QStringLiteral("ShutdownHung"));
+    if (lifecycleClient) {
+        const bool ignoreStop = moduleId == QStringLiteral("DeadlineModuleA") ||
+                                moduleId == QStringLiteral("DeadlineModuleB") ||
+                                moduleId.startsWith(QStringLiteral("ShutdownHung"));
+        const int stopExitDelayMs = moduleId == QStringLiteral("AsyncRestartModule")
+            ? 350 : (moduleId == QStringLiteral("StopAckModule") ? 250 : 50);
+        const bool ignoreMessageAcknowledgements =
+            moduleId == QStringLiteral("AccountingModule");
+        bool stopScheduled = false;
+        QObject::connect(
+            &socket,
+            &QLocalSocket::readyRead,
+            &application,
+            [&socket, &application, &inputBuffer, &stopScheduled,
+             ignoreStop, stopExitDelayMs, ignoreMessageAcknowledgements]() {
+                inputBuffer.append(socket.readAll());
+                for (;;) {
+                    QJsonObject frame;
+                    QString error;
+                    const qframework::process::FrameResult result =
+                        qframework::process::takeFrame(
+                            &inputBuffer, &frame, 1024 * 1024, &error);
+                    if (result == qframework::process::FrameResult::Incomplete)
+                        return;
+                    if (result == qframework::process::FrameResult::Invalid) {
+                        application.exit(26);
+                        return;
+                    }
+                    const QString type = frame.value(QStringLiteral("type")).toString();
+                    if (type == QStringLiteral("ping")) {
+                        QJsonObject pong;
+                        pong.insert(QStringLiteral("type"), QStringLiteral("pong"));
+                        if (!writeFaultProcessFrame(&socket, pong))
+                            application.exit(27);
+                    } else if (type == QStringLiteral("message")) {
+                        if (ignoreMessageAcknowledgements)
+                            continue;
+                        QJsonObject ack;
+                        ack.insert(QStringLiteral("type"), QStringLiteral("deliveryAck"));
+                        ack.insert(QStringLiteral("messageId"),
+                                   frame.value(QStringLiteral("messageId")));
+                        ack.insert(QStringLiteral("accepted"), true);
+                        if (!writeFaultProcessFrame(&socket, ack))
+                            application.exit(28);
+                    } else if (type == QStringLiteral("stop") && !ignoreStop &&
+                               !stopScheduled) {
+                        QJsonObject ack;
+                        ack.insert(QStringLiteral("type"), QStringLiteral("stopAck"));
+                        if (!writeFaultProcessFrame(&socket, ack)) {
+                            application.exit(29);
+                            return;
+                        }
+                        stopScheduled = true;
+                        QTimer::singleShot(stopExitDelayMs,
+                                           &application,
+                                           &QCoreApplication::quit);
+                    }
+                }
+            });
+        return application.exec();
+    }
 
     // 故意不读取后续 ping，监督器应按心跳超时结束该进程。
     return application.exec();
@@ -573,7 +800,11 @@ qframework::MessageBusConfig queueTestBusConfig()
         << QStringLiteral("TEST_CHILD_INLINE")
         << QStringLiteral("TEST_CHILD_SHARED")
         << QStringLiteral("TEST_CHILD_REPLY_INLINE")
-        << QStringLiteral("TEST_CHILD_REPLY_SHARED");
+        << QStringLiteral("TEST_CHILD_REPLY_SHARED")
+        << QStringLiteral("TEST_PARENT_HUNG")
+        << QStringLiteral("TEST_CHILD_HUNG_ENTERED")
+        << QStringLiteral("TEST_CHILD_STRESS")
+        << QStringLiteral("TEST_ACCOUNTING");
     for (const QString& topic : reliableTopics) {
         config.topics.insert(
             topic,
@@ -593,6 +824,20 @@ qframework::ProcessConfig faultProcessConfig()
     config.stopTimeoutMs = 200;
     config.restartDelayMs = 50;
     config.restartWindowMs = 1000;
+    config.maxRestartCount = 0;
+    return config;
+}
+
+// 异步生命周期测试使用较长心跳窗口，避免故意拖延 stop 的客户端先被心跳判故障。
+qframework::ProcessConfig lifecycleProcessConfig(int stopTimeoutMs = 300)
+{
+    qframework::ProcessConfig config;
+    config.registrationTimeoutMs = 2000;
+    config.heartbeatIntervalMs = 50;
+    config.heartbeatTimeoutMs = 5000;
+    config.stopTimeoutMs = stopTimeoutMs;
+    config.restartDelayMs = 20;
+    config.restartWindowMs = 2000;
     config.maxRestartCount = 0;
     return config;
 }
@@ -672,6 +917,22 @@ int messageCountForTopic(const QVector<ReceivedMessage>& messages,
             ++count;
     }
     return count;
+}
+
+bool stateSignalContainsDetail(const QSignalSpy& spy,
+                               const QString& moduleId,
+                               const QString& state,
+                               const QString& detailPart)
+{
+    for (const QList<QVariant>& arguments : spy) {
+        if (arguments.size() >= 3 &&
+            arguments.at(0).toString() == moduleId &&
+            arguments.at(1).toString() == state &&
+            arguments.at(2).toString().contains(detailPart)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // 按文件名顺序读取目录中的全部滚动日志并拼接。
@@ -1043,7 +1304,27 @@ void BaselineTest::pluginLoaderAndModuleIntegration()
         manager.uiModule(QStringLiteral("InProcessUiExample"));
     QVERIFY(uiModule != nullptr);
     QTRY_COMPARE(uiModule->property("receivedMessageCount").toInt(), 1);
-    manager.shutdown(2000);
+
+    // ProcessNonUiExample 每次启动都会发布 2048 字符的共享内存演示消息。
+    // UI 只能显示有界预览，不能让任意长业务文本反向放大 Dock 的最小尺寸。
+    qframework::protocols::LogDisplayMessage oversizedMessage;
+    oversizedMessage.set_level("INFO");
+    oversizedMessage.set_module_id("ProcessNonUiExample");
+    oversizedMessage.set_text(std::string("ProcessNonUiExample ready ") +
+                              std::string(2048, 'X'));
+    std::string oversizedBytes;
+    QVERIFY(oversizedMessage.SerializeToString(&oversizedBytes));
+    uiModule->onMessage(QString::fromLatin1(QFRAMEWORK_LOG_DISPLAY),
+                        QStringLiteral("ProcessNonUiExample"),
+                        QByteArray::fromStdString(oversizedBytes));
+    QTRY_COMPARE(uiModule->property("receivedMessageCount").toInt(), 2);
+    QVERIFY2(uiModule->minimumSizeHint().width() < 1200,
+             qPrintable(QStringLiteral("long message expanded UI minimum width to %1")
+                            .arg(uiModule->minimumSizeHint().width())));
+    bus.beginShutdown();
+    const qframework::MessageBusStopReport pluginStopReport = bus.stopQueues(2000);
+    QVERIFY(pluginStopReport.allStopped());
+    QVERIFY(manager.shutdown(pluginStopReport.timedOutModuleIds).isEmpty());
     QVERIFY(manager.runningModuleIds().isEmpty());
 
     qframework::MessageBus disabledBus(busConfig);
@@ -1059,7 +1340,10 @@ void BaselineTest::pluginLoaderAndModuleIntegration()
              qPrintable(errors.join('\n')));
     QCOMPARE(disabledManager.runningModuleIds(),
              QStringList() << QStringLiteral("InProcessUiExample"));
-    disabledManager.shutdown(2000);
+    disabledBus.beginShutdown();
+    const qframework::MessageBusStopReport disabledStopReport =
+        disabledBus.stopQueues(2000);
+    QVERIFY(disabledManager.shutdown(disabledStopReport.timedOutModuleIds).isEmpty());
 
     // 元数据类型错误只隔离当前模块，后续有效模块仍可启动。
     qframework::MessageBus isolatedBus(busConfig);
@@ -1074,7 +1358,10 @@ void BaselineTest::pluginLoaderAndModuleIntegration()
     QVERIFY(!errors.isEmpty());
     QCOMPARE(isolatedManager.runningModuleIds(),
              QStringList() << QStringLiteral("InProcessNonUiExample"));
-    isolatedManager.shutdown(2000);
+    isolatedBus.beginShutdown();
+    const qframework::MessageBusStopReport isolatedStopReport =
+        isolatedBus.stopQueues(2000);
+    QVERIFY(isolatedManager.shutdown(isolatedStopReport.timedOutModuleIds).isEmpty());
 }
 
 // 目的：验证本地 IPC 的“4 字节长度 + JSON”拆包规则。
@@ -1143,6 +1430,7 @@ void BaselineTest::processIpcAndSupervision()
     qframework::ProcessSupervisor supervisor(&bus, busConfig, processConfig);
     QSignalSpy stateSpy(&supervisor, &qframework::ProcessSupervisor::moduleStateChanged);
     QSignalSpy windowSpy(&supervisor, &qframework::ProcessSupervisor::windowHandleReady);
+    QSignalSpy startupSpy(&supervisor, &qframework::ProcessSupervisor::startupBatchFinished);
     qframework::ProcessWindowHost windowHost;
     windowHost.resize(720, 400);
     windowHost.show();
@@ -1154,6 +1442,8 @@ void BaselineTest::processIpcAndSupervision()
                                        qframework::ModuleType::ProcessUi));
     QStringList errors;
     QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.runningModuleIds().size(), 2, 10000);
+    QTRY_COMPARE_WITH_TIMEOUT(startupSpy.count(), 1, 10000);
     QCOMPARE(supervisor.runningModuleIds(),
              QStringList() << QStringLiteral("ProcessNonUiExample")
                            << QStringLiteral("ProcessUiExample"));
@@ -1175,15 +1465,21 @@ void BaselineTest::processIpcAndSupervision()
         windowSpy.at(0).at(1).toULongLong());
     QVERIFY(initialWindowId != 0);
     QVERIFY2(windowHost.attachWindow(initialWindowId, &error), qPrintable(error));
-    QVERIFY2(supervisor.showWindow(QStringLiteral("ProcessUiExample"),
-                                   windowHost.width(),
-                                   windowHost.height(),
-                                   &error),
+    QVERIFY2(supervisor.showWindow(QStringLiteral("ProcessUiExample"), &error),
+             qPrintable(error));
+    QVERIFY2(supervisor.resizeWindow(QStringLiteral("ProcessUiExample"),
+                                     windowHost.width(),
+                                     windowHost.height(),
+                                     &error),
              qPrintable(error));
 #ifdef Q_OS_WIN
     QTRY_COMPARE_WITH_TIMEOUT(nativeWindowClientSize(initialWindowId),
                               windowHost.size(),
                               1000);
+    windowHost.resize(500, 320);
+    QTRY_COMPARE_WITH_TIMEOUT(nativeWindowClientSize(initialWindowId),
+                              windowHost.size(),
+                              2000);
 #endif
 
     QTest::qWait(1200);
@@ -1205,6 +1501,24 @@ void BaselineTest::processIpcAndSupervision()
     QCOMPARE(supervisor.state(QStringLiteral("ProcessNonUiExample")),
              QStringLiteral("Running"));
 
+    // 精确复现桌面问题：ProcessUi 仍嵌入时手动重启 ProcessNonUi。后者会再次
+    // 发布 2048 字符消息，但不得改变现有 HWND、宿主尺寸或主窗口布局约束。
+    const int windowCountBeforeNonUiRestart = windowSpy.size();
+    QSignalSpy nonUiRestartSpy(&supervisor,
+                               &qframework::ProcessSupervisor::restartFinished);
+    QVERIFY2(supervisor.requestRestart(QStringLiteral("ProcessNonUiExample"), &error),
+             qPrintable(error));
+    QTRY_COMPARE_WITH_TIMEOUT(nonUiRestartSpy.count(), 1, 5000);
+    QVERIFY2(nonUiRestartSpy.first().at(1).toBool(),
+             qPrintable(nonUiRestartSpy.first().at(2).toString()));
+    QCOMPARE(windowSpy.size(), windowCountBeforeNonUiRestart);
+    QCOMPARE(supervisor.state(QStringLiteral("ProcessUiExample")),
+             QStringLiteral("Running"));
+#ifdef Q_OS_WIN
+    QTest::qWait(500);
+    QCOMPARE(nativeWindowClientSize(initialWindowId), windowHost.size());
+#endif
+
     const int priorWindowCount = windowSpy.size();
     windowHost.showPlaceholder(QString::fromUtf8(u8"等待重新附加"));
     QVERIFY2(supervisor.restart(QStringLiteral("ProcessUiExample"), &error),
@@ -1216,10 +1530,12 @@ void BaselineTest::processIpcAndSupervision()
         windowSpy.last().at(1).toULongLong());
     QVERIFY(restartedWindowId != 0);
     QVERIFY2(windowHost.attachWindow(restartedWindowId, &error), qPrintable(error));
-    QVERIFY2(supervisor.showWindow(QStringLiteral("ProcessUiExample"),
-                                   windowHost.width(),
-                                   windowHost.height(),
-                                   &error),
+    QVERIFY2(supervisor.showWindow(QStringLiteral("ProcessUiExample"), &error),
+             qPrintable(error));
+    QVERIFY2(supervisor.resizeWindow(QStringLiteral("ProcessUiExample"),
+                                     windowHost.width(),
+                                     windowHost.height(),
+                                     &error),
              qPrintable(error));
 #ifdef Q_OS_WIN
     QTRY_COMPARE_WITH_TIMEOUT(nativeWindowClientSize(restartedWindowId),
@@ -1270,6 +1586,10 @@ void BaselineTest::processLatestQueueOverwritesOldFrames()
     QStringList errors;
     QVERIFY2(supervisor.startAll(modules, &errors),
              qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(
+        supervisor.state(QStringLiteral("RuntimeQueueLatest")),
+        QStringLiteral("Running"),
+        5000);
     bus.setDeliveryEnabled(true);
 
     for (int sequence = 1; sequence <= 100; ++sequence) {
@@ -1334,6 +1654,10 @@ void BaselineTest::processReliableQueueDoesNotOverwrite()
     QStringList errors;
     QVERIFY2(supervisor.startAll(modules, &errors),
              qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(
+        supervisor.state(QStringLiteral("RuntimeQueueReliable")),
+        QStringLiteral("Running"),
+        5000);
     bus.setDeliveryEnabled(true);
 
     QVERIFY(publisher.publish(QStringLiteral("TEST_PARENT_RELIABLE"),
@@ -1430,6 +1754,10 @@ void BaselineTest::processIpcInlineSharedBidirectional()
     QStringList errors;
     QVERIFY2(supervisor.startAll(modules, &errors),
              qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(
+        supervisor.state(QStringLiteral("RuntimeQueueInlineShared")),
+        QStringLiteral("Running"),
+        5000);
     bus.setDeliveryEnabled(true);
 
     const QByteArray parentInline("parent-inline");
@@ -1475,17 +1803,23 @@ void BaselineTest::processRejectsInvalidToken()
     qframework::MessageBus bus(busConfig);
     qframework::ProcessSupervisor supervisor(&bus, busConfig, processConfig);
     QSignalSpy faultSpy(&supervisor, &qframework::ProcessSupervisor::moduleFault);
+    QSignalSpy startupSpy(&supervisor, &qframework::ProcessSupervisor::startupBatchFinished);
 
     const QString moduleId = QStringLiteral("InvalidTokenModule");
     QVector<qframework::ModuleConfig> modules;
     modules.append(faultProcessModuleConfig(moduleId));
     QStringList errors;
-    QVERIFY(!supervisor.startAll(modules, &errors));
-    QCOMPARE(supervisor.state(moduleId), QStringLiteral("Failed"));
-    QVERIFY(errors.join('\n').contains(QString::fromUtf8(u8"子进程注册信息校验失败")));
-    QVERIFY(faultSignalContains(faultSpy,
-                                moduleId,
-                                QString::fromUtf8(u8"子进程注册信息校验失败")));
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Failed"), 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(startupSpy.count(), 1, 3000);
+    const QStringList startupErrors = startupSpy.first().at(0).toStringList();
+    QVERIFY(startupErrors.join('\n').contains(
+        QString::fromUtf8(u8"子进程注册信息校验失败")));
+    QTRY_VERIFY_WITH_TIMEOUT(
+        faultSignalContains(faultSpy,
+                            moduleId,
+                            QString::fromUtf8(u8"子进程注册信息校验失败")),
+        3000);
 
     supervisor.shutdown();
     bus.beginShutdown();
@@ -1502,17 +1836,22 @@ void BaselineTest::processRegistrationTimeout()
     qframework::MessageBus bus(busConfig);
     qframework::ProcessSupervisor supervisor(&bus, busConfig, processConfig);
     QSignalSpy faultSpy(&supervisor, &qframework::ProcessSupervisor::moduleFault);
+    QSignalSpy startupSpy(&supervisor, &qframework::ProcessSupervisor::startupBatchFinished);
 
     const QString moduleId = QStringLiteral("RegistrationTimeoutModule");
     QVector<qframework::ModuleConfig> modules;
     modules.append(faultProcessModuleConfig(moduleId));
     QStringList errors;
-    QVERIFY(!supervisor.startAll(modules, &errors));
-    QCOMPARE(supervisor.state(moduleId), QStringLiteral("Failed"));
-    QVERIFY(errors.join('\n').contains(QString::fromUtf8(u8"子进程注册超时")));
-    QVERIFY(faultSignalContains(faultSpy,
-                                moduleId,
-                                QString::fromUtf8(u8"子进程注册超时")));
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Failed"), 3000);
+    QTRY_COMPARE_WITH_TIMEOUT(startupSpy.count(), 1, 3000);
+    const QStringList startupErrors = startupSpy.first().at(0).toStringList();
+    QVERIFY(startupErrors.join('\n').contains(QString::fromUtf8(u8"子进程注册超时")));
+    QTRY_VERIFY_WITH_TIMEOUT(
+        faultSignalContains(faultSpy,
+                            moduleId,
+                            QString::fromUtf8(u8"子进程注册超时")),
+        3000);
 
     supervisor.shutdown();
     bus.beginShutdown();
@@ -1535,7 +1874,7 @@ void BaselineTest::processHeartbeatTimeout()
     modules.append(faultProcessModuleConfig(moduleId));
     QStringList errors;
     QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
-    QCOMPARE(supervisor.state(moduleId), QStringLiteral("Running"));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Running"), 3000);
     QTRY_VERIFY_WITH_TIMEOUT(supervisor.state(moduleId) == QStringLiteral("Failed"), 3000);
     QVERIFY(faultSignalContains(faultSpy,
                                 moduleId,
@@ -1567,13 +1906,627 @@ void BaselineTest::processDebuggerWaitDefersHeartbeat()
     QElapsedTimer elapsed;
     elapsed.start();
     QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
-    QVERIFY(elapsed.elapsed() >= 500);
-    QCOMPARE(supervisor.state(moduleId), QStringLiteral("Running"));
+    QVERIFY2(elapsed.elapsed() < 200,
+             qPrintable(QStringLiteral("startAll blocked for %1 ms").arg(elapsed.elapsed())));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Running"), 3000);
     QVERIFY(faultSpy.isEmpty());
 
     supervisor.shutdown();
     bus.beginShutdown();
     QVERIFY(bus.stopQueues(200));
+}
+
+// requestRestart 只提交状态转换；用主线程 QTimer 证明等待 stop/启动期间事件循环仍运行。
+void BaselineTest::processRestartRequestDoesNotBlockGui()
+{
+    const qframework::MessageBusConfig busConfig = faultBusConfig();
+    qframework::MessageBus bus(busConfig);
+    qframework::ProcessSupervisor supervisor(
+        &bus, busConfig, lifecycleProcessConfig());
+    QSignalSpy restartSpy(&supervisor, &qframework::ProcessSupervisor::restartFinished);
+
+    const QString moduleId = QStringLiteral("AsyncRestartModule");
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(faultProcessModuleConfig(moduleId));
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Running"), 3000);
+
+    int timerTicks = 0;
+    QTimer guiTimer;
+    guiTimer.setInterval(20);
+    connect(&guiTimer, &QTimer::timeout, this, [&timerTicks]() { ++timerTicks; });
+    guiTimer.start();
+    QElapsedTimer elapsed;
+    elapsed.start();
+    QString error;
+    QVERIFY2(supervisor.requestRestart(moduleId, &error), qPrintable(error));
+    QVERIFY2(elapsed.elapsed() < 100,
+             qPrintable(QStringLiteral("requestRestart blocked for %1 ms")
+                            .arg(elapsed.elapsed())));
+    QTRY_COMPARE_WITH_TIMEOUT(restartSpy.count(), 1, 5000);
+    guiTimer.stop();
+    QVERIFY2(timerTicks >= 5,
+             qPrintable(QStringLiteral("GUI timer only fired %1 times").arg(timerTicks)));
+    QVERIFY(restartSpy.first().at(1).toBool());
+    QCOMPARE(supervisor.state(moduleId), QStringLiteral("Running"));
+
+    supervisor.shutdown();
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(500));
+}
+
+// 同一 Entry 的 operationBusy 在第一轮重启完成前拒绝第二次请求。
+void BaselineTest::processRejectsDuplicateRestartRequest()
+{
+    const qframework::MessageBusConfig busConfig = faultBusConfig();
+    qframework::MessageBus bus(busConfig);
+    qframework::ProcessSupervisor supervisor(
+        &bus, busConfig, lifecycleProcessConfig());
+    QSignalSpy restartSpy(&supervisor, &qframework::ProcessSupervisor::restartFinished);
+
+    const QString moduleId = QStringLiteral("DuplicateRestartModule");
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(faultProcessModuleConfig(moduleId));
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Running"), 3000);
+
+    QString error;
+    QVERIFY2(supervisor.requestRestart(moduleId, &error), qPrintable(error));
+    error.clear();
+    QVERIFY(!supervisor.requestRestart(moduleId, &error));
+    QVERIFY(error.contains(QString::fromUtf8(u8"操作正在进行")));
+    QTRY_COMPARE_WITH_TIMEOUT(restartSpy.count(), 1, 4000);
+    QVERIFY(restartSpy.first().at(1).toBool());
+    QCOMPARE(supervisor.state(moduleId), QStringLiteral("Running"));
+
+    supervisor.shutdown();
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(500));
+}
+
+// requestStop 返回前必须同时关闭父到子队列和 MessageBus 单模块入口。
+void BaselineTest::processStopClosesIngressImmediately()
+{
+    qframework::MessageBusConfig busConfig = faultBusConfig();
+    busConfig.defaultQueueCapacity = 8;
+    qframework::MessageBus bus(busConfig);
+    BusTestModule publisher(QStringList() << QStringLiteral("TEST_STOP_GATE"),
+                            QStringList());
+    QString error;
+    QVERIFY2(bus.registerModule(QStringLiteral("StopGatePublisher"), &publisher, &error),
+             qPrintable(error));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("StopGatePublisher"), true));
+
+    qframework::ProcessSupervisor supervisor(
+        &bus, busConfig, lifecycleProcessConfig());
+    const QString moduleId = QStringLiteral("IngressGateModule");
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(faultProcessModuleConfig(moduleId));
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Running"), 3000);
+    bus.setDeliveryEnabled(true);
+    QVERIFY(publisher.publish(QStringLiteral("TEST_STOP_GATE"), QByteArrayLiteral("before")));
+    QTRY_COMPARE_WITH_TIMEOUT(bus.queueStats(moduleId).delivered, quint64(1), 1000);
+
+    QVERIFY2(supervisor.requestStop(moduleId, &error), qPrintable(error));
+    QVERIFY(!publisher.publish(QStringLiteral("TEST_STOP_GATE"), QByteArrayLiteral("after")));
+    QVERIFY(bus.queueStats(moduleId).rejected >= 1);
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Stopped"), 2000);
+
+    supervisor.shutdown();
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(500));
+    QVERIFY(bus.unregisterModule(QStringLiteral("StopGatePublisher"), false));
+}
+
+// A、B 各自持有 stop deadline；稍后启动 B 的重启不能重置 A 的超时预算。
+void BaselineTest::processDeadlinesAreIndependentPerEntry()
+{
+    const qframework::MessageBusConfig busConfig = faultBusConfig();
+    qframework::MessageBus bus(busConfig);
+    qframework::ProcessSupervisor supervisor(
+        &bus, busConfig, lifecycleProcessConfig(300));
+    QSignalSpy restartSpy(&supervisor, &qframework::ProcessSupervisor::restartFinished);
+
+    const QString moduleA = QStringLiteral("DeadlineModuleA");
+    const QString moduleB = QStringLiteral("DeadlineModuleB");
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(faultProcessModuleConfig(moduleA));
+    modules.append(faultProcessModuleConfig(moduleB));
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.runningModuleIds().size(), 2, 4000);
+
+    QElapsedTimer timeline;
+    timeline.start();
+    qint64 moduleAStoppedAt = -1;
+    connect(&supervisor,
+            &qframework::ProcessSupervisor::moduleStateChanged,
+            this,
+            [&timeline, &moduleAStoppedAt, moduleA](const QString& id,
+                                                    const QString& state,
+                                                    const QString&) {
+                if (id == moduleA && state == QStringLiteral("Stopped"))
+                    moduleAStoppedAt = timeline.elapsed();
+            });
+    QString error;
+    QVERIFY2(supervisor.requestStop(moduleA, &error), qPrintable(error));
+    QTest::qWait(80);
+    QVERIFY2(supervisor.requestRestart(moduleB, &error), qPrintable(error));
+    QTRY_VERIFY_WITH_TIMEOUT(moduleAStoppedAt >= 0, 1800);
+    QVERIFY2(moduleAStoppedAt < 1000,
+             qPrintable(QStringLiteral("A stop deadline drifted to %1 ms")
+                            .arg(moduleAStoppedAt)));
+    QTRY_COMPARE_WITH_TIMEOUT(restartSpy.count(), 1, 2500);
+    QVERIFY(restartSpy.first().at(1).toBool());
+    QCOMPARE(supervisor.state(moduleB), QStringLiteral("Running"));
+
+    supervisor.shutdown();
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(500));
+}
+
+// stopAck 到达后状态机必须从 WaitingStopAck 推进，并给出可观察的等待退出详情。
+void BaselineTest::processStopAckAdvancesState()
+{
+    const qframework::MessageBusConfig busConfig = faultBusConfig();
+    qframework::MessageBus bus(busConfig);
+    qframework::ProcessSupervisor supervisor(
+        &bus, busConfig, lifecycleProcessConfig(1000));
+    QSignalSpy stateSpy(&supervisor, &qframework::ProcessSupervisor::moduleStateChanged);
+
+    const QString moduleId = QStringLiteral("StopAckModule");
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(faultProcessModuleConfig(moduleId));
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Running"), 3000);
+    QString error;
+    QVERIFY2(supervisor.requestStop(moduleId, &error), qPrintable(error));
+    QTRY_VERIFY_WITH_TIMEOUT(
+        stateSignalContainsDetail(stateSpy,
+                                  moduleId,
+                                  QStringLiteral("Stopping"),
+                                  QStringLiteral("stopAck")),
+        1000);
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Stopped"), 2000);
+
+    supervisor.shutdown();
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(500));
+}
+
+// 三个无响应子进程共用一次退出总预算，耗时不能线性乘以进程数量。
+void BaselineTest::processShutdownUsesOneTotalDeadline()
+{
+    const qframework::MessageBusConfig busConfig = faultBusConfig();
+    qframework::MessageBus bus(busConfig);
+    qframework::ProcessSupervisor supervisor(
+        &bus, busConfig, lifecycleProcessConfig(250));
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(faultProcessModuleConfig(QStringLiteral("ShutdownHungA")));
+    modules.append(faultProcessModuleConfig(QStringLiteral("ShutdownHungB")));
+    modules.append(faultProcessModuleConfig(QStringLiteral("ShutdownHungC")));
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.runningModuleIds().size(), 3, 4000);
+
+    QElapsedTimer elapsed;
+    elapsed.start();
+    supervisor.shutdown();
+    QVERIFY2(elapsed.elapsed() < 2300,
+             qPrintable(QStringLiteral("shutdown used %1 ms for one total deadline")
+                            .arg(elapsed.elapsed())));
+    QVERIFY(supervisor.runningModuleIds().isEmpty());
+
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(500));
+}
+
+// startAll 的返回值只代表请求被接受；批次完成信号必须在后续事件循环发出。
+void BaselineTest::processStartupBatchCompletesAsynchronously()
+{
+    const qframework::MessageBusConfig busConfig = faultBusConfig();
+    qframework::MessageBus bus(busConfig);
+    qframework::ProcessSupervisor supervisor(
+        &bus, busConfig, lifecycleProcessConfig());
+    QSignalSpy startupSpy(&supervisor, &qframework::ProcessSupervisor::startupBatchFinished);
+
+    const QString moduleId = QStringLiteral("StartupAsyncModule");
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(faultProcessModuleConfig(moduleId));
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QCOMPARE(startupSpy.count(), 0);
+    QCOMPARE(supervisor.state(moduleId), QStringLiteral("Starting"));
+    QTRY_COMPARE_WITH_TIMEOUT(startupSpy.count(), 1, 3000);
+    QCOMPARE(startupSpy.first().at(0).toStringList(), QStringList());
+    QCOMPARE(supervisor.state(moduleId), QStringLiteral("Running"));
+
+    supervisor.shutdown();
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(500));
+}
+
+// MessageBus 超时只能返回报告，不能在 finishStop 后再做无界 wait。
+void BaselineTest::messageBusStopTimeoutIsBounded()
+{
+    qframework::MessageBusConfig config = faultBusConfig();
+    config.shutdownDrainTimeoutMs = 100;
+    qframework::MessageBus bus(config);
+    BusTestModule publisher(QStringList() << QStringLiteral("TEST_BLOCKING_CALLBACK"),
+                            QStringList());
+    BlockingBusModule blocker;
+    QString error;
+    QVERIFY2(bus.registerModule(QStringLiteral("BlockingPublisher"), &publisher, &error),
+             qPrintable(error));
+    QVERIFY2(bus.registerModule(QStringLiteral("BlockingModule"), &blocker, &error),
+             qPrintable(error));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("BlockingPublisher"), true));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("BlockingModule"), true));
+    bus.setDeliveryEnabled(true);
+    QVERIFY(publisher.publish(QStringLiteral("TEST_BLOCKING_CALLBACK"),
+                              QByteArrayLiteral("block")));
+    QVERIFY(blocker.waitUntilEntered(1000));
+
+    bus.beginShutdown();
+    QElapsedTimer elapsed;
+    elapsed.start();
+    const qframework::MessageBusStopReport report = bus.stopQueues(100);
+    QVERIFY2(elapsed.elapsed() < 500,
+             qPrintable(QStringLiteral("stopQueues blocked for %1 ms")
+                            .arg(elapsed.elapsed())));
+    QVERIFY(report.timedOutModuleIds.contains(QStringLiteral("BlockingModule")));
+    QVERIFY(blocker.isStopRequested());
+
+    blocker.release();
+    QTRY_VERIFY_WITH_TIMEOUT(bus.isModuleQueueStopped(QStringLiteral("BlockingModule")), 1000);
+    QVERIFY(bus.unregisterModule(QStringLiteral("BlockingModule"), false));
+    QVERIFY(bus.unregisterModule(QStringLiteral("BlockingPublisher"), false));
+}
+
+// 超时队列保持注册，PluginManager 收到同一超时 ID 时保留 loader，安全后才可重试回收。
+void BaselineTest::timedOutQueueIsNotDeletedOrUnloaded()
+{
+    qframework::MessageBusConfig config = faultBusConfig();
+    config.shutdownDrainTimeoutMs = 80;
+    {
+        qframework::MessageBus bus(config);
+        BusTestModule publisher(
+            QStringList() << QStringLiteral("TEST_BLOCKING_CALLBACK"), QStringList());
+        BlockingBusModule blocker;
+        QString error;
+        QVERIFY(bus.registerModule(QStringLiteral("QuarantinePublisher"), &publisher, &error));
+        QVERIFY(bus.registerModule(QStringLiteral("QuarantineModule"), &blocker, &error));
+        QVERIFY(bus.setModuleRunning(QStringLiteral("QuarantinePublisher"), true));
+        QVERIFY(bus.setModuleRunning(QStringLiteral("QuarantineModule"), true));
+        bus.setDeliveryEnabled(true);
+        QVERIFY(publisher.publish(QStringLiteral("TEST_BLOCKING_CALLBACK"),
+                                  QByteArrayLiteral("block")));
+        QVERIFY(blocker.waitUntilEntered(1000));
+        bus.beginShutdown();
+        const qframework::MessageBusStopReport report = bus.stopQueues(80);
+        QVERIFY(report.timedOutModuleIds.contains(QStringLiteral("QuarantineModule")));
+        QVERIFY(!bus.unregisterModule(QStringLiteral("QuarantineModule"), false));
+        QVERIFY(bus.moduleIds().contains(QStringLiteral("QuarantineModule")));
+        QCOMPARE(blocker.moduleId(), QStringLiteral("QuarantineModule"));
+        blocker.release();
+        QTRY_VERIFY_WITH_TIMEOUT(
+            bus.isModuleQueueStopped(QStringLiteral("QuarantineModule")), 1000);
+        QVERIFY(bus.unregisterModule(QStringLiteral("QuarantineModule"), false));
+        QVERIFY(bus.unregisterModule(QStringLiteral("QuarantinePublisher"), false));
+    }
+
+    const QString moduleId = QStringLiteral("InProcessNonUiExample");
+    qframework::MessageBus pluginBus(config);
+    qframework::PluginManager manager(&pluginBus);
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(moduleId, qframework::ModuleType::InProcessNonUi));
+    QStringList errors;
+    QVERIFY2(manager.loadAndStart(modules, &errors, false), qPrintable(errors.join('\n')));
+    pluginBus.beginShutdown();
+    const qframework::MessageBusStopReport stopped = pluginBus.stopQueues(500);
+    QVERIFY(stopped.allStopped());
+    QCOMPARE(manager.shutdown(QStringList() << moduleId), QStringList() << moduleId);
+    QCOMPARE(manager.quarantinedModuleIds(), QStringList() << moduleId);
+    QVERIFY(pluginBus.moduleIds().contains(moduleId));
+    QVERIFY(manager.retryQuarantinedShutdown().isEmpty());
+    QVERIFY(!pluginBus.moduleIds().contains(moduleId));
+}
+
+// 子进程 onMessage 卡死时，运行时不杀单条 QThread，而是让整个测试子进程退出。
+void BaselineTest::processHungCallbackEndsWholeChild()
+{
+    qframework::MessageBusConfig busConfig = queueTestBusConfig();
+    busConfig.shutdownDrainTimeoutMs = 150;
+    qframework::MessageBus bus(busConfig);
+    BusTestModule publisher(QStringList() << QStringLiteral("TEST_PARENT_HUNG"),
+                            QStringList());
+    BusTestModule observer(QStringList(),
+                           QStringList() << QStringLiteral("TEST_CHILD_HUNG_ENTERED"));
+    QString error;
+    QVERIFY(bus.registerModule(QStringLiteral("HungPublisher"), &publisher, &error));
+    QVERIFY(bus.registerModule(QStringLiteral("HungObserver"), &observer, &error));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("HungPublisher"), true));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("HungObserver"), true));
+
+    qframework::ProcessSupervisor supervisor(
+        &bus, busConfig, queueTestProcessConfig());
+    QSignalSpy stateSpy(&supervisor, &qframework::ProcessSupervisor::moduleStateChanged);
+    const QString moduleId = QStringLiteral("RuntimeHungCallback");
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(queueTestModuleConfig(moduleId));
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Running"), 3000);
+    bus.setDeliveryEnabled(true);
+    QVERIFY(publisher.publish(QStringLiteral("TEST_PARENT_HUNG"), QByteArrayLiteral("hang")));
+    QTRY_VERIFY_WITH_TIMEOUT(
+        messagesContain(observer.received(),
+                        QStringLiteral("TEST_CHILD_HUNG_ENTERED"),
+                        QByteArrayLiteral("entered")),
+        3000);
+
+    QElapsedTimer elapsed;
+    elapsed.start();
+    QVERIFY2(supervisor.requestStop(moduleId, &error), qPrintable(error));
+    QVERIFY(elapsed.elapsed() < 100);
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Stopped"), 3000);
+    QVERIFY(stateSignalContainsDetail(stateSpy,
+                                      moduleId,
+                                      QStringLiteral("Stopping"),
+                                      QString::fromUtf8(u8"停止超时")) ||
+            stateSignalContainsDetail(stateSpy,
+                                      moduleId,
+                                      QStringLiteral("Stopped"),
+                                      QString::fromUtf8(u8"停止超时")));
+    QVERIFY(!supervisor.runningModuleIds().contains(moduleId));
+
+    supervisor.shutdown();
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(1000));
+    QVERIFY(bus.unregisterModule(QStringLiteral("HungPublisher"), false));
+    QVERIFY(bus.unregisterModule(QStringLiteral("HungObserver"), false));
+}
+
+// fail-fast 使用可替换入口；测试记录请求并释放卡死条件，不结束 Qt Test 主进程。
+void BaselineTest::shutdownRequestsFailFastForHungInProcessModule()
+{
+    qframework::MessageBusConfig config = faultBusConfig();
+    config.shutdownDrainTimeoutMs = 80;
+    qframework::MessageBus bus(config);
+    BusTestModule publisher(QStringList() << QStringLiteral("TEST_BLOCKING_CALLBACK"),
+                            QStringList());
+    BlockingBusModule blocker;
+    QString error;
+    QVERIFY(bus.registerModule(QStringLiteral("FailFastPublisher"), &publisher, &error));
+    QVERIFY(bus.registerModule(QStringLiteral("FailFastModule"), &blocker, &error));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("FailFastPublisher"), true));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("FailFastModule"), true));
+    bus.setDeliveryEnabled(true);
+    QVERIFY(publisher.publish(QStringLiteral("TEST_BLOCKING_CALLBACK"),
+                              QByteArrayLiteral("block")));
+    QVERIFY(blocker.waitUntilEntered(1000));
+    bus.beginShutdown();
+    const qframework::MessageBusStopReport report = bus.stopQueues(80);
+    QVERIFY(report.timedOutModuleIds.contains(QStringLiteral("FailFastModule")));
+
+    {
+        QMutexLocker locker(&failFastRecordMutex);
+        failFastRequested = false;
+        failFastReason.clear();
+    }
+    qframework::ProcessFailFast::setHandlerForTests(&recordFailFastRequest);
+    QVERIFY(qframework::ProcessFailFast::requestForHungModules(
+        report.timedOutModuleIds));
+    qframework::ProcessFailFast::setHandlerForTests(nullptr);
+    {
+        QMutexLocker locker(&failFastRecordMutex);
+        QVERIFY(failFastRequested);
+        QVERIFY(failFastReason.contains(QStringLiteral("FailFastModule")));
+    }
+
+    blocker.release();
+    QTRY_VERIFY_WITH_TIMEOUT(bus.isModuleQueueStopped(QStringLiteral("FailFastModule")), 1000);
+    QVERIFY(bus.unregisterModule(QStringLiteral("FailFastModule"), false));
+    QVERIFY(bus.unregisterModule(QStringLiteral("FailFastPublisher"), false));
+}
+
+// 源码级守卫配合上一项进程行为测试，防止未来重新引入 QThread::terminate()。
+void BaselineTest::messageQueueNeverUsesThreadTerminate()
+{
+    const QString sourcePath = QDir::cleanPath(
+        QCoreApplication::applicationDirPath() +
+        QStringLiteral("/../../../../Source/QFramework/Process/ProcessRuntime.cpp"));
+    QFile sourceFile(sourcePath);
+    QVERIFY2(sourceFile.open(QIODevice::ReadOnly), qPrintable(sourcePath));
+    const QByteArray source = sourceFile.readAll();
+    QVERIFY(!source.contains("QThread::terminate"));
+    QVERIFY(!source.contains("terminate();"));
+}
+
+// 四个业务 QThread 持续 publish，连续重启三轮，验证 stop/delete 与 enqueue 同步。
+void BaselineTest::processPublishGateIsThreadSafeDuringStop()
+{
+    const qframework::MessageBusConfig busConfig = queueTestBusConfig();
+    qframework::MessageBus bus(busConfig);
+    qframework::ProcessSupervisor supervisor(
+        &bus, busConfig, queueTestProcessConfig());
+    QSignalSpy restartSpy(&supervisor, &qframework::ProcessSupervisor::restartFinished);
+    QSignalSpy faultSpy(&supervisor, &qframework::ProcessSupervisor::moduleFault);
+
+    const QString moduleId = QStringLiteral("RuntimePublishStress");
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(queueTestModuleConfig(moduleId));
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Running"), 4000);
+
+    for (int round = 0; round < 3; ++round) {
+        QTest::qWait(100);
+        QString error;
+        const int expectedSignals = restartSpy.count() + 1;
+        QVERIFY2(supervisor.requestRestart(moduleId, &error), qPrintable(error));
+        QTRY_COMPARE_WITH_TIMEOUT(restartSpy.count(), expectedSignals, 5000);
+        QVERIFY2(restartSpy.last().at(1).toBool(),
+                 qPrintable(restartSpy.last().at(2).toString()));
+        QCOMPARE(supervisor.state(moduleId), QStringLiteral("Running"));
+    }
+
+    QString error;
+    QVERIFY2(supervisor.requestStop(moduleId, &error), qPrintable(error));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Stopped"), 4000);
+    QVERIFY(faultSpy.isEmpty());
+    supervisor.shutdown();
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(1000));
+}
+
+// 控制帧失败分支不易靠操作系统稳定制造短写，使用源码守卫锁定立即 fault 顺序。
+void BaselineTest::processControlWriteFailureTriggersFaultImmediately()
+{
+    const QString root = QDir::cleanPath(
+        QCoreApplication::applicationDirPath() + QStringLiteral("/../../../../"));
+    QFile supervisorFile(QDir(root).filePath(
+        QStringLiteral("Source/QFramework/Process/ProcessSupervisor.cpp")));
+    QFile runtimeFile(QDir(root).filePath(
+        QStringLiteral("Source/QFramework/Process/ProcessRuntime.cpp")));
+    QFile runtimeHeader(QDir(root).filePath(
+        QStringLiteral("Source/QFrameworkSdk/ProcessRuntime.h")));
+    QVERIFY(supervisorFile.open(QIODevice::ReadOnly));
+    QVERIFY(runtimeFile.open(QIODevice::ReadOnly));
+    QVERIFY(runtimeHeader.open(QIODevice::ReadOnly));
+    QByteArray supervisor = supervisorFile.readAll();
+    QByteArray runtime = runtimeFile.readAll();
+    const QByteArray header = runtimeHeader.readAll();
+    for (QByteArray* source : {&supervisor, &runtime}) {
+        source->replace(" ", "");
+        source->replace("\t", "");
+        source->replace("\r", "");
+        source->replace("\n", "");
+    }
+
+    const int pingCheck = supervisor.indexOf("if(!sendFrame(entry,ping))");
+    const int pingFault = supervisor.indexOf("handleFault(entry", pingCheck);
+    const int pingTimestamp = supervisor.indexOf("entry->lastPingMs=now", pingCheck);
+    QVERIFY(pingCheck >= 0);
+    QVERIFY(pingFault > pingCheck);
+    QVERIFY(pingTimestamp > pingFault);
+    QVERIFY(header.contains("bool sendFrame(const QJsonObject& frame)"));
+    QVERIFY(runtime.contains("if(!sendFrame(startedFrame))"));
+    QVERIFY(runtime.contains("if(!sendFrame(pong))"));
+    QVERIFY(runtime.contains("if(!sendFrame(ack))"));
+    QVERIFY(runtime.contains("if(!sendFrame(frame))"));
+    QVERIFY(supervisor.contains(
+        "if(!sendFrame(entry,ack)&&!isStoppingPhase(entry->phase))"));
+}
+
+// 故障客户端故意不回 deliveryAck，稳定形成等待、在途和容量拒绝三类项。
+void BaselineTest::processStopAccountingIncludesDiscardedMessages()
+{
+    qframework::MessageBusConfig busConfig = faultBusConfig();
+    busConfig.topics.insert(
+        QStringLiteral("TEST_ACCOUNTING"),
+        queueTopicConfig(1, qframework::QueuePolicy::Reliable));
+    qframework::MessageBus bus(busConfig);
+    BusTestModule publisher(QStringList() << QStringLiteral("TEST_ACCOUNTING"),
+                            QStringList());
+    QString error;
+    QVERIFY2(bus.registerModule(QStringLiteral("AccountingPublisher"), &publisher, &error),
+             qPrintable(error));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("AccountingPublisher"), true));
+
+    qframework::ProcessSupervisor supervisor(
+        &bus, busConfig, lifecycleProcessConfig(1000));
+    const QString moduleId = QStringLiteral("AccountingModule");
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(faultProcessModuleConfig(moduleId));
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Running"), 3000);
+    bus.setDeliveryEnabled(true);
+
+    QVERIFY(publisher.publish(QStringLiteral("TEST_ACCOUNTING"), QByteArrayLiteral("one")));
+    QTRY_VERIFY_WITH_TIMEOUT(supervisor.queueStats(moduleId).inFlight >= 1, 1500);
+    QVERIFY(publisher.publish(QStringLiteral("TEST_ACCOUNTING"), QByteArrayLiteral("two")));
+    QTRY_VERIFY_WITH_TIMEOUT(supervisor.queueStats(moduleId).pending >= 1, 1500);
+    for (int index = 0; index < 20 &&
+         supervisor.queueStats(moduleId).rejected == 0; ++index) {
+        publisher.publish(QStringLiteral("TEST_ACCOUNTING"), QByteArray::number(index));
+        QTest::qWait(10);
+    }
+    QTRY_VERIFY_WITH_TIMEOUT(supervisor.queueStats(moduleId).rejected >= 1, 1500);
+
+    QVERIFY2(supervisor.requestStop(moduleId, &error), qPrintable(error));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Stopped"), 3000);
+    const qframework::ProcessQueueStats stats = supervisor.queueStats(moduleId);
+    QVERIFY(stats.dropped >= 1);
+    QVERIFY(stats.rejected >= 1);
+    QVERIFY(stats.abandoned >= 1);
+    QCOMPARE(stats.pending, 0);
+    QCOMPARE(stats.inFlight, 0);
+
+    supervisor.shutdown();
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(1000));
+    QVERIFY(bus.unregisterModule(QStringLiteral("AccountingPublisher"), false));
+}
+
+// 精确边界由源码守卫固定为 >=，避免依赖毫秒调度去“碰巧”命中等号。
+void BaselineTest::processRestartWindowBoundaryIsInclusive()
+{
+    const QString path = QDir::cleanPath(
+        QCoreApplication::applicationDirPath() +
+        QStringLiteral("/../../../../Source/QFramework/Process/ProcessSupervisor.cpp"));
+    QFile file(path);
+    QVERIFY2(file.open(QIODevice::ReadOnly), qPrintable(path));
+    QByteArray source = file.readAll();
+    source.replace(" ", "");
+    source.replace("\t", "");
+    source.replace("\r", "");
+    source.replace("\n", "");
+    QVERIFY(source.contains(
+        "now-entry->restartWindowStartMs>=qMax(1,processConfig_.restartWindowMs)"));
+    QVERIFY(!source.contains(
+        "now-entry->restartWindowStartMs>qMax(1,processConfig_.restartWindowMs)"));
+}
+
+// queuePublish 只能访问 PublishQueue；所有 QLocalSocket 读写都留在 Runtime 线程。
+void BaselineTest::processSocketAccessStaysOnRuntimeThread()
+{
+    const QString root = QDir::cleanPath(
+        QCoreApplication::applicationDirPath() + QStringLiteral("/../../../../"));
+    const QString runtimePath = QDir(root).filePath(
+        QStringLiteral("Source/QFramework/Process/ProcessRuntime.cpp"));
+    const QString supervisorPath = QDir(root).filePath(
+        QStringLiteral("Source/QFramework/Process/ProcessSupervisor.cpp"));
+    QFile runtimeFile(runtimePath);
+    QFile supervisorFile(supervisorPath);
+    QVERIFY2(runtimeFile.open(QIODevice::ReadOnly), qPrintable(runtimePath));
+    QVERIFY2(supervisorFile.open(QIODevice::ReadOnly), qPrintable(supervisorPath));
+    const QByteArray runtime = runtimeFile.readAll();
+    const QByteArray supervisor = supervisorFile.readAll();
+
+    const int publishStart = runtime.indexOf("bool ProcessRuntime::queuePublish");
+    const int publishEnd = runtime.indexOf("// 日志体较小", publishStart);
+    QVERIFY(publishStart >= 0 && publishEnd > publishStart);
+    const QByteArray publishBody = runtime.mid(publishStart, publishEnd - publishStart);
+    QVERIFY(!publishBody.contains("running_"));
+    QVERIFY(!publishBody.contains("socket_"));
+    QCOMPARE(runtime.count("socket_->write("), 1);
+    QVERIFY(runtime.contains("Q_ASSERT(QThread::currentThread() == thread())"));
+    QVERIFY(runtime.contains(
+        "Q_ASSERT(socket_ == nullptr || socket_->thread() == QThread::currentThread())"));
+
+    const int publishQueueStart = runtime.indexOf("class ProcessRuntime::PublishQueue");
+    const int messageQueueStart = runtime.indexOf("class ProcessRuntime::MessageQueue");
+    QVERIFY(publishQueueStart >= 0 && messageQueueStart > publishQueueStart);
+    QVERIFY(!runtime.mid(publishQueueStart, messageQueueStart - publishQueueStart)
+                 .contains("available_"));
+    QVERIFY(!supervisor.contains("outgoingChanged"));
 }
 
 // 目的：验证 SingleInstanceGuard 以目录为作用域阻止同目录第二个实例。
@@ -1628,8 +2581,11 @@ void BaselineTest::layoutPersistenceAndDockingRules()
     qframework::LayoutManager manager(&window);
     manager.registerModuleDock(QStringLiteral("First"), &firstDock);
     manager.registerModuleDock(QStringLiteral("Second"), &secondDock);
+    QHash<QString, bool> requestedVisibility;
+    requestedVisibility.insert(QStringLiteral("First"), true);
+    requestedVisibility.insert(QStringLiteral("Second"), false);
     QString error;
-    QVERIFY2(manager.saveLayout(layoutPath, &error), qPrintable(error));
+    QVERIFY2(manager.saveLayout(layoutPath, requestedVisibility, &error), qPrintable(error));
 
     QFile layoutFile(layoutPath);
     QVERIFY(layoutFile.open(QIODevice::ReadOnly));
@@ -1640,6 +2596,7 @@ void BaselineTest::layoutPersistenceAndDockingRules()
     QJsonObject modules = root.value(QStringLiteral("modules")).toObject();
     QJsonObject missingModule;
     missingModule.insert(QStringLiteral("visible"), true);
+    missingModule.insert(QStringLiteral("requestedVisible"), true);
     modules.insert(QStringLiteral("MissingModule"), missingModule);
     root.insert(QStringLiteral("modules"), modules);
     QVERIFY(layoutFile.open(QIODevice::WriteOnly | QIODevice::Truncate));
@@ -1649,10 +2606,19 @@ void BaselineTest::layoutPersistenceAndDockingRules()
 
     firstDock.hide();
     secondDock.show();
+    QHash<QString, bool> loadedVisibility;
     QStringList unavailableModules;
-    QVERIFY2(manager.loadLayout(layoutPath, &error, &unavailableModules),
-             qPrintable(error));
+    bool legacyVisibility = true;
+    QVERIFY2(manager.loadLayout(layoutPath,
+                                &loadedVisibility,
+                                &error,
+                                &unavailableModules,
+                                &legacyVisibility),
+              qPrintable(error));
     QCOMPARE(unavailableModules, QStringList() << QStringLiteral("MissingModule"));
+    QVERIFY(!legacyVisibility);
+    QVERIFY(loadedVisibility.value(QStringLiteral("First")));
+    QVERIFY(!loadedVisibility.value(QStringLiteral("Second")));
     QVERIFY(firstDock.isVisible());
     QVERIFY(!secondDock.isVisible());
     QCOMPARE(manager.activeFilePath(), QFileInfo(layoutPath).absoluteFilePath());
@@ -1680,7 +2646,320 @@ void BaselineTest::layoutPersistenceAndDockingRules()
     QVERIFY(damagedFile.open(QIODevice::WriteOnly));
     QCOMPARE(damagedFile.write("{ damaged"), qint64(9));
     damagedFile.close();
-    QVERIFY(!manager.loadLayout(damagedPath, &error));
+    QVERIFY(!manager.loadLayout(damagedPath, &loadedVisibility, &error));
+    QCOMPARE(window.saveState(1), stateBeforeFailure);
+    QCOMPARE(manager.activeFilePath(), activeBeforeFailure);
+}
+
+// 菜单勾选表示用户意图，取消勾选必须立即隐藏已经 ready 的 Dock。
+void BaselineTest::moduleMenuTogglesRequestedVisibility()
+{
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(QStringLiteral("MenuUi"), qframework::ModuleType::InProcessUi));
+    qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
+    window.show();
+    QVERIFY(QMetaObject::invokeMethod(&window,
+                                      "setUiAvailable",
+                                      Qt::DirectConnection,
+                                      Q_ARG(QString, QStringLiteral("MenuUi")),
+                                      Q_ARG(bool, true)));
+    QAction* action = window.findChild<QAction*>(QStringLiteral("ModuleAction.MenuUi"));
+    QDockWidget* dock = window.findChild<QDockWidget*>(QStringLiteral("ModuleDock.MenuUi"));
+    QVERIFY(action != nullptr);
+    QVERIFY(dock != nullptr);
+
+    action->trigger();
+    QTRY_VERIFY(action->isChecked());
+    QTRY_VERIFY(dock->isVisible());
+    action->trigger();
+    QTRY_VERIFY(!action->isChecked());
+    QTRY_VERIFY(!dock->isVisible());
+}
+
+// Dock 关闭按钮与标签切换分离：只有 close 才撤销菜单勾选。
+void BaselineTest::dockCloseClearsRequestedVisibility()
+{
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(QStringLiteral("CloseUi"), qframework::ModuleType::InProcessUi));
+    qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
+    window.show();
+    QVERIFY(QMetaObject::invokeMethod(&window, "setUiAvailable", Qt::DirectConnection,
+                                      Q_ARG(QString, QStringLiteral("CloseUi")), Q_ARG(bool, true)));
+    QAction* action = window.findChild<QAction*>(QStringLiteral("ModuleAction.CloseUi"));
+    QDockWidget* dock = window.findChild<QDockWidget*>(QStringLiteral("ModuleDock.CloseUi"));
+    QVERIFY(action != nullptr);
+    QVERIFY(dock != nullptr);
+    action->trigger();
+    QTRY_VERIFY(dock->isVisible());
+    QVERIFY(dock->close());
+    QTRY_VERIFY(!action->isChecked());
+}
+
+// 两个标签来回 raise 只改变 Qt 当前绘制页，不改变两个 QAction 的用户意图。
+void BaselineTest::tabSwitchKeepsRequestedVisibility()
+{
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(QStringLiteral("TabOne"), qframework::ModuleType::InProcessUi));
+    modules.append(pluginConfig(QStringLiteral("TabTwo"), qframework::ModuleType::InProcessUi));
+    qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
+    window.show();
+    const QStringList moduleIds = QStringList()
+        << QStringLiteral("TabOne") << QStringLiteral("TabTwo");
+    for (const QString& id : moduleIds) {
+        QVERIFY(QMetaObject::invokeMethod(&window, "setUiAvailable", Qt::DirectConnection,
+                                          Q_ARG(QString, id), Q_ARG(bool, true)));
+        QAction* action = window.findChild<QAction*>(QStringLiteral("ModuleAction.%1").arg(id));
+        QVERIFY(action != nullptr);
+        action->trigger();
+    }
+    QDockWidget* first = window.findChild<QDockWidget*>(QStringLiteral("ModuleDock.TabOne"));
+    QDockWidget* second = window.findChild<QDockWidget*>(QStringLiteral("ModuleDock.TabTwo"));
+    QVERIFY(first != nullptr);
+    QVERIFY(second != nullptr);
+    QVERIFY(window.tabifiedDockWidgets(first).contains(second));
+    first->raise();
+    second->raise();
+    QCoreApplication::processEvents();
+    QVERIFY(window.findChild<QAction*>(QStringLiteral("ModuleAction.TabOne"))->isChecked());
+    QVERIFY(window.findChild<QAction*>(QStringLiteral("ModuleAction.TabTwo"))->isChecked());
+}
+
+// 保存的是两个 Dock 的显示意图，restoreState 仍负责恢复标签关系和当前页。
+void BaselineTest::layoutPreservesTabbedVisibilityIntent()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString path = directory.filePath(QStringLiteral("tabs.qflayout"));
+    QMainWindow window;
+    qframework::ManagedDockWidget first(QStringLiteral("First"), &window);
+    qframework::ManagedDockWidget second(QStringLiteral("Second"), &window);
+    first.setObjectName(QStringLiteral("ModuleDock.First"));
+    second.setObjectName(QStringLiteral("ModuleDock.Second"));
+    window.addDockWidget(Qt::LeftDockWidgetArea, &first);
+    window.addDockWidget(Qt::LeftDockWidgetArea, &second);
+    window.tabifyDockWidget(&first, &second);
+    window.show();
+    first.show();
+    second.show();
+    first.raise();
+    qframework::LayoutManager manager(&window);
+    manager.registerModuleDock(QStringLiteral("First"), &first);
+    manager.registerModuleDock(QStringLiteral("Second"), &second);
+    QHash<QString, bool> requested;
+    requested.insert(QStringLiteral("First"), true);
+    requested.insert(QStringLiteral("Second"), true);
+    QString error;
+    QVERIFY2(manager.saveLayout(path, requested, &error), qPrintable(error));
+
+    window.removeDockWidget(&second);
+    window.addDockWidget(Qt::RightDockWidgetArea, &second);
+    QHash<QString, bool> loaded;
+    QVERIFY2(manager.loadLayout(path, &loaded, &error), qPrintable(error));
+    QVERIFY(loaded.value(QStringLiteral("First")));
+    QVERIFY(loaded.value(QStringLiteral("Second")));
+    QVERIFY(window.tabifiedDockWidgets(&first).contains(&second));
+}
+
+// 未 ready 时保留 checked/pending；ready 到达后自动应用显示意图。
+void BaselineTest::layoutDefersUnavailableDockUntilReady()
+{
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(QStringLiteral("PendingUi"), qframework::ModuleType::InProcessUi));
+    qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
+    window.show();
+    QAction* action = window.findChild<QAction*>(QStringLiteral("ModuleAction.PendingUi"));
+    QDockWidget* dock = window.findChild<QDockWidget*>(QStringLiteral("ModuleDock.PendingUi"));
+    QVERIFY(action != nullptr);
+    QVERIFY(dock != nullptr);
+    action->trigger();
+    QVERIFY(action->isChecked());
+    QVERIFY(!dock->isVisible());
+    QVERIFY(QMetaObject::invokeMethod(&window, "setUiAvailable", Qt::DirectConnection,
+                                      Q_ARG(QString, QStringLiteral("PendingUi")), Q_ARG(bool, true)));
+    QTRY_VERIFY(dock->isVisible());
+}
+
+// 明确取消 pending 后，即使窗口随后 ready 也不能被补显示。
+void BaselineTest::layoutHiddenDockStaysHiddenAfterReady()
+{
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(QStringLiteral("HiddenUi"), qframework::ModuleType::InProcessUi));
+    qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
+    window.show();
+    QAction* action = window.findChild<QAction*>(QStringLiteral("ModuleAction.HiddenUi"));
+    QDockWidget* dock = window.findChild<QDockWidget*>(QStringLiteral("ModuleDock.HiddenUi"));
+    QVERIFY(action != nullptr);
+    QVERIFY(dock != nullptr);
+    action->trigger();
+    action->trigger();
+    QVERIFY(!action->isChecked());
+    QVERIFY(QMetaObject::invokeMethod(&window, "setUiAvailable", Qt::DirectConnection,
+                                      Q_ARG(QString, QStringLiteral("HiddenUi")), Q_ARG(bool, true)));
+    QVERIFY(!dock->isVisible());
+}
+
+// 真实 ProcessUi 窗口晚到时只应用布局保存的显示意图：显示布局会补发 showWindow，
+// 明确隐藏布局在重启后的新 windowReady 到达时保持隐藏，之后菜单勾选仍能显示。
+void BaselineTest::processUiLateWindowHonorsLayoutVisibility()
+{
+    const QString moduleId = QStringLiteral("ProcessUiExample");
+    const QString executablePath = processModulePath(moduleId);
+    QVERIFY2(QFileInfo::exists(executablePath), qPrintable(executablePath));
+
+    qframework::MessageBusConfig busConfig;
+    busConfig.defaultQueueCapacity = 32;
+    busConfig.maxMessageBytes = 1024 * 1024;
+    busConfig.sharedMemoryThresholdBytes = 256;
+    busConfig.shutdownDrainTimeoutMs = 2000;
+    qframework::ProcessConfig processConfig;
+    processConfig.registrationTimeoutMs = 5000;
+    processConfig.heartbeatIntervalMs = 100;
+    processConfig.heartbeatTimeoutMs = 1000;
+    processConfig.stopTimeoutMs = 2000;
+    processConfig.restartDelayMs = 100;
+    processConfig.restartWindowMs = 5000;
+    processConfig.maxRestartCount = 2;
+
+    qframework::MessageBus bus(busConfig);
+    qframework::ProcessSupervisor supervisor(&bus, busConfig, processConfig);
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(processModuleConfig(moduleId, qframework::ModuleType::ProcessUi));
+    qframework::MainWindow window(modules, nullptr, &supervisor, nullptr);
+    window.show();
+
+    QAction* action = window.findChild<QAction*>(
+        QStringLiteral("ModuleAction.%1").arg(moduleId));
+    QDockWidget* dock = window.findChild<QDockWidget*>(
+        QStringLiteral("ModuleDock.%1").arg(moduleId));
+    qframework::ProcessWindowHost* host =
+        qobject_cast<qframework::ProcessWindowHost*>(dock == nullptr ? nullptr : dock->widget());
+    QVERIFY(action != nullptr);
+    QVERIFY(dock != nullptr);
+    QVERIFY(host != nullptr);
+
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString visiblePath = directory.filePath(QStringLiteral("visible.qflayout"));
+    const QString hiddenPath = directory.filePath(QStringLiteral("hidden.qflayout"));
+    QString error;
+    QHash<QString, bool> visibility;
+    visibility.insert(moduleId, true);
+    QVERIFY2(window.layoutManager()->saveLayout(visiblePath, visibility, &error),
+             qPrintable(error));
+    QVERIFY2(window.loadLayoutFile(visiblePath, &error), qPrintable(error));
+    QVERIFY(action->isChecked());
+    QVERIFY(!dock->isVisible());
+
+    qRegisterMetaType<quintptr>("quintptr");
+    QSignalSpy windowSpy(&supervisor, &qframework::ProcessSupervisor::windowHandleReady);
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Running"), 10000);
+    QTRY_VERIFY_WITH_TIMEOUT(windowSpy.count() >= 1, 5000);
+    const quintptr initialWindowId = static_cast<quintptr>(
+        windowSpy.first().at(1).toULongLong());
+    QVERIFY(initialWindowId != 0);
+    QTRY_VERIFY_WITH_TIMEOUT(dock->isVisible(), 2000);
+#ifdef Q_OS_WIN
+    QTRY_VERIFY_WITH_TIMEOUT(nativeWindowVisible(initialWindowId), 2000);
+    // Dock 尺寸变化只发送合并后的 resizeWindow，原生客户区最终应与宿主一致。
+    QTRY_COMPARE_WITH_TIMEOUT(nativeWindowClientSize(initialWindowId), host->size(), 2000);
+    window.resize(960, 620);
+    QTRY_COMPARE_WITH_TIMEOUT(nativeWindowClientSize(initialWindowId), host->size(), 2000);
+    window.resize(700, 480);
+    QTRY_COMPARE_WITH_TIMEOUT(nativeWindowClientSize(initialWindowId), host->size(), 2000);
+#endif
+    QVERIFY(window.minimumSize().width() < 2000);
+    QVERIFY(window.minimumSize().height() < 1600);
+
+    // 隐藏意图在重启前写入；新 HWND 晚到时只能嵌入，不能自动补发显示命令。
+    visibility.insert(moduleId, false);
+    QVERIFY2(window.layoutManager()->saveLayout(hiddenPath, visibility, &error),
+             qPrintable(error));
+    QVERIFY2(window.loadLayoutFile(hiddenPath, &error), qPrintable(error));
+    QVERIFY(!action->isChecked());
+    QVERIFY(!dock->isVisible());
+
+    const int priorWindowCount = windowSpy.count();
+    QVERIFY2(supervisor.requestRestart(moduleId, &error), qPrintable(error));
+    QTRY_VERIFY_WITH_TIMEOUT(windowSpy.count() > priorWindowCount, 10000);
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(moduleId), QStringLiteral("Running"), 10000);
+    const quintptr restartedWindowId = static_cast<quintptr>(
+        windowSpy.last().at(1).toULongLong());
+    QVERIFY(restartedWindowId != 0);
+    QTest::qWait(250);
+    QVERIFY(!action->isChecked());
+    QVERIFY(!dock->isVisible());
+#ifdef Q_OS_WIN
+    QVERIFY(!nativeWindowVisible(restartedWindowId));
+    // 隐藏期间即使主窗口继续 resize，也不能靠尺寸帧把子窗口补显示。
+    window.resize(850, 560);
+    QTest::qWait(120);
+    QVERIFY(!nativeWindowVisible(restartedWindowId));
+#endif
+
+    // 窗口已经 ready 后，用户再次勾选仍会发送 showWindow 并显示同一原生窗口。
+    action->trigger();
+    QVERIFY(action->isChecked());
+    QTRY_VERIFY_WITH_TIMEOUT(dock->isVisible(), 2000);
+#ifdef Q_OS_WIN
+    QTRY_VERIFY_WITH_TIMEOUT(nativeWindowVisible(restartedWindowId), 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(nativeWindowClientSize(restartedWindowId), host->size(), 2000);
+#endif
+
+    supervisor.shutdown();
+    QVERIFY(supervisor.runningModuleIds().isEmpty());
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(2000));
+}
+
+// 旧布局按 visible 兼容读取；损坏文件仍完整保留当前 state 和活动路径。
+void BaselineTest::legacyLayoutLoadsWithoutCorruptingCurrentState()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString legacyPath = directory.filePath(QStringLiteral("legacy.qflayout"));
+    const QString damagedPath = directory.filePath(QStringLiteral("damaged.qflayout"));
+    QMainWindow window;
+    qframework::ManagedDockWidget dock(QStringLiteral("Legacy"), &window);
+    dock.setObjectName(QStringLiteral("ModuleDock.Legacy"));
+    window.addDockWidget(Qt::LeftDockWidgetArea, &dock);
+    window.show();
+    qframework::LayoutManager manager(&window);
+    manager.registerModuleDock(QStringLiteral("Legacy"), &dock);
+    QHash<QString, bool> requested;
+    requested.insert(QStringLiteral("Legacy"), true);
+    QString error;
+    QVERIFY2(manager.saveLayout(legacyPath, requested, &error), qPrintable(error));
+
+    QFile file(legacyPath);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QJsonObject root = QJsonDocument::fromJson(file.readAll()).object();
+    file.close();
+    root.remove(QStringLiteral("visibilitySemantics"));
+    QJsonObject modules = root.value(QStringLiteral("modules")).toObject();
+    QJsonObject state = modules.value(QStringLiteral("Legacy")).toObject();
+    state.remove(QStringLiteral("requestedVisible"));
+    modules.insert(QStringLiteral("Legacy"), state);
+    root.insert(QStringLiteral("modules"), modules);
+    QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    const QByteArray legacyData = QJsonDocument(root).toJson();
+    QCOMPARE(file.write(legacyData), qint64(legacyData.size()));
+    file.close();
+
+    dock.hide();
+    QHash<QString, bool> loaded;
+    bool legacy = false;
+    QVERIFY2(manager.loadLayout(legacyPath, &loaded, &error, nullptr, &legacy), qPrintable(error));
+    QVERIFY(legacy);
+    QVERIFY(loaded.value(QStringLiteral("Legacy")));
+    const QByteArray stateBeforeFailure = window.saveState(1);
+    const QString activeBeforeFailure = manager.activeFilePath();
+    QFile damaged(damagedPath);
+    QVERIFY(damaged.open(QIODevice::WriteOnly));
+    QCOMPARE(damaged.write("{ damaged"), qint64(9));
+    damaged.close();
+    QVERIFY(!manager.loadLayout(damagedPath, &loaded, &error));
     QCOMPARE(window.saveState(1), stateBeforeFailure);
     QCOMPARE(manager.activeFilePath(), activeBeforeFailure);
 }

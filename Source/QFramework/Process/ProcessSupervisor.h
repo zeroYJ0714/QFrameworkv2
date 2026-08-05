@@ -5,9 +5,11 @@
 // 有界队列；心跳、注册、重启、窗口句柄和 ACK 都在同一 Qt 线程协调。
 
 #include <QProcess>
+#include <QDeadlineTimer>
 #include <QJsonObject>
 #include <QObject>
 #include <QStringList>
+#include <QSet>
 #include <QTimer>
 #include <QVector>
 
@@ -17,6 +19,15 @@
 namespace qframework
 {
 class MessageBus;
+
+struct ProcessQueueStats
+{
+    quint64 dropped = 0;
+    quint64 rejected = 0;
+    quint64 abandoned = 0;
+    int pending = 0;
+    int inFlight = 0;
+};
 
 class QFRAMEWORK_EXPORT ProcessSupervisor : public QObject
 {
@@ -33,14 +44,21 @@ public:
     // 启动所有 ProcessUi/ProcessNonUi 模块；失败模块写入 errors 但继续处理其他模块。
     bool startAll(const QVector<ModuleConfig>& modules,
                   QStringList* errors = nullptr);
-    // 正常 stop 等待 stopAck；restart 先清理旧 IPC，再重新创建随机令牌和队列。
+    // 兼容入口只提交异步请求，不再在调用线程等待子进程。
     bool stop(const QString& moduleId, QString* errorMessage = nullptr);
     bool restart(const QString& moduleId, QString* errorMessage = nullptr);
+    bool requestStop(const QString& moduleId, QString* errorMessage = nullptr);
+    bool requestRestart(const QString& moduleId, QString* errorMessage = nullptr);
     bool showWindow(const QString& moduleId, QString* errorMessage = nullptr);
     bool showWindow(const QString& moduleId,
                     int width,
                     int height,
                     QString* errorMessage = nullptr);
+    // 只调整已嵌入 ProcessUi 的客户区，不改变子进程显示状态。
+    bool resizeWindow(const QString& moduleId,
+                      int width,
+                      int height,
+                      QString* errorMessage = nullptr);
     // 强制结束用于故障注入和监督器上层的紧急停止；正常关闭应使用 stop/shutdown。
     bool terminate(const QString& moduleId);
     void shutdown();
@@ -48,6 +66,8 @@ public:
     // 查询只返回状态快照；Entry 的所有权始终属于监督器。
     QStringList runningModuleIds() const;
     QString state(const QString& moduleId) const;
+    // 返回父到子有界队列的只读快照，供诊断和边界测试使用。
+    ProcessQueueStats queueStats(const QString& moduleId) const;
 
 signals:
     // UI 通过这些信号显示生命周期和故障，不直接访问 Entry。
@@ -56,6 +76,9 @@ signals:
                             const QString& detail);
     void moduleFault(const QString& moduleId, const QString& detail);
     void windowHandleReady(const QString& moduleId, quintptr windowId);
+    void restartFinished(const QString& moduleId, bool success, const QString& detail);
+    void operationBusyChanged(const QString& moduleId, bool busy);
+    void startupBatchFinished(const QStringList& errors);
 
 public slots:
     void applyStyleSheet(const QString& styleSheet);
@@ -68,6 +91,7 @@ private slots:
     // 连接断开时进入故障或正常停止清理流程。
     void onSocketDisconnected();
     // QProcess 报告启动/运行错误时转换为模块故障信号。
+    void onProcessStarted();
     void onProcessError(QProcess::ProcessError error);
     // 进程退出后统一判断是否预期、是否需要重启。
     void onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus);
@@ -78,6 +102,27 @@ private slots:
 
 private:
     friend class ProcessBridge;
+    enum class LifecyclePhase
+    {
+        Stopped,
+        StartingProcess,
+        WaitingRegistration,
+        WaitingStarted,
+        Running,
+        StopRequested,
+        WaitingStopAck,
+        WaitingProcessExit,
+        RestartDelay,
+        Failed
+    };
+    enum class StopPurpose
+    {
+        None,
+        Stop,
+        ManualRestart,
+        AutoRestart,
+        Shutdown
+    };
     struct Entry;
 
     // 以下查找函数都只返回监督器拥有的 Entry 借用指针。
@@ -85,10 +130,17 @@ private:
     Entry* findEntryByServer(QObject* object) const;
     Entry* findEntryBySocket(QObject* object) const;
     Entry* findEntryByProcess(QObject* object) const;
-    // 为一个 Entry 建立服务端、进程和桥接器资源。
-    bool startEntry(Entry* entry, QString* errorMessage);
-    // 在有限时间内泵送事件，等待注册和 started 两个阶段完成。
-    bool waitForRunning(Entry* entry, int timeoutMs, QString* errorMessage);
+    // 异步建立服务端和 QProcess；started/register/started-frame 信号继续推进。
+    bool beginStartEntry(Entry* entry, QString* errorMessage);
+    void beginStopEntry(Entry* entry, StopPurpose purpose);
+    void closeEntryIngress(Entry* entry);
+    void advanceStopEntry(Entry* entry);
+    void finishEntryAfterProcessExit(Entry* entry, const QString& detail);
+    void setOperationBusy(Entry* entry, bool busy);
+    void settleStartupEntry(Entry* entry, const QString& error);
+    void scheduleStartupBatchFinished();
+    bool isStoppingPhase(LifecyclePhase phase) const;
+    bool isRegisteredPhase(LifecyclePhase phase) const;
     // 编码并写入已经认证的子进程 Socket。
     bool sendFrame(Entry* entry, const QJsonObject& frame);
     // 将 MessageBus 回调放入父到子有界队列。返回值只表示是否进入等待队列。
@@ -100,6 +152,8 @@ private:
     void acknowledgeChildMessage(Entry* entry,
                                  const QString& messageId,
                                  bool accepted);
+    // 本地尚未写入 Socket 即失败时回收槽位并计为 dropped，而不是远端拒绝。
+    void discardChildMessageBeforeSend(Entry* entry, const QString& messageId);
     // 根据 type 分派注册、心跳、ACK、窗口和业务消息。
     void handleFrame(Entry* entry, const QJsonObject& frame);
     // 标记故障、清理资源，并按重启策略安排下一次启动。
@@ -120,5 +174,9 @@ private:
     QString styleSheet_;
     // shutdown 后阻止新连接、重启和队列入队。
     bool shuttingDown_;
+    QSet<QString> startupPendingModules_;
+    QStringList startupErrors_;
+    bool startupBatchActive_;
+    bool startupBatchSignalScheduled_;
 };
 }

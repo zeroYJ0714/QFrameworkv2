@@ -13,6 +13,8 @@
 #include "QFrameworkGlobal.h"
 
 class QAction;
+class QByteArray;
+class QEvent;
 class QLabel;
 
 namespace qframework
@@ -24,6 +26,7 @@ class PluginManager;
 class ProcessSupervisor;
 class ProcessWindowHost;
 class StyleManager;
+class WindowTitleBar;
 
 class QFRAMEWORK_EXPORT MainWindow : public QMainWindow
 {
@@ -71,6 +74,18 @@ private slots:
     void selectStyleSheet();
     void reloadStyleSheet();
     void setUiAvailable(const QString& moduleId, bool available);
+    // 标题栏按钮请求都回到 MainWindow，由这里统一改变顶层窗口状态。
+    void minimizeWindow();
+    void toggleMaximizedState();
+    void closeWindow();
+
+protected:
+    // WindowStateChange 到达后同步标题栏的最大化/还原图标。
+    void changeEvent(QEvent* event) override;
+    // Windows 无边框窗口的命中测试；非 Windows 平台走 QWidget 默认实现。
+    bool nativeEvent(const QByteArray& eventType,
+                     void* message,
+                     long* result) override;
 
 private:
     enum class VisibilityOrigin
@@ -103,6 +118,8 @@ private:
     PluginManager* pluginManager_;
     ProcessSupervisor* processSupervisor_;
     StyleManager* styleManager_;
+    // 由 MainWindow 持有的客户区标题栏；setMenuWidget() 只改变它在 QMainWindow 中的位置。
+    WindowTitleBar* titleBar_;
     LayoutManager* layoutManager_;
     ModuleManagerDialog* moduleManagerDialog_;
     // 下列映射都以稳定 moduleId 为键，指针所有权仍由 Qt 父子关系管理。

@@ -73,6 +73,15 @@ QLabel[role="brandSub"] {
     letter-spacing: 1px;
 }
 
+/* MainWindow 的无边框标题栏是 Qt 客户区控件，因此 QSS 可以直接绘制它。
+   高度和按钮槽位固定，窗口状态变化只替换图标，不会推动菜单或 Dock。 */
+QWidget#QFrameworkTitleBar {
+    min-height: 38px;
+    max-height: 38px;
+    background-color: #111c20;
+    border-bottom: 1px solid #26383c;
+}
+
 QLabel[role="sectionTitle"] {
     color: #8fa7aa;
     font-size: 8pt;
@@ -607,6 +616,43 @@ QMenu {
     border: 1px solid #3a6064;
 }
 
+/* QMenu 是展开后的下拉菜单；QMenuBar 则是标题栏中的文件/模块/样式行。
+   两者必须分别设置状态颜色，否则系统默认 hover 背景可能覆盖主题文字。 */
+QMenuBar {
+    padding: 0;
+    spacing: 2px;
+    color: #c4d3d5;
+    background-color: transparent;
+}
+
+QMenuBar::item {
+    padding: 0 10px;
+    color: #c4d3d5;
+    background-color: transparent;
+}
+
+QMenuBar::item:selected {
+    color: #f2ffff;
+    background-color: #1b5c5d;
+}
+
+/* Qt 在鼠标只悬停菜单项、尚未展开菜单时使用 hover 状态；它不一定同时设置
+   selected。单独覆盖 hover，避免回退到 Windows 浅蓝背景导致文字看不清。 */
+QMenuBar::item:hover {
+    color: #f2ffff;
+    background-color: #1b5c5d;
+}
+
+QMenuBar::item:pressed {
+    color: #f2ffff;
+    background-color: #246f70;
+}
+
+QMenuBar::item:disabled {
+    color: #6f8588;
+    background-color: transparent;
+}
+
 QMenu::item {
     padding: 7px 28px 7px 10px;
     border-radius: 3px;
@@ -644,6 +690,49 @@ QToolBar::separator {
     width: 1px;
     margin: 4px 5px;
     background-color: #2c4448;
+}
+
+/* QMainWindow 使用内部 Dock 布局管理器；这里的 separator 才是 Dock 之间的
+   调整手柄。QSplitter::handle 仍保留给真正使用 QSplitter 的业务控件。 */
+QMainWindow::separator {
+    width: 6px;
+    height: 6px;
+    background-color: #26383c;
+}
+
+QMainWindow::separator:hover {
+    background-color: #4b8c8c;
+}
+
+QToolButton#WindowMinimizeButton,
+QToolButton#WindowMaximizeButton,
+QToolButton#WindowCloseButton {
+    min-width: 46px;
+    max-width: 46px;
+    min-height: 38px;
+    max-height: 38px;
+    padding: 0;
+    border: none;
+    border-radius: 0;
+    background-color: transparent;
+}
+
+QToolButton#WindowMinimizeButton:hover,
+QToolButton#WindowMaximizeButton:hover {
+    background-color: #1d3034;
+}
+
+QToolButton#WindowMinimizeButton:pressed,
+QToolButton#WindowMaximizeButton:pressed {
+    background-color: #29464a;
+}
+
+QToolButton#WindowCloseButton:hover {
+    background-color: #c94747;
+}
+
+QToolButton#WindowCloseButton:pressed {
+    background-color: #a93636;
 }
 
 QSplitter::handle {

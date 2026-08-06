@@ -73,6 +73,10 @@ private slots:
     void legacyLayoutLoadsWithoutCorruptingCurrentState();
     // 检查 QSS 重载和失败时保留旧样式。
     void styleSheetReloadAndFailureRecovery();
+    // 检查无边框标题栏复用三组菜单，并把窗口按钮请求交回 MainWindow。
+    void framelessTitleBarAndWindowControls();
+    // 检查 TechDashboard 的 QMenuBar 状态和 QMainWindow Dock 分隔条规则。
+    void techDashboardMenuAndDockStyle();
     // 检查默认/非法配置回退 100 ms，并由后台线程自动落盘。
     void loggerFlushesAtConfiguredInterval();
     // 检查显式 flush 和 stop 都会写出尚未到周期的尾部日志。

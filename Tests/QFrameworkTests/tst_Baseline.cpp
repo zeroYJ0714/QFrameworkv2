@@ -18,11 +18,14 @@
 #include <QJsonDocument>
 #include <QLocalSocket>
 #include <QMainWindow>
+#include <QMenuBar>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QPluginLoader>
 #include <QSignalSpy>
+#include <QStyle>
 #include <QTemporaryDir>
+#include <QToolButton>
 #include <QTest>
 #include <QThread>
 #include <QTimer>
@@ -51,6 +54,7 @@
 #include "QFrameworkVersion.h"
 #include "SingleInstanceGuard.h"
 #include "StyleManager.h"
+#include "WindowTitleBar.h"
 #include "ProtocolVersion.h"
 #include "MessageTopics.h"
 #include "Generated/image_messages.pb.h"
@@ -3011,6 +3015,105 @@ void BaselineTest::styleSheetReloadAndFailureRecovery()
     QCOMPARE(changedSpy.size(), 2);
 
     qApp->setStyleSheet(originalStyleSheet);
+}
+
+// 标题栏测试的重点是“菜单动作没有重建”：MainWindow 仍只创建一套 QAction，
+// WindowTitleBar 只提供菜单栏容器和窗口按钮请求。按钮点击由 signal 送回 MainWindow，
+// 再由 Qt 更新窗口状态，因而测试可以直接观察 isMaximized()/isMinimized()。
+void BaselineTest::framelessTitleBarAndWindowControls()
+{
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(QStringLiteral("MenuUi"),
+                                 qframework::ModuleType::InProcessUi));
+    qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
+
+    QVERIFY(window.windowFlags().testFlag(Qt::FramelessWindowHint));
+    qframework::WindowTitleBar* titleBar =
+        window.findChild<qframework::WindowTitleBar*>(QStringLiteral("QFrameworkTitleBar"));
+    QVERIFY(titleBar != nullptr);
+    // 左侧现在只保留菜单栏；图标和 QFramework 文字不再创建为可见 QLabel。
+    QVERIFY(titleBar->findChild<QWidget*>(QStringLiteral("ApplicationIconLabel")) == nullptr);
+    QVERIFY(titleBar->findChild<QWidget*>(QStringLiteral("ApplicationNameLabel")) == nullptr);
+    QCOMPARE(window.menuWidget(), titleBar);
+
+    QMenuBar* titleMenuBar =
+        titleBar->findChild<QMenuBar*>(QStringLiteral("QFrameworkTitleMenuBar"));
+    QVERIFY(titleMenuBar != nullptr);
+    QCOMPARE(window.findChildren<QMenuBar*>().size(), 1);
+    QCOMPARE(titleMenuBar->actions().size(), 3);
+    QCOMPARE(titleMenuBar->actions().at(0)->text(), QString::fromUtf8(u8"文件(&F)"));
+    QCOMPARE(titleMenuBar->actions().at(1)->text(), QString::fromUtf8(u8"模块(&M)"));
+    QCOMPARE(titleMenuBar->actions().at(2)->text(), QString::fromUtf8(u8"样式(&S)"));
+    QVERIFY(window.findChild<QAction*>(QStringLiteral("ModuleAction.MenuUi")) != nullptr);
+
+    QToolButton* minimizeButton =
+        titleBar->findChild<QToolButton*>(QStringLiteral("WindowMinimizeButton"));
+    QToolButton* maximizeButton =
+        titleBar->findChild<QToolButton*>(QStringLiteral("WindowMaximizeButton"));
+    QToolButton* closeButton =
+        titleBar->findChild<QToolButton*>(QStringLiteral("WindowCloseButton"));
+    QVERIFY(minimizeButton != nullptr);
+    QVERIFY(maximizeButton != nullptr);
+    QVERIFY(closeButton != nullptr);
+    QVERIFY(!minimizeButton->icon().isNull());
+    QVERIFY(!maximizeButton->icon().isNull());
+    QVERIFY(!closeButton->icon().isNull());
+    QCOMPARE(maximizeButton->toolTip(), QString::fromUtf8(u8"最大化"));
+
+    window.show();
+    QTRY_VERIFY(window.isVisible());
+    QTest::mouseClick(maximizeButton, Qt::LeftButton);
+    QTRY_VERIFY(window.isMaximized());
+    QCOMPARE(maximizeButton->toolTip(), QString::fromUtf8(u8"还原"));
+
+    QTest::mouseClick(maximizeButton, Qt::LeftButton);
+    QTRY_VERIFY(!window.isMaximized());
+    QCOMPARE(maximizeButton->toolTip(), QString::fromUtf8(u8"最大化"));
+
+    QTest::mouseClick(minimizeButton, Qt::LeftButton);
+    QTRY_VERIFY(window.isMinimized());
+    window.showNormal();
+    window.show();
+    QTest::mouseClick(closeButton, Qt::LeftButton);
+    QTRY_VERIFY(!window.isVisible());
+}
+
+// 读取仓库中的真实 TechDashboard 文件，而不是在测试中复制一份简化样式。
+// 这样可以同时确认 StyleManager 的 UTF-8/结构校验通过，并确认 Qt 样式表最终
+// 看到了 QMenuBar 和 QMainWindow::separator 规则。样式恢复放在所有断言之前，
+// 避免这个测试污染后续 Qt Test 的 QApplication 全局状态。
+void BaselineTest::techDashboardMenuAndDockStyle()
+{
+    const QString stylePath = QDir(QCoreApplication::applicationDirPath())
+        .filePath(QStringLiteral("../../../../config/Styles/TechDashboard.qss"));
+    QVERIFY2(QFileInfo::exists(stylePath), qPrintable(stylePath));
+
+    const QString originalStyleSheet = qApp->styleSheet();
+    qframework::StyleManager manager;
+    QString error;
+    const bool loaded = manager.loadStyleSheet(stylePath, &error);
+    QVERIFY2(loaded, qPrintable(error));
+
+    const QString appliedStyleSheet = manager.currentStyleSheet();
+    const bool hasMenuBarStates =
+        appliedStyleSheet.contains(QStringLiteral("QMenuBar::item")) &&
+        appliedStyleSheet.contains(QStringLiteral("QMenuBar::item:hover")) &&
+        appliedStyleSheet.contains(QStringLiteral("QMenuBar::item:selected")) &&
+        appliedStyleSheet.contains(QStringLiteral("QMenuBar::item:pressed")) &&
+        appliedStyleSheet.contains(QStringLiteral("QMenuBar::item:disabled"));
+    const bool hasDockSeparatorStates =
+        appliedStyleSheet.contains(QStringLiteral("QMainWindow::separator")) &&
+        appliedStyleSheet.contains(QStringLiteral("QMainWindow::separator:hover"));
+
+    QMainWindow window;
+    const int separatorExtent = window.style()->pixelMetric(
+        QStyle::PM_DockWidgetSeparatorExtent, nullptr, &window);
+    qApp->setStyleSheet(originalStyleSheet);
+
+    QVERIFY(hasMenuBarStates);
+    QVERIFY(hasDockSeparatorStates);
+    QVERIFY2(separatorExtent >= 6,
+             qPrintable(QString::fromUtf8(u8"Dock 分隔条命中尺寸过小：%1").arg(separatorExtent)));
 }
 
 // 测试程序的双身份入口：普通启动运行 Qt Test；带监督器参数时运行故障/IPC

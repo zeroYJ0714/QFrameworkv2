@@ -2,6 +2,7 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QEvent>
 #include <QFileDialog>
 #include <QIcon>
 #include <QLabel>
@@ -21,6 +22,14 @@
 #include "../Process/ProcessSupervisor.h"
 #include "ProcessWindowHost.h"
 #include "StyleManager.h"
+#include "WindowTitleBar.h"
+
+#ifdef Q_OS_WIN
+// 这里只在顶层 MainWindow 处理 Windows 无边框所需的消息。
+// WIN32_LEAN_AND_MEAN/NOMINMAX 已由工程预处理宏提供，避免把 Win32 类型扩散到 Qt UI 类。
+#include <windows.h>
+#include <windowsx.h>
+#endif
 
 // MainWindow 只做 UI 编排：从管理器接收状态、更新 Dock/菜单，并把用户操作
 // 委托回对应管理器。任何耗时队列或进程等待都不在 UI 控件代码里实现。
@@ -53,6 +62,57 @@ QIcon themedIcon(QWidget* widget,
         icon = widget->style()->standardIcon(fallback);
     return icon;
 }
+
+#ifdef Q_OS_WIN
+// 以 Windows 屏幕像素构造窗口矩形。WM_NCHITTEST 的坐标也是屏幕坐标，先统一成
+// QRect 后再做边角判断，比直接在 LPARAM 上做位运算更容易审查和维护。
+QRect nativeWindowRect(HWND windowHandle)
+{
+    RECT nativeRect = {};
+    if (windowHandle == nullptr || !GetWindowRect(windowHandle, &nativeRect))
+        return QRect();
+    return QRect(QPoint(nativeRect.left, nativeRect.top),
+                 QSize(nativeRect.right - nativeRect.left,
+                       nativeRect.bottom - nativeRect.top));
+}
+
+// 返回八方向缩放命中值。角必须先于边返回，否则左上角会被误判成单独的上边或左边。
+// Windows 收到这些 HT* 值后会接管鼠标缩放，不需要 Qt 自己循环 move() 窗口。
+long resizeHitTest(const QPoint& screenPoint,
+                   const QRect& nativeRect,
+                   int nativeBorderWidth)
+{
+    if (!nativeRect.isValid() || nativeBorderWidth <= 0)
+        return HTNOWHERE;
+
+    const bool onLeft = screenPoint.x() >= nativeRect.left() &&
+                        screenPoint.x() < nativeRect.left() + nativeBorderWidth;
+    const bool onRight = screenPoint.x() <= nativeRect.right() &&
+                         screenPoint.x() >= nativeRect.right() - nativeBorderWidth + 1;
+    const bool onTop = screenPoint.y() >= nativeRect.top() &&
+                       screenPoint.y() < nativeRect.top() + nativeBorderWidth;
+    const bool onBottom = screenPoint.y() <= nativeRect.bottom() &&
+                          screenPoint.y() >= nativeRect.bottom() - nativeBorderWidth + 1;
+
+    if (onTop && onLeft)
+        return HTTOPLEFT;
+    if (onTop && onRight)
+        return HTTOPRIGHT;
+    if (onBottom && onLeft)
+        return HTBOTTOMLEFT;
+    if (onBottom && onRight)
+        return HTBOTTOMRIGHT;
+    if (onTop)
+        return HTTOP;
+    if (onBottom)
+        return HTBOTTOM;
+    if (onLeft)
+        return HTLEFT;
+    if (onRight)
+        return HTRIGHT;
+    return HTNOWHERE;
+}
+#endif
 }
 
 // 创建主窗口静态控件和模块占位页，并连接三类管理器的状态信号。
@@ -66,6 +126,7 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
       pluginManager_(pluginManager),
       processSupervisor_(processSupervisor),
       styleManager_(styleManager),
+      titleBar_(new WindowTitleBar(this)),
       layoutManager_(new LayoutManager(this)),
       moduleManagerDialog_(new ModuleManagerDialog(modules, this)),
       statusSummaryLabel_(new QLabel(this)),
@@ -74,6 +135,31 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
     // 先建立模块状态快照，再创建依赖这些状态的菜单和 Dock。
     setObjectName(QStringLiteral("QFrameworkMainWindow"));
     setWindowTitle(QStringLiteral("QFramework"));
+
+    // FramelessWindowHint 删除 Windows 原生标题栏；窗口仍保留系统菜单、最小化、
+    // 最大化和关闭 flags，随后由 nativeEvent() 补回拖动、缩放和任务栏工作区行为。
+    // 不使用 Qt::Tool，确保任务栏仍把它当作正常应用窗口显示。
+    setWindowFlags(windowFlags() |
+                   Qt::FramelessWindowHint |
+                   Qt::WindowSystemMenuHint |
+                   Qt::WindowMinimizeButtonHint |
+                   Qt::WindowMaximizeButtonHint |
+                   Qt::WindowCloseButtonHint);
+    // setMenuWidget() 把标题栏放进 QMainWindow 的客户区顶部；标题栏内部的 QMenuBar
+    // 接下来会承载原有 QAction，业务动作仍由 MainWindow 保存和连接。
+    setMenuWidget(titleBar_);
+    connect(titleBar_,
+            &WindowTitleBar::minimizeRequested,
+            this,
+            &MainWindow::minimizeWindow);
+    connect(titleBar_,
+            &WindowTitleBar::maximizeRestoreRequested,
+            this,
+            &MainWindow::toggleMaximizedState);
+    connect(titleBar_,
+            &WindowTitleBar::closeRequested,
+            this,
+            &MainWindow::closeWindow);
     setDockNestingEnabled(true);
     setTabPosition(Qt::AllDockWidgetAreas, QTabWidget::North);
     resize(1200, 760);
@@ -469,11 +555,37 @@ void MainWindow::reloadStyleSheet()
     statusBar()->showMessage(QString::fromUtf8(u8"当前 QSS 已重新加载"), 4000);
 }
 
+// 标题栏只发出请求，真正的窗口状态变化集中在 MainWindow，避免子控件知道模块或
+// 进程实现，也避免绕过 Qt 的 WindowStateChange、closeEvent 和退出清理流程。
+void MainWindow::minimizeWindow()
+{
+    showMinimized();
+}
+
+// 普通状态进入最大化，最大化状态恢复普通窗口。Windows 收到标题栏拖动时也可能
+// 自动完成“最大化 -> 普通”转换，changeEvent() 会随后更新按钮视觉状态。
+void MainWindow::toggleMaximizedState()
+{
+    if (isMaximized())
+        showNormal();
+    else
+        showMaximized();
+}
+
+// close() 会进入现有 QWidget/QMainWindow closeEvent 链路，而不是直接调用 qApp->quit。
+// 这样 FrameworkRuntime 仍能按原顺序停止模块、进程和消息总线。
+void MainWindow::closeWindow()
+{
+    close();
+}
+
 // 创建文件、模块和样式菜单，并把动作连接到本类槽函数。
 void MainWindow::createActions()
 {
     // 菜单按文件、模块、样式三组构造；模块菜单可提前记录晚到窗口的显示意图。
-    QMenu* fileMenu = menuBar()->addMenu(QString::fromUtf8(u8"文件(&F)"));
+    // 复用原有 QAction 和槽，只更换菜单栏宿主，避免出现两套功能不一致的菜单。
+    QMenuBar* titleMenuBar = titleBar_->menuBar();
+    QMenu* fileMenu = titleMenuBar->addMenu(QString::fromUtf8(u8"文件(&F)"));
     QAction* loadLayoutAction = fileMenu->addAction(
         themedIcon(this, QStringLiteral("document-open"), QStyle::SP_DialogOpenButton),
         QString::fromUtf8(u8"加载布局..."));
@@ -488,7 +600,7 @@ void MainWindow::createActions()
     connect(saveAsAction, &QAction::triggered, this, &MainWindow::saveLayoutAs);
     connect(exitAction, &QAction::triggered, qApp, &QApplication::quit);
 
-    QMenu* moduleMenu = menuBar()->addMenu(QString::fromUtf8(u8"模块(&M)"));
+    QMenu* moduleMenu = titleMenuBar->addMenu(QString::fromUtf8(u8"模块(&M)"));
     QAction* managerAction = moduleMenu->addAction(
         themedIcon(this, QStringLiteral("view-list-details"), QStyle::SP_FileDialogDetailedView),
         QString::fromUtf8(u8"模块管理"));
@@ -509,7 +621,7 @@ void MainWindow::createActions()
         moduleActions_.insert(module.id, action);
     }
 
-    QMenu* styleMenu = menuBar()->addMenu(QString::fromUtf8(u8"样式(&S)"));
+    QMenu* styleMenu = titleMenuBar->addMenu(QString::fromUtf8(u8"样式(&S)"));
     QAction* selectStyleAction = styleMenu->addAction(
         themedIcon(this, QStringLiteral("preferences-desktop-theme"), QStyle::SP_DesktopIcon),
         QString::fromUtf8(u8"选择 QSS..."));
@@ -694,5 +806,102 @@ QString MainWindow::placeholderText(const QString& moduleId,
 {
     // 两行格式让占位页同时显示模块名和当前原因。
     return QString::fromUtf8(u8"%1\n%2").arg(displayName(moduleId), detail);
+}
+
+// Qt 在 showMaximized()/showNormal() 或系统贴边恢复后发送 WindowStateChange。
+// 先让 QMainWindow 完成自身状态更新，再让标题栏刷新最大化/还原图标和辅助文本。
+void MainWindow::changeEvent(QEvent* event)
+{
+    QMainWindow::changeEvent(event);
+    if (event != nullptr && event->type() == QEvent::WindowStateChange && titleBar_ != nullptr)
+        titleBar_->updateWindowControlState(isMaximized());
+}
+
+// 无边框窗口不再有 Windows 原生非客户区，所以这里把“边缘/标题栏/客户区”的命中
+// 结果交给 Windows。Windows 收到 HT* 返回值后负责移动、八方向缩放和贴边，不需要
+// 自己调用 QWidget::move() 写一个持续运行的鼠标循环。
+bool MainWindow::nativeEvent(const QByteArray& eventType,
+                             void* message,
+                             long* result)
+{
+#ifdef Q_OS_WIN
+    Q_UNUSED(eventType)
+    if (message != nullptr && result != nullptr) {
+        MSG* nativeMessage = static_cast<MSG*>(message);
+
+        if (nativeMessage->message == WM_GETMINMAXINFO) {
+            // 最大化尺寸必须使用 monitor 工作区 rcWork，而不是完整 rcMonitor；
+            // 这样任务栏位于上下左右任意一侧时都不会被无边框窗口覆盖。
+            MINMAXINFO* minMaxInfo = reinterpret_cast<MINMAXINFO*>(nativeMessage->lParam);
+            MONITORINFO monitorInfo = {};
+            monitorInfo.cbSize = sizeof(MONITORINFO);
+            HMONITOR monitor = MonitorFromWindow(
+                nativeMessage->hwnd, MONITOR_DEFAULTTONEAREST);
+            if (minMaxInfo != nullptr && monitor != nullptr &&
+                GetMonitorInfo(monitor, &monitorInfo)) {
+                const RECT& monitorRect = monitorInfo.rcMonitor;
+                const RECT& workRect = monitorInfo.rcWork;
+                minMaxInfo->ptMaxPosition.x = workRect.left - monitorRect.left;
+                minMaxInfo->ptMaxPosition.y = workRect.top - monitorRect.top;
+                minMaxInfo->ptMaxSize.x = workRect.right - workRect.left;
+                minMaxInfo->ptMaxSize.y = workRect.bottom - workRect.top;
+                *result = 0;
+                return true;
+            }
+        }
+
+        if (nativeMessage->message == WM_NCHITTEST) {
+            const QPoint screenPoint(GET_X_LPARAM(nativeMessage->lParam),
+                                     GET_Y_LPARAM(nativeMessage->lParam));
+            const QRect windowRect = nativeWindowRect(nativeMessage->hwnd);
+
+            // 最大化状态下 Windows 已经把窗口放到工作区，边缘不再代表缩放区域。
+            // 普通状态先判断角，再判断边，保证角落获得正确的斜向调整光标。
+            if (!isMaximized() && windowRect.isValid()) {
+                const qreal deviceScale = devicePixelRatioF() > 0.0
+                    ? devicePixelRatioF() : 1.0;
+                const int nativeBorderWidth = qMax(1, qRound(6.0 * deviceScale));
+                const long resizeResult = resizeHitTest(
+                    screenPoint, windowRect, nativeBorderWidth);
+                if (resizeResult != HTNOWHERE) {
+                    *result = resizeResult;
+                    return true;
+                }
+            }
+
+            // WM_NCHITTEST 给的是 Windows 屏幕物理像素，而 QWidget::childAt 使用 Qt
+            // 逻辑像素。先转到客户区，再按当前窗口 DPI 换算，避免 125%/150% 下错位。
+            POINT nativeClientPoint = {screenPoint.x(), screenPoint.y()};
+            if (nativeMessage->hwnd != nullptr &&
+                ScreenToClient(nativeMessage->hwnd, &nativeClientPoint)) {
+                const qreal deviceScale = devicePixelRatioF() > 0.0
+                    ? devicePixelRatioF() : 1.0;
+                const QPoint logicalClientPoint(
+                    qRound(static_cast<qreal>(nativeClientPoint.x) / deviceScale),
+                    qRound(static_cast<qreal>(nativeClientPoint.y) / deviceScale));
+                if (titleBar_ != nullptr) {
+                    const QPoint titleBarPoint = titleBar_->mapFrom(
+                        this, logicalClientPoint);
+                    if (titleBar_->rect().contains(titleBarPoint)) {
+                        // 菜单和三个按钮必须返回 HTCLIENT，Windows 才不会把点击误当
+                        // 成拖动；只有标题栏空白区域返回 HTCAPTION 才能移动和双击最大化。
+                        *result = titleBar_->isInteractiveAt(titleBarPoint)
+                            ? HTCLIENT : HTCAPTION;
+                        return true;
+                    }
+                }
+            }
+
+            // 其他客户区交给 Qt 控件处理，保证 Dock、状态栏和菜单弹出不会被拖动逻辑抢走。
+            *result = HTCLIENT;
+            return true;
+        }
+    }
+#else
+    Q_UNUSED(eventType)
+    Q_UNUSED(message)
+    Q_UNUSED(result)
+#endif
+    return QMainWindow::nativeEvent(eventType, message, result);
 }
 }

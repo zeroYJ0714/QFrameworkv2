@@ -145,6 +145,7 @@
     <QtMoc Include="Plugin\PluginManager.h" />
     <QtMoc Include="Ui\ManagedDockWidget.h" />
     <QtMoc Include="Ui\MainWindow.h" />
+    <QtMoc Include="Ui\WindowTitleBar.h" />
     <QtMoc Include="Ui\ModuleManagerDialog.h" />
     <QtMoc Include="Ui\ProcessWindowHost.h" />
     <ClInclude Include="Ui\LayoutManager.h" />
@@ -163,6 +164,7 @@
     <ClCompile Include="Process\ProcessSupervisor.cpp" />
     <ClCompile Include="Ui\ManagedDockWidget.cpp" />
     <ClCompile Include="Ui\MainWindow.cpp" />
+    <ClCompile Include="Ui\WindowTitleBar.cpp" />
     <ClCompile Include="Ui\ModuleManagerDialog.cpp" />
     <ClCompile Include="Ui\ProcessWindowHost.cpp" />
     <ClCompile Include="Ui\LayoutManager.cpp" />
@@ -173,4 +175,19 @@
     <Import Project="$(QtMsBuild)\qt.targets" />
   </ImportGroup>
   <ImportGroup Label="ExtensionTargets" />
+  <!--
+    QFramework.ini 和 QSS 是按可执行文件目录读取的运行时配置，不会由 QtMsBuild
+    自动复制。只要源码 QSS 更新，Debug/Release 输出目录就必须同步，否则程序会
+    继续加载旧的菜单悬停规则。这里只复制 Styles/*.qss，不覆盖用户在输出目录
+    配置好的 QFramework.ini（例如默认使用 TechDashboard.qss）。
+  -->
+  <Target Name="CopyQFrameworkStyles" AfterTargets="Build">
+    <ItemGroup>
+      <QFrameworkStyleFiles Include="$(SolutionDir)config\Styles\*.qss" />
+    </ItemGroup>
+    <MakeDir Directories="$(OutDir)config\Styles" />
+    <Copy SourceFiles="@(QFrameworkStyleFiles)"
+          DestinationFolder="$(OutDir)config\Styles"
+          SkipUnchangedFiles="true" />
+  </Target>
 </Project>

@@ -15,9 +15,11 @@
 #include "QFrameworkGlobal.h"
 
 class QAction;
+class QActionGroup;
 class QByteArray;
 class QEvent;
 class QLabel;
+class QMenu;
 
 namespace qframework
 {
@@ -62,10 +64,16 @@ public:
     void attachInProcessUiModules();
     void releaseInProcessUiModules();
 
+    // 由 FrameworkRuntime 在构造完成后注入一次只读布局预设快照。
+    void setLayoutPresets(const QVector<LayoutPresetConfig>& presets);
+    // 启动时只尝试 Layout.1；失败不会弹框，也不会建立活动布局。
+    bool loadInitialLayoutPreset();
+
     // 委托 LayoutManager 恢复布局，并再次隐藏当前不可用模块的 Dock。
     bool loadLayoutFile(const QString& filePath,
                         QString* errorMessage = nullptr,
-                        QStringList* unavailableModuleIds = nullptr);
+                        QStringList* unavailableModuleIds = nullptr,
+                        bool activateLayout = true);
     // 返回借用指针，供测试或上层调用布局 API。
     LayoutManager* layoutManager() const;
 
@@ -85,6 +93,7 @@ private slots:
     void onModuleFault(const QString& moduleId, const QString& detail);
     void onWindowHandleReady(const QString& moduleId, quintptr windowId);
     void onProcessWindowSizeChanged(const QString& moduleId, const QSize& size);
+    void onLayoutPresetTriggered(bool checked);
     void loadLayoutFromDialog();
     void saveCurrentLayout();
     void saveLayoutAs();
@@ -128,6 +137,9 @@ private:
     void syncModuleAction(const QString& moduleId);
     void updateStatusSummary();
     void reportStateFailure(const QString& title, const QString& detail);
+    bool activateLayoutPreset(int index, bool startup, QString* errorMessage = nullptr);
+    const LayoutPresetConfig* layoutPreset(int index) const;
+    void clearLayoutPresetActions();
     QString displayName(const QString& moduleId) const;
     QString placeholderText(const QString& moduleId, const QString& detail) const;
 
@@ -152,6 +164,12 @@ private:
     QHash<QString, QString> moduleStates_;
     QLabel* statusSummaryLabel_;
     QAction* saveLayoutAction_;
+    QMenu* layoutMenu_;
+    QAction* layoutPresetSeparator_;
+    QActionGroup* layoutPresetGroup_;
+    QHash<int, QAction*> layoutPresetActions_;
+    QVector<LayoutPresetConfig> layoutPresets_;
+    int activeLayoutIndex_;
     QColor dockSeparatorColor_;
     QColor dockSeparatorHoverColor_;
 };

@@ -1,0 +1,17 @@
+{
+    "format": "QFrameworkLayout",
+    "geometry": "AdnQywADAAAAAAFoAAAAjAAABTUAAALcAAABaAAAAIwAAAU1AAAC3AAAAAAAAAAAB4AAAAFoAAAAjAAABTUAAALc",
+    "modules": {
+        "InProcessUiExample": {
+            "requestedVisible": true,
+            "visible": true
+        },
+        "ProcessUiExample": {
+            "requestedVisible": true,
+            "visible": true
+        }
+    },
+    "state": "AAAA/wAAAAH9AAAAAQAAAAAAAAPOAAACEvwCAAAAAfwAAAAnAAACEgAAAMABAAAi+gAAAAECAAAAAvsAAAA6AE0AbwBkAHUAbABlAEQAbwBjAGsALgBJAG4AUAByAG8AYwBlAHMAcwBVAGkARQB4AGEAbQBwAGwAZQEAAAAA/////wAAAJ0A////+wAAADYATQBvAGQAdQBsAGUARABvAGMAawAuAFAAcgBvAGMAZQBzAHMAVQBpAEUAeABhAG0AcABsAGUBAAAAAP////8AAACRAP///wAAAAAAAAEsAAAABAAAAAQAAAAIAAAACPwAAAAA",
+    "version": 1,
+    "visibilitySemantics": "userIntent"
+}

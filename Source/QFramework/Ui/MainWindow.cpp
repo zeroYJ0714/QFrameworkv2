@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include <QAction>
+#include <QActionGroup>
 #include <QEvent>
 #include <QFileDialog>
 #include <QGuiApplication>
@@ -134,6 +135,10 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
       moduleManagerDialog_(new ModuleManagerDialog(modules, this)),
       statusSummaryLabel_(new QLabel(this)),
       saveLayoutAction_(nullptr),
+      layoutMenu_(nullptr),
+      layoutPresetSeparator_(nullptr),
+      layoutPresetGroup_(nullptr),
+      activeLayoutIndex_(-1),
       dockSeparatorColor_(),
       dockSeparatorHoverColor_()
 {
@@ -318,7 +323,8 @@ void MainWindow::releaseInProcessUiModules()
 // 委托布局管理器恢复文件，再按当前 UI 可用性隐藏失效 Dock。
 bool MainWindow::loadLayoutFile(const QString& filePath,
                                 QString* errorMessage,
-                                QStringList* unavailableModuleIds)
+                                QStringList* unavailableModuleIds,
+                                bool activateLayout)
 {
     QHash<QString, bool> loadedRequestedVisibility;
     bool legacyVisibilitySemantics = false;
@@ -327,7 +333,10 @@ bool MainWindow::loadLayoutFile(const QString& filePath,
         &loadedRequestedVisibility,
         errorMessage,
         unavailableModuleIds,
-        &legacyVisibilitySemantics);
+        &legacyVisibilitySemantics,
+        activateLayout
+            ? LayoutActivation::Activate
+            : LayoutActivation::KeepCurrent);
     if (!loaded)
         return false;
 
@@ -347,6 +356,144 @@ bool MainWindow::loadLayoutFile(const QString& filePath,
         statusBar()->showMessage(
             QString::fromUtf8(u8"旧版布局已加载，请确认显示状态后重新保存"), 8000);
     }
+    return true;
+}
+
+// 由 FrameworkRuntime 注入一次配置快照；运行期间不监听 INI 文件变化。
+void MainWindow::setLayoutPresets(const QVector<LayoutPresetConfig>& presets)
+{
+    clearLayoutPresetActions();
+    layoutPresets_ = presets;
+    activeLayoutIndex_ = -1;
+    if (saveLayoutAction_ != nullptr)
+        saveLayoutAction_->setEnabled(false);
+    if (layoutMenu_ == nullptr || layoutPresetGroup_ == nullptr ||
+        layoutPresetSeparator_ == nullptr) {
+        return;
+    }
+
+    layoutMenu_->setToolTipsVisible(true);
+    for (const LayoutPresetConfig& preset : layoutPresets_) {
+        QAction* action = new QAction(
+            preset.name.isEmpty()
+                ? QString::fromUtf8(u8"布局%1").arg(preset.index)
+                : preset.name,
+            layoutMenu_);
+        action->setCheckable(true);
+        action->setProperty("layoutIndex", preset.index);
+        layoutPresetGroup_->addAction(action);
+        layoutMenu_->insertAction(layoutPresetSeparator_, action);
+        layoutPresetActions_.insert(preset.index, action);
+        connect(action,
+                &QAction::triggered,
+                this,
+                &MainWindow::onLayoutPresetTriggered);
+
+        QString validationError;
+        const bool valid = layoutManager_->validateLayoutFile(
+            preset.filePath, &validationError);
+        action->setEnabled(valid);
+        if (!valid) {
+            action->setToolTip(validationError);
+            Logger::instance().log(
+                LogLevel::Warning,
+                QStringLiteral("QFrameworkApp"),
+                QString::fromUtf8(u8"布局预设 %1 不可用：%2")
+                    .arg(action->text(), validationError));
+        } else {
+            action->setToolTip(preset.filePath);
+        }
+    }
+    layoutPresetSeparator_->setVisible(!layoutPresetActions_.isEmpty());
+}
+
+// 启动只尝试编号 1；错误写日志并禁用该项，不弹出启动警告对话框。
+bool MainWindow::loadInitialLayoutPreset()
+{
+    return activateLayoutPreset(1, true, nullptr);
+}
+
+// 查找配置快照中的稳定编号，避免用菜单文字反向匹配重复 Name。
+const LayoutPresetConfig* MainWindow::layoutPreset(int index) const
+{
+    for (const LayoutPresetConfig& preset : layoutPresets_) {
+        if (preset.index == index)
+            return &preset;
+    }
+    return nullptr;
+}
+
+// 删除旧 QAction 后再注入新快照，保证重复调用不会产生两套菜单项。
+void MainWindow::clearLayoutPresetActions()
+{
+    for (QAction* action : layoutPresetActions_) {
+        if (layoutPresetGroup_ != nullptr)
+            layoutPresetGroup_->removeAction(action);
+        delete action;
+    }
+    layoutPresetActions_.clear();
+}
+
+// 统一处理启动和用户点击；只有成功恢复后才改变活动编号和勾选状态。
+bool MainWindow::activateLayoutPreset(int index,
+                                      bool startup,
+                                      QString* errorMessage)
+{
+    const LayoutPresetConfig* preset = layoutPreset(index);
+    QAction* action = layoutPresetActions_.value(index, nullptr);
+    if (preset == nullptr || action == nullptr || !action->isEnabled()) {
+        if (errorMessage != nullptr)
+            *errorMessage = action != nullptr
+                ? action->toolTip()
+                : QString::fromUtf8(u8"布局预设不存在：%1").arg(index);
+        return false;
+    }
+
+    const int previousIndex = activeLayoutIndex_;
+    QAction* previousAction = layoutPresetActions_.value(previousIndex, nullptr);
+    QString error;
+    QStringList unavailableModules;
+    if (!loadLayoutFile(preset->filePath,
+                        &error,
+                        &unavailableModules,
+                        true)) {
+        if (startup) {
+            action->setEnabled(false);
+            action->setToolTip(error);
+            Logger::instance().log(
+                LogLevel::Warning,
+                QStringLiteral("QFrameworkApp"),
+                QString::fromUtf8(u8"启动布局预设 %1 加载失败：%2")
+                    .arg(action->text(), error));
+        } else {
+            const QSignalBlocker blocker(layoutPresetGroup_);
+            if (previousAction != nullptr)
+                previousAction->setChecked(true);
+            else
+                action->setChecked(false);
+            reportStateFailure(QString::fromUtf8(u8"布局加载失败"), error);
+        }
+        if (errorMessage != nullptr)
+            *errorMessage = error;
+        return false;
+    }
+
+    activeLayoutIndex_ = index;
+    {
+        const QSignalBlocker blocker(layoutPresetGroup_);
+        action->setChecked(true);
+    }
+    if (saveLayoutAction_ != nullptr)
+        saveLayoutAction_->setEnabled(true);
+    if (!unavailableModules.isEmpty()) {
+        Logger::instance().log(
+            LogLevel::Warning,
+            QStringLiteral("QFrameworkApp"),
+            QString::fromUtf8(u8"布局预设中的模块当前不可用：%1")
+                .arg(unavailableModules.join(QStringLiteral(", "))));
+    }
+    statusBar()->showMessage(
+        QString::fromUtf8(u8"布局已加载：%1").arg(action->text()), 5000);
     return true;
 }
 
@@ -497,6 +644,16 @@ void MainWindow::onProcessWindowSizeChanged(const QString& moduleId,
     }
 }
 
+// 预设 QAction 的 checked 变化先由 QActionGroup 完成；槽只提交成功的布局。
+void MainWindow::onLayoutPresetTriggered(bool checked)
+{
+    Q_UNUSED(checked);
+    QAction* action = qobject_cast<QAction*>(sender());
+    if (action == nullptr)
+        return;
+    activateLayoutPreset(action->property("layoutIndex").toInt(), false, nullptr);
+}
+
 // 打开非原生文件选择器，加载用户选择的 .qflayout 并报告不可用模块。
 void MainWindow::loadLayoutFromDialog()
 {
@@ -513,7 +670,7 @@ void MainWindow::loadLayoutFromDialog()
 
     QString error;
     QStringList unavailable;
-    if (!loadLayoutFile(filePath, &error, &unavailable)) {
+    if (!loadLayoutFile(filePath, &error, &unavailable, false)) {
         reportStateFailure(QString::fromUtf8(u8"布局加载失败"), error);
         return;
     }
@@ -526,27 +683,26 @@ void MainWindow::loadLayoutFromDialog()
     statusBar()->showMessage(QString::fromUtf8(u8"布局已加载：%1").arg(filePath), 5000);
 }
 
-// 保存到当前活动布局；首次保存时转到另存为流程。
+// 保存到当前选中的 INI 预设；没有活动预设时按钮本身保持置灰。
 void MainWindow::saveCurrentLayout()
 {
-    // 先固定本次保存目标。这个路径只会在布局成功加载或成功另存为后由
-    // LayoutManager 记录，因此“保存当前布局”不会再次询问路径，也不会误写其他文件。
-    const QString currentFilePath = layoutManager_->activeFilePath();
-    // 当前会话还没有成功加载/保存过布局时没有覆盖目标，此时才进入“另存为”。
-    if (currentFilePath.isEmpty()) {
-        saveLayoutAs();
+    const LayoutPresetConfig* preset = layoutPreset(activeLayoutIndex_);
+    if (preset == nullptr || preset->filePath.isEmpty()) {
+        if (saveLayoutAction_ != nullptr)
+            saveLayoutAction_->setEnabled(false);
         return;
     }
     QString error;
-    if (!layoutManager_->saveLayout(currentFilePath,
+    if (!layoutManager_->saveLayout(preset->filePath,
                                     requestedDockVisibility_,
-                                    &error)) {
+                                    &error,
+                                    LayoutActivation::KeepCurrent)) {
         reportStateFailure(QString::fromUtf8(u8"布局保存失败"), error);
         return;
     }
     // 显示实际覆盖的文件，让用户能够直接确认“保存当前”和“另存为”的区别。
     statusBar()->showMessage(
-        QString::fromUtf8(u8"当前布局已保存：%1").arg(currentFilePath), 5000);
+        QString::fromUtf8(u8"当前布局已保存：%1").arg(preset->filePath), 5000);
 }
 
 // 选择新路径并保存布局，必要时自动补齐 .qflayout 后缀。
@@ -554,10 +710,12 @@ void MainWindow::saveLayoutAs()
 {
     // “另存为”无论当前是否已经加载布局都必须显示路径选择框；当前文件路径只作为
     // 初始建议位置，用户确认的新路径会在保存成功后成为后续“保存当前”的目标。
+    const LayoutPresetConfig* preset = layoutPreset(activeLayoutIndex_);
+    const QString suggestedPath = preset != nullptr ? preset->filePath : QString();
     QString filePath = QFileDialog::getSaveFileName(
         this,
         QString::fromUtf8(u8"布局另存为"),
-        layoutManager_->activeFilePath(),
+        suggestedPath,
         QString::fromUtf8(u8"QFramework 布局 (*.qflayout)"),
         nullptr,
         QFileDialog::DontUseNativeDialog);
@@ -567,7 +725,10 @@ void MainWindow::saveLayoutAs()
         filePath.append(QStringLiteral(".qflayout"));
 
     QString error;
-    if (!layoutManager_->saveLayout(filePath, requestedDockVisibility_, &error)) {
+    if (!layoutManager_->saveLayout(filePath,
+                                    requestedDockVisibility_,
+                                    &error,
+                                    LayoutActivation::KeepCurrent)) {
         reportStateFailure(QString::fromUtf8(u8"布局保存失败"), error);
         return;
     }
@@ -642,14 +803,19 @@ void MainWindow::createActions()
     // 菜单按文件、模块、样式三组构造；模块菜单可提前记录晚到窗口的显示意图。
     // 复用原有 QAction 和槽，只更换菜单栏宿主，避免出现两套功能不一致的菜单。
     QMenuBar* titleMenuBar = titleBar_->menuBar();
-    QMenu* fileMenu = titleMenuBar->addMenu(QString::fromUtf8(u8"布局(&L)"));
-    QAction* loadLayoutAction = fileMenu->addAction(
+    layoutMenu_ = titleMenuBar->addMenu(QString::fromUtf8(u8"布局(&L)"));
+    layoutMenu_->setToolTipsVisible(true);
+    layoutPresetGroup_ = new QActionGroup(layoutMenu_);
+    layoutPresetGroup_->setExclusive(true);
+    layoutPresetSeparator_ = layoutMenu_->addSeparator();
+    QAction* loadLayoutAction = layoutMenu_->addAction(
         themedIcon(this, QStringLiteral("document-open"), QStyle::SP_DialogOpenButton),
         QString::fromUtf8(u8"加载布局..."));
-    saveLayoutAction_ = fileMenu->addAction(
+    saveLayoutAction_ = layoutMenu_->addAction(
         themedIcon(this, QStringLiteral("document-save"), QStyle::SP_DialogSaveButton),
         QString::fromUtf8(u8"保存当前布局"));
-    QAction* saveAsAction = fileMenu->addAction(QString::fromUtf8(u8"布局另存为..."));
+    saveLayoutAction_->setEnabled(false);
+    QAction* saveAsAction = layoutMenu_->addAction(QString::fromUtf8(u8"布局另存为..."));
     connect(loadLayoutAction, &QAction::triggered, this, &MainWindow::loadLayoutFromDialog);
     connect(saveLayoutAction_, &QAction::triggered, this, &MainWindow::saveCurrentLayout);
     connect(saveAsAction, &QAction::triggered, this, &MainWindow::saveLayoutAs);

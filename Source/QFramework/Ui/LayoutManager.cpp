@@ -65,7 +65,8 @@ void LayoutManager::unregisterModuleDock(const QString& moduleId)
 // 把窗口几何、Qt Dock 状态和模块可见性写成带版本 JSON，并原子提交。
 bool LayoutManager::saveLayout(const QString& filePath,
                                const QHash<QString, bool>& requestedVisibility,
-                               QString* errorMessage)
+                               QString* errorMessage,
+                               LayoutActivation activation)
 {
     // 扩展名和主窗口都有效后才调用 Qt saveGeometry/saveState。
     if (!validateFilePath(filePath, errorMessage) || mainWindow_ == nullptr)
@@ -119,24 +120,40 @@ bool LayoutManager::saveLayout(const QString& filePath,
         return false;
     }
 
-    activeFilePath_ = absolutePath;
+    if (activation == LayoutActivation::Activate)
+        activeFilePath_ = absolutePath;
     return true;
 }
 
-// 完整解析并校验布局后尝试恢复；Qt 任一步失败都会回滚到调用前状态。
-bool LayoutManager::loadLayout(const QString& filePath,
-                               QHash<QString, bool>* requestedVisibility,
-                               QString* errorMessage,
-                               QStringList* unavailableModuleIds,
-                               bool* legacyVisibilitySemantics)
+// 只解析和校验布局文件，供启动菜单在不改变窗口的前提下判断是否可用。
+bool LayoutManager::validateLayoutFile(const QString& filePath,
+                                       QString* errorMessage) const
 {
-    // 输出列表每次调用先清空，避免调用方误用上一次结果。
-    if (!validateFilePath(filePath, errorMessage) || mainWindow_ == nullptr)
+    QByteArray geometry;
+    QByteArray state;
+    QHash<QString, bool> requestedVisibility;
+    QStringList unavailableModuleIds;
+    bool legacyVisibilitySemantics = false;
+    return readLayoutFile(filePath,
+                          &geometry,
+                          &state,
+                          &requestedVisibility,
+                          &unavailableModuleIds,
+                          &legacyVisibilitySemantics,
+                          errorMessage);
+}
+
+// 把磁盘文件转换成经过完整校验的 Qt 状态和模块显示意图，但不应用到窗口。
+bool LayoutManager::readLayoutFile(const QString& filePath,
+                                   QByteArray* geometry,
+                                   QByteArray* state,
+                                   QHash<QString, bool>* requestedVisibility,
+                                   QStringList* unavailableModuleIds,
+                                   bool* legacyVisibilitySemantics,
+                                   QString* errorMessage) const
+{
+    if (!validateFilePath(filePath, errorMessage))
         return false;
-    if (unavailableModuleIds != nullptr)
-        unavailableModuleIds->clear();
-    if (legacyVisibilitySemantics != nullptr)
-        *legacyVisibilitySemantics = false;
 
     QFile file(filePath);
     if (!file.open(QIODevice::ReadOnly)) {
@@ -170,11 +187,11 @@ bool LayoutManager::loadLayout(const QString& filePath,
         return false;
     }
 
-    QByteArray geometry;
-    QByteArray state;
-    if (!decodeBase64(root.value(QStringLiteral("geometry")).toString(), &geometry) ||
-        !decodeBase64(root.value(QStringLiteral("state")).toString(), &state) ||
-        geometry.isEmpty() || state.isEmpty()) {
+    QByteArray loadedGeometry;
+    QByteArray loadedState;
+    if (!decodeBase64(root.value(QStringLiteral("geometry")).toString(), &loadedGeometry) ||
+        !decodeBase64(root.value(QStringLiteral("state")).toString(), &loadedState) ||
+        loadedGeometry.isEmpty() || loadedState.isEmpty()) {
         setError(errorMessage, QString::fromUtf8(u8"布局中的窗口状态编码无效"));
         return false;
     }
@@ -212,6 +229,54 @@ bool LayoutManager::loadLayout(const QString& filePath,
             loadedUnavailableModules.append(iterator.key());
     }
 
+    // 只把已校验的内容返回给 loadLayout；这里绝不能调用 restoreGeometry/restoreState。
+    if (geometry != nullptr)
+        *geometry = loadedGeometry;
+    if (state != nullptr)
+        *state = loadedState;
+    if (requestedVisibility != nullptr)
+        *requestedVisibility = loadedRequestedVisibility;
+    if (unavailableModuleIds != nullptr)
+        *unavailableModuleIds = loadedUnavailableModules;
+    if (legacyVisibilitySemantics != nullptr)
+        *legacyVisibilitySemantics = !usesUserIntent;
+    return true;
+}
+
+// 完整解析并校验布局后尝试恢复；Qt 任一步失败都会回滚到调用前状态。
+bool LayoutManager::loadLayout(const QString& filePath,
+                               QHash<QString, bool>* requestedVisibility,
+                               QString* errorMessage,
+                               QStringList* unavailableModuleIds,
+                               bool* legacyVisibilitySemantics,
+                               LayoutActivation activation)
+{
+    if (mainWindow_ == nullptr) {
+        setError(errorMessage, QString::fromUtf8(u8"主窗口不可用"));
+        return false;
+    }
+    if (requestedVisibility != nullptr)
+        requestedVisibility->clear();
+    if (unavailableModuleIds != nullptr)
+        unavailableModuleIds->clear();
+    if (legacyVisibilitySemantics != nullptr)
+        *legacyVisibilitySemantics = false;
+
+    QByteArray geometry;
+    QByteArray state;
+    QHash<QString, bool> loadedRequestedVisibility;
+    QStringList loadedUnavailableModules;
+    bool loadedLegacyVisibility = false;
+    if (!readLayoutFile(filePath,
+                        &geometry,
+                        &state,
+                        &loadedRequestedVisibility,
+                        &loadedUnavailableModules,
+                        &loadedLegacyVisibility,
+                        errorMessage)) {
+        return false;
+    }
+
     // 保存完整旧状态，用于 restoreGeometry/restoreState 任一失败时回滚。
     const QByteArray previousGeometry = mainWindow_->saveGeometry();
     const QByteArray previousState = mainWindow_->saveState(kLayoutVersion);
@@ -225,7 +290,6 @@ bool LayoutManager::loadLayout(const QString& filePath,
     const bool geometryRestored = mainWindow_->restoreGeometry(geometry);
     const bool stateRestored = mainWindow_->restoreState(state, kLayoutVersion);
     if (!geometryRestored || !stateRestored) {
-        // Qt 恢复失败时还原三部分状态，保证用户当前布局不被半应用。
         mainWindow_->restoreGeometry(previousGeometry);
         mainWindow_->restoreState(previousState, kLayoutVersion);
         for (QHash<QString, bool>::const_iterator iterator = previousVisibility.constBegin();
@@ -266,8 +330,9 @@ bool LayoutManager::loadLayout(const QString& filePath,
     if (unavailableModuleIds != nullptr)
         *unavailableModuleIds = loadedUnavailableModules;
     if (legacyVisibilitySemantics != nullptr)
-        *legacyVisibilitySemantics = !usesUserIntent;
-    activeFilePath_ = QFileInfo(filePath).absoluteFilePath();
+        *legacyVisibilitySemantics = loadedLegacyVisibility;
+    if (activation == LayoutActivation::Activate)
+        activeFilePath_ = QFileInfo(filePath).absoluteFilePath();
     return true;
 }
 

@@ -5,7 +5,7 @@
 #include <QSettings>
 
 // 解析流程严格按 INI 分组进行：Modules -> MessageBus/Topic -> Process ->
-// Layout/Style/Logging。任一必需字段无效时立即返回，不保留“部分成功”语义。
+// Layout.n/Style/Logging。任一必需字段无效时立即返回，不保留“部分成功”语义。
 
 namespace qframework
 {
@@ -143,10 +143,24 @@ bool FrameworkConfig::load(const QString& iniFilePath, QString* errorMessage)
     process_.maxRestartCount = positiveValue(settings.value(QStringLiteral("MaxRestartCount")), 3);
     settings.endGroup();
 
-    settings.beginGroup(QStringLiteral("Layout"));
-    // 路径类配置统一在读取时解析，后续模块不需要知道 INI 位于何处。
-    layout_.startupFile = resolvePath(settings.value(QStringLiteral("StartupFile")).toString());
-    settings.endGroup();
+    layout_.presets.clear();
+    // 布局编号由配置维护者保证从 1 连续递增；遇到第一个缺失分组即结束读取。
+    // File 允许为空或指向暂时不存在的文件，MainWindow 会保留菜单项并显示校验原因。
+    const QStringList topLevelGroups = settings.childGroups();
+    for (int index = 1; ; ++index) {
+        const QString groupName = QStringLiteral("Layout.%1").arg(index);
+        if (!topLevelGroups.contains(groupName))
+            break;
+
+        settings.beginGroup(groupName);
+        LayoutPresetConfig preset;
+        preset.index = index;
+        preset.name = settings.value(QStringLiteral("Name")).toString().trimmed();
+        preset.filePath = resolvePath(
+            settings.value(QStringLiteral("File")).toString());
+        settings.endGroup();
+        layout_.presets.append(preset);
+    }
     settings.beginGroup(QStringLiteral("Style"));
     style_.file = resolvePath(settings.value(QStringLiteral("File")).toString());
     settings.endGroup();

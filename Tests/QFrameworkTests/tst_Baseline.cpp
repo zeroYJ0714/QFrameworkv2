@@ -24,6 +24,7 @@
 #include <QMainWindow>
 #include <QMenu>
 #include <QMenuBar>
+#include <QMessageBox>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QPluginLoader>
@@ -861,6 +862,44 @@ qframework::MessageBusConfig faultBusConfig()
     return config;
 }
 
+// 用真实 MainWindow/LayoutManager 生成与目标 Dock 对象名一致的测试布局文件。
+bool writeMainWindowLayout(const QString& filePath,
+                           const QVector<qframework::ModuleConfig>& modules,
+                           const QHash<QString, bool>& requestedVisibility,
+                           QString* errorMessage)
+{
+    qframework::MainWindow sourceWindow(modules, nullptr, nullptr, nullptr);
+    sourceWindow.show();
+    QCoreApplication::processEvents();
+    return sourceWindow.layoutManager()->saveLayout(
+        filePath, requestedVisibility, errorMessage);
+}
+
+// 取标题栏左侧的“布局”菜单；测试不依赖 WindowTitleBar 内部控件层级。
+QMenu* mainLayoutMenu(qframework::MainWindow* window)
+{
+    if (window == nullptr)
+        return nullptr;
+    const QList<QMenuBar*> menuBars = window->findChildren<QMenuBar*>();
+    if (menuBars.isEmpty() || menuBars.first()->actions().isEmpty())
+        return nullptr;
+    return menuBars.first()->actions().first()->menu();
+}
+
+// 预设 QAction 用稳定 layoutIndex 属性识别，允许多个项目显示相同 Name。
+QAction* layoutPresetAction(QMenu* menu, int index)
+{
+    if (menu == nullptr)
+        return nullptr;
+    for (QAction* action : menu->actions()) {
+        if (action != nullptr &&
+            action->property("layoutIndex").toInt() == index) {
+            return action;
+        }
+    }
+    return nullptr;
+}
+
 // 创建单个队列主题配置。
 // capacity 决定最多等待多少条，policy 决定满时覆盖旧帧还是拒绝新消息。
 qframework::TopicConfig queueTopicConfig(int capacity,
@@ -1143,11 +1182,235 @@ void BaselineTest::configIsReadOnlyAndResolvesPaths()
     QCOMPARE(config.logging().flushIntervalMs, 100);
     QCOMPARE(config.messageBus().topics.value(QStringLiteral("QFRAMEWORK_IMAGE_RAW")).policy,
              qframework::QueuePolicy::Latest);
+    QCOMPARE(config.layout().presets.size(), 1);
+    QCOMPARE(config.layout().presets.first().index, 1);
+    QCOMPARE(config.layout().presets.first().name, QString::fromUtf8(u8"默认布局"));
+    QVERIFY(config.layout().presets.first().filePath.isEmpty());
 
     QVERIFY(file.open(QIODevice::ReadOnly));
     const QByteArray after = file.readAll();
     file.close();
     QCOMPARE(after, before);
+}
+
+// 目的：验证连续 Layout.n 配置、直接菜单项、重复名称、空名称回退和启动选择。
+void BaselineTest::layoutPresetsParseAndBuildMenu()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    QVERIFY(QDir(directory.path()).mkpath(QStringLiteral("Layouts")));
+
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(QStringLiteral("PresetUi"),
+                                qframework::ModuleType::InProcessUi));
+    QHash<QString, bool> hiddenVisibility;
+    hiddenVisibility.insert(QStringLiteral("PresetUi"), false);
+    QHash<QString, bool> visibleVisibility;
+    visibleVisibility.insert(QStringLiteral("PresetUi"), true);
+    const QString firstPath = QDir(directory.path()).filePath(
+        QStringLiteral("Layouts/First.qflayout"));
+    const QString secondPath = QDir(directory.path()).filePath(
+        QStringLiteral("Layouts/Second.qflayout"));
+    QString error;
+    QVERIFY2(writeMainWindowLayout(firstPath, modules, hiddenVisibility, &error),
+             qPrintable(error));
+    QVERIFY2(writeMainWindowLayout(secondPath, modules, visibleVisibility, &error),
+             qPrintable(error));
+
+    const QString iniPath = QDir(directory.path()).filePath(QStringLiteral("QFramework.ini"));
+    QFile iniFile(iniPath);
+    QVERIFY(iniFile.open(QIODevice::WriteOnly));
+    const QString iniText = QString::fromUtf8(
+        u8"[Modules]\nNames=\n"
+        u8"[Layout.1]\nName=重复布局\nFile=Layouts/First.qflayout\n"
+        u8"[Layout.2]\nName=重复布局\nFile=%1\n"
+        u8"[Layout.3]\nName=\nFile=Layouts/Missing.qflayout\n")
+        .arg(QDir::fromNativeSeparators(secondPath));
+    QCOMPARE(iniFile.write(iniText.toUtf8()), qint64(iniText.toUtf8().size()));
+    iniFile.close();
+
+    qframework::FrameworkConfig config;
+    QVERIFY2(config.load(iniPath, &error), qPrintable(error));
+    const QVector<qframework::LayoutPresetConfig> presets = config.layout().presets;
+    QCOMPARE(presets.size(), 3);
+    QCOMPARE(presets.at(0).index, 1);
+    QCOMPARE(presets.at(0).name, QString::fromUtf8(u8"重复布局"));
+    QCOMPARE(presets.at(0).filePath, QFileInfo(firstPath).absoluteFilePath());
+    QCOMPARE(presets.at(1).name, QString::fromUtf8(u8"重复布局"));
+    QCOMPARE(presets.at(1).filePath, QFileInfo(secondPath).absoluteFilePath());
+    QVERIFY(presets.at(2).name.isEmpty());
+
+    qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
+    window.setLayoutPresets(presets);
+    QMenu* menu = mainLayoutMenu(&window);
+    QVERIFY(menu != nullptr);
+    QVERIFY(menu->toolTipsVisible());
+    QCOMPARE(menu->actions().size(), 7);
+    QAction* firstAction = layoutPresetAction(menu, 1);
+    QAction* secondAction = layoutPresetAction(menu, 2);
+    QAction* missingAction = layoutPresetAction(menu, 3);
+    QVERIFY(firstAction != nullptr);
+    QVERIFY(secondAction != nullptr);
+    QVERIFY(missingAction != nullptr);
+    QCOMPARE(firstAction->text(), QString::fromUtf8(u8"重复布局"));
+    QCOMPARE(secondAction->text(), QString::fromUtf8(u8"重复布局"));
+    QCOMPARE(missingAction->text(), QString::fromUtf8(u8"布局3"));
+    QVERIFY(!missingAction->isEnabled());
+    QVERIFY(!missingAction->toolTip().isEmpty());
+    QVERIFY(menu->actions().at(3)->isSeparator());
+
+    QVERIFY(window.loadInitialLayoutPreset());
+    QVERIFY(firstAction->isChecked());
+    QVERIFY(!secondAction->isChecked());
+    QCOMPARE(window.layoutManager()->activeFilePath(),
+             QFileInfo(firstPath).absoluteFilePath());
+    secondAction->trigger();
+    QVERIFY(!firstAction->isChecked());
+    QVERIFY(secondAction->isChecked());
+    QCOMPARE(window.layoutManager()->activeFilePath(),
+             QFileInfo(secondPath).absoluteFilePath());
+    secondAction->trigger();
+    QVERIFY(secondAction->isChecked());
+    QCOMPARE(window.layoutManager()->activeFilePath(),
+             QFileInfo(secondPath).absoluteFilePath());
+}
+
+// 目的：验证运行期间文件损坏后切换失败，旧选择和 Qt state 均保持不变。
+void BaselineTest::layoutPresetFailureKeepsSelection()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(QStringLiteral("FailureUi"),
+                                qframework::ModuleType::InProcessUi));
+    QHash<QString, bool> visibility;
+    visibility.insert(QStringLiteral("FailureUi"), true);
+    const QString firstPath = directory.filePath(QStringLiteral("first.qflayout"));
+    const QString secondPath = directory.filePath(QStringLiteral("second.qflayout"));
+    QString error;
+    QVERIFY2(writeMainWindowLayout(firstPath, modules, visibility, &error), qPrintable(error));
+    QVERIFY2(writeMainWindowLayout(secondPath, modules, visibility, &error), qPrintable(error));
+
+    QVector<qframework::LayoutPresetConfig> presets;
+    qframework::LayoutPresetConfig firstPreset;
+    firstPreset.index = 1;
+    firstPreset.name = QStringLiteral("First");
+    firstPreset.filePath = firstPath;
+    presets.append(firstPreset);
+    qframework::LayoutPresetConfig secondPreset;
+    secondPreset.index = 2;
+    secondPreset.name = QStringLiteral("Second");
+    secondPreset.filePath = secondPath;
+    presets.append(secondPreset);
+
+    qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
+    window.setLayoutPresets(presets);
+    QVERIFY(window.loadInitialLayoutPreset());
+    QMenu* menu = mainLayoutMenu(&window);
+    QAction* firstAction = layoutPresetAction(menu, 1);
+    QAction* secondAction = layoutPresetAction(menu, 2);
+    QVERIFY(firstAction != nullptr);
+    QVERIFY(secondAction != nullptr);
+    const QByteArray stateBeforeFailure = window.saveState(1);
+
+    QFile damaged(secondPath);
+    QVERIFY(damaged.open(QIODevice::WriteOnly | QIODevice::Truncate));
+    QCOMPARE(damaged.write("{ damaged"), qint64(9));
+    damaged.close();
+
+    bool warningSeen = false;
+    QTimer dialogCloser;
+    dialogCloser.setInterval(10);
+    connect(&dialogCloser, &QTimer::timeout, [&warningSeen]() {
+        for (QWidget* widget : QApplication::topLevelWidgets()) {
+            QMessageBox* messageBox = qobject_cast<QMessageBox*>(widget);
+            if (messageBox == nullptr || !messageBox->isVisible())
+                continue;
+            warningSeen = true;
+            messageBox->accept();
+            return;
+        }
+    });
+    dialogCloser.start();
+    secondAction->trigger();
+    dialogCloser.stop();
+
+    QVERIFY(warningSeen);
+    QVERIFY(firstAction->isChecked());
+    QVERIFY(!secondAction->isChecked());
+    QVERIFY(secondAction->isEnabled());
+    QCOMPARE(window.saveState(1), stateBeforeFailure);
+    QCOMPARE(window.layoutManager()->activeFilePath(),
+             QFileInfo(firstPath).absoluteFilePath());
+}
+
+// 目的：验证手动加载和另存为只改变界面/输出文件，不改变当前预设。
+void BaselineTest::manualLayoutOperationsKeepPresetActive()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(QStringLiteral("ManualUi"),
+                                qframework::ModuleType::InProcessUi));
+    QHash<QString, bool> hiddenVisibility;
+    hiddenVisibility.insert(QStringLiteral("ManualUi"), false);
+    QHash<QString, bool> visibleVisibility;
+    visibleVisibility.insert(QStringLiteral("ManualUi"), true);
+    const QString presetPath = directory.filePath(QStringLiteral("preset.qflayout"));
+    const QString manualPath = directory.filePath(QStringLiteral("manual.qflayout"));
+    const QString exportedPath = directory.filePath(QStringLiteral("exported.qflayout"));
+    QString error;
+    QVERIFY2(writeMainWindowLayout(presetPath, modules, hiddenVisibility, &error),
+             qPrintable(error));
+    QVERIFY2(writeMainWindowLayout(manualPath, modules, visibleVisibility, &error),
+             qPrintable(error));
+
+    qframework::LayoutPresetConfig preset;
+    preset.index = 1;
+    preset.name = QStringLiteral("Preset");
+    preset.filePath = presetPath;
+    qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
+    window.setLayoutPresets(QVector<qframework::LayoutPresetConfig>() << preset);
+    QVERIFY(window.loadInitialLayoutPreset());
+    QAction* presetAction = layoutPresetAction(mainLayoutMenu(&window), 1);
+    QVERIFY(presetAction != nullptr);
+
+    QVERIFY2(window.loadLayoutFile(manualPath, &error, nullptr, false), qPrintable(error));
+    QVERIFY(presetAction->isChecked());
+    QCOMPARE(window.layoutManager()->activeFilePath(),
+             QFileInfo(presetPath).absoluteFilePath());
+
+    bool saveDialogSeen = false;
+    QTimer saveDialogHandler;
+    saveDialogHandler.setInterval(10);
+    connect(&saveDialogHandler, &QTimer::timeout,
+            [&saveDialogSeen, &exportedPath]() {
+        for (QWidget* widget : QApplication::topLevelWidgets()) {
+            QFileDialog* dialog = qobject_cast<QFileDialog*>(widget);
+            if (dialog == nullptr || !dialog->isVisible())
+                continue;
+            saveDialogSeen = true;
+            dialog->selectFile(exportedPath);
+            QMetaObject::invokeMethod(dialog, "accept", Qt::DirectConnection);
+            return;
+        }
+    });
+    saveDialogHandler.start();
+    QVERIFY(QMetaObject::invokeMethod(&window, "saveLayoutAs", Qt::DirectConnection));
+    saveDialogHandler.stop();
+    QVERIFY(saveDialogSeen);
+    QVERIFY(QFileInfo::exists(exportedPath));
+    QVERIFY(presetAction->isChecked());
+    QCOMPARE(window.layoutManager()->activeFilePath(),
+             QFileInfo(presetPath).absoluteFilePath());
+
+    QVERIFY(QMetaObject::invokeMethod(&window, "saveCurrentLayout", Qt::DirectConnection));
+    QFile savedPreset(presetPath);
+    QVERIFY(savedPreset.open(QIODevice::ReadOnly));
+    const QJsonObject savedRoot = QJsonDocument::fromJson(savedPreset.readAll()).object();
+    const QJsonObject savedModule = savedRoot.value(QStringLiteral("modules"))
+        .toObject().value(QStringLiteral("ManualUi")).toObject();
+    QVERIFY(savedModule.value(QStringLiteral("requestedVisible")).toBool());
 }
 
 // 目的：验证小文件滚动、框架日志格式以及 Qt 全局消息接管。
@@ -2756,9 +3019,8 @@ void BaselineTest::layoutPersistenceAndDockingRules()
     QCOMPARE(manager.activeFilePath(), activeBeforeFailure);
 }
 
-// 用户先加载 A.qflayout，再调整模块显示意图并点击“保存当前布局”。测试直接调用
-// MainWindow 的 Qt slot，断言 A 的内容被覆盖且活动路径没有变化；如果实现错误地进入
-// QFileDialog，测试定时器会关闭对话框并让断言失败，不会永久阻塞测试进程。
+// 用户先选中 INI 预设 A，再调整模块显示意图并点击“保存当前布局”。测试直接调用
+// MainWindow 的 Qt slot，断言 A 的内容被覆盖且活动预设保持不变。
 void BaselineTest::saveCurrentLayoutOverwritesLoadedFile()
 {
     QTemporaryDir directory;
@@ -2769,16 +3031,20 @@ void BaselineTest::saveCurrentLayoutOverwritesLoadedFile()
     modules.append(pluginConfig(QStringLiteral("SaveUi"),
                                 qframework::ModuleType::InProcessUi));
 
-    // 用独立窗口创建待加载文件，避免测试窗口通过 saveLayout() 提前获得活动路径。
-    qframework::MainWindow sourceWindow(modules, nullptr, nullptr, nullptr);
     QHash<QString, bool> initialVisibility;
     initialVisibility.insert(QStringLiteral("SaveUi"), false);
     QString error;
-    QVERIFY2(sourceWindow.layoutManager()->saveLayout(
-                 layoutPath, initialVisibility, &error), qPrintable(error));
+    QVERIFY2(writeMainWindowLayout(layoutPath, modules, initialVisibility, &error),
+             qPrintable(error));
+
+    qframework::LayoutPresetConfig preset;
+    preset.index = 1;
+    preset.name = QStringLiteral("Loaded");
+    preset.filePath = layoutPath;
 
     qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
-    QVERIFY2(window.loadLayoutFile(layoutPath, &error), qPrintable(error));
+    window.setLayoutPresets(QVector<qframework::LayoutPresetConfig>() << preset);
+    QVERIFY(window.loadInitialLayoutPreset());
     QCOMPARE(window.layoutManager()->activeFilePath(),
              QFileInfo(layoutPath).absoluteFilePath());
 
@@ -2789,26 +3055,8 @@ void BaselineTest::saveCurrentLayoutOverwritesLoadedFile()
     moduleAction->trigger();
     QVERIFY(moduleAction->isChecked());
 
-    // 即使未来错误地进入 QFileDialog，也由测试定时器关闭，避免回归测试永久阻塞。
-    bool unexpectedDialogSeen = false;
-    QTimer unexpectedDialogCloser;
-    unexpectedDialogCloser.setInterval(10);
-    connect(&unexpectedDialogCloser, &QTimer::timeout, [&unexpectedDialogSeen]() {
-        const QWidgetList topLevelWidgets = QApplication::topLevelWidgets();
-        for (QWidget* widget : topLevelWidgets) {
-            QFileDialog* dialog = qobject_cast<QFileDialog*>(widget);
-            if (dialog == nullptr || !dialog->isVisible())
-                continue;
-            unexpectedDialogSeen = true;
-            dialog->reject();
-            return;
-        }
-    });
-    unexpectedDialogCloser.start();
     QVERIFY(QMetaObject::invokeMethod(
         &window, "saveCurrentLayout", Qt::DirectConnection));
-    unexpectedDialogCloser.stop();
-    QVERIFY(!unexpectedDialogSeen);
     QCOMPARE(window.layoutManager()->activeFilePath(),
              QFileInfo(layoutPath).absoluteFilePath());
     QVERIFY(window.statusBar()->currentMessage().contains(
@@ -2824,35 +3072,26 @@ void BaselineTest::saveCurrentLayoutOverwritesLoadedFile()
     QVERIFY(savedModule.value(QStringLiteral("requestedVisible")).toBool());
 }
 
-// 新窗口没有成功加载或另存为过布局，因此不存在可覆盖文件。定时器只负责关闭进入的
-// 非原生 QFileDialog；看到标题“布局另存为”即可证明首次“保存当前”走了正确分支。
-void BaselineTest::saveCurrentLayoutFallsBackToSaveAs()
+// 没有成功激活预设时，“保存当前布局”必须置灰并且不打开另存为对话框。
+void BaselineTest::saveCurrentLayoutDisabledWithoutPreset()
 {
     qframework::MainWindow window(
         QVector<qframework::ModuleConfig>(), nullptr, nullptr, nullptr);
     QVERIFY(window.layoutManager()->activeFilePath().isEmpty());
-
-    bool saveAsDialogSeen = false;
-    QTimer dialogCloser;
-    dialogCloser.setInterval(10);
-    connect(&dialogCloser, &QTimer::timeout, [&saveAsDialogSeen]() {
-        const QWidgetList topLevelWidgets = QApplication::topLevelWidgets();
-        for (QWidget* widget : topLevelWidgets) {
-            QFileDialog* dialog = qobject_cast<QFileDialog*>(widget);
-            if (dialog == nullptr || !dialog->isVisible())
-                continue;
-            saveAsDialogSeen =
-                dialog->windowTitle() == QString::fromUtf8(u8"布局另存为");
-            dialog->reject();
-            return;
+    QMenu* menu = mainLayoutMenu(&window);
+    QVERIFY(menu != nullptr);
+    QAction* saveAction = nullptr;
+    for (QAction* action : menu->actions()) {
+        if (action != nullptr &&
+            action->text() == QString::fromUtf8(u8"保存当前布局")) {
+            saveAction = action;
+            break;
         }
-    });
-    dialogCloser.start();
+    }
+    QVERIFY(saveAction != nullptr);
+    QVERIFY(!saveAction->isEnabled());
     QVERIFY(QMetaObject::invokeMethod(
         &window, "saveCurrentLayout", Qt::DirectConnection));
-    dialogCloser.stop();
-
-    QVERIFY(saveAsDialogSeen);
     QVERIFY(window.layoutManager()->activeFilePath().isEmpty());
 }
 

@@ -85,10 +85,18 @@ struct ProcessConfig
     int maxRestartCount = 3;
 };
 
+struct LayoutPresetConfig
+{
+    // index 对应 [Layout.n] 中的 n；filePath 已经由 resolvePath 规范化。
+    int index = 0;
+    QString name;
+    QString filePath;
+};
+
 struct LayoutConfig
 {
-    // 启动时可选加载的布局文件，已经由 resolvePath 规范化。
-    QString startupFile;
+    // 保留 INI 中从 Layout.1 开始的连续顺序，运行期间不重新读取。
+    QVector<LayoutPresetConfig> presets;
 };
 
 struct StyleConfig

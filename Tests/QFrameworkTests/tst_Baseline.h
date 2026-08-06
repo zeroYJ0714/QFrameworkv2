@@ -18,6 +18,12 @@ private slots:
     void protobufRoundTrip();
     // 检查只读 INI、相对路径和强类型配置解析。
     void configIsReadOnlyAndResolvesPaths();
+    // 检查 Layout.n 预设解析、菜单顺序、勾选和无效项提示。
+    void layoutPresetsParseAndBuildMenu();
+    // 检查预设切换失败时保留当前布局，并允许后续重试。
+    void layoutPresetFailureKeepsSelection();
+    // 检查手动加载和另存为不会改变当前预设活动路径。
+    void manualLayoutOperationsKeepPresetActive();
     // 检查日志滚动、Qt 全局消息捕获和输出格式。
     void loggerRollsAndCapturesQtMessages();
     // 检查主进程消息总线的顺序、容量、大小和发布权限。
@@ -65,8 +71,8 @@ private slots:
     void layoutPersistenceAndDockingRules();
     // 检查加载布局后“保存当前”直接覆盖活动文件，不进入另存为。
     void saveCurrentLayoutOverwritesLoadedFile();
-    // 检查没有活动布局时“保存当前”才转入另存为对话框。
-    void saveCurrentLayoutFallsBackToSaveAs();
+    // 检查没有活动预设时“保存当前布局”置灰且不打开对话框。
+    void saveCurrentLayoutDisabledWithoutPreset();
     void moduleMenuTogglesRequestedVisibility();
     void dockCloseClearsRequestedVisibility();
     // 检查无边框主窗口最大化后，主进程 UI Dock 的标题栏关闭按钮仍可点击。

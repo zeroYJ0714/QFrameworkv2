@@ -117,6 +117,7 @@ bool FrameworkRuntime::initialize(const QString& configFilePath,
     styleManager_ = new StyleManager;
     mainWindow_ = new MainWindow(
         config_.modules(), pluginManager_, processSupervisor_, styleManager_);
+    mainWindow_->setLayoutPresets(config_.layout().presets);
     QObject::connect(styleManager_,
                      &StyleManager::styleSheetChanged,
                      processSupervisor_,
@@ -151,22 +152,9 @@ bool FrameworkRuntime::initialize(const QString& configFilePath,
     // 子进程启动已经改成异步批次；即时 errors 只说明请求未被接受，最终错误和
     // MessageBus 投递闸门都由 startupBatchFinished 在事件循环中统一处理。
 
-    const QString layoutFilePath = config_.layout().startupFile;
-    if (!layoutFilePath.isEmpty()) {
-        QStringList unavailableModules;
-        error.clear();
-        if (!mainWindow_->loadLayoutFile(
-                layoutFilePath, &error, &unavailableModules)) {
-            appendStartupWarnings(
-                QStringList() << QString::fromUtf8(u8"启动布局加载失败：%1").arg(error));
-        } else if (!unavailableModules.isEmpty()) {
-            Logger::instance().log(
-                LogLevel::Warning,
-                QStringLiteral("QFrameworkApp"),
-                QString::fromUtf8(u8"启动布局跳过不可用模块：%1")
-                    .arg(unavailableModules.join(QStringLiteral(", "))));
-        }
-    }
+    // 布局预设由 MainWindow 统一处理：启动只尝试 Layout.1，失败写日志并置灰菜单项，
+    // 不进入全局启动警告对话框，也不改变当前空白窗口状态。
+    mainWindow_->loadInitialLayoutPreset();
 
     initialized_ = true;
     return true;

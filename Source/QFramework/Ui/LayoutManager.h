@@ -14,6 +14,12 @@ class QMainWindow;
 
 namespace qframework
 {
+enum class LayoutActivation
+{
+    KeepCurrent,
+    Activate
+};
+
 class QFRAMEWORK_EXPORT LayoutManager
 {
 public:
@@ -27,18 +33,31 @@ public:
     // save 使用 QSaveFile 原子提交，失败不会破坏原布局文件。
     bool saveLayout(const QString& filePath,
                     const QHash<QString, bool>& requestedVisibility,
-                    QString* errorMessage = nullptr);
+                    QString* errorMessage = nullptr,
+                    LayoutActivation activation = LayoutActivation::Activate);
     // load 先完整校验；Qt restore 失败会回滚 geometry/state/visibility。
     bool loadLayout(const QString& filePath,
                     QHash<QString, bool>* requestedVisibility,
                     QString* errorMessage = nullptr,
                     QStringList* unavailableModuleIds = nullptr,
-                    bool* legacyVisibilitySemantics = nullptr);
+                    bool* legacyVisibilitySemantics = nullptr,
+                    LayoutActivation activation = LayoutActivation::Activate);
+
+    // 只读取并校验文件，不改变主窗口、显示意图或活动路径。
+    bool validateLayoutFile(const QString& filePath,
+                            QString* errorMessage = nullptr) const;
 
     // 最近一次成功保存或加载的绝对路径。
     QString activeFilePath() const;
 
 private:
+    bool readLayoutFile(const QString& filePath,
+                        QByteArray* geometry,
+                        QByteArray* state,
+                        QHash<QString, bool>* requestedVisibility,
+                        QStringList* unavailableModuleIds,
+                        bool* legacyVisibilitySemantics,
+                        QString* errorMessage) const;
     bool validateFilePath(const QString& filePath,
                           QString* errorMessage) const;
 

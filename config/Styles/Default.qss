@@ -44,6 +44,16 @@ QToolButton {
     padding: 5px;
 }
 
+/* 模块管理中的纯图标按钮不使用普通工具按钮的文字 padding。 */
+QToolButton[role="moduleAction"] {
+    /* 加上 1px border 后，操作按钮的实际外框为 32x28。 */
+    min-width: 30px;
+    max-width: 30px;
+    min-height: 26px;
+    max-height: 26px;
+    padding: 0;
+}
+
 QToolButton:hover {
     background: #e9edf2;
     border-color: #cfd5dc;

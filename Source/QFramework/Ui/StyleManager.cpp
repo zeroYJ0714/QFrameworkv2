@@ -1,9 +1,12 @@
 #include "StyleManager.h"
 
 #include <QApplication>
+#include <QPainter>
+#include <QProxyStyle>
 #include <QFile>
 #include <QFileInfo>
 #include <QTextCodec>
+#include <QStyleOption>
 
 // QSS 加载采用“先完整验证，后一次应用”的事务式流程，失败不会清空旧样式。
 
@@ -12,6 +15,92 @@ namespace qframework
 namespace
 {
 const qint64 kMaximumStyleSheetBytes = 16 * 1024 * 1024;
+const int kDockSeparatorHitExtent = 5;
+const int kDockSeparatorVisibleExtent = 1;
+const char* kDockSeparatorStyleInstalledProperty =
+    "_qframeworkDockSeparatorStyleInstalled";
+
+// 代理样式放在 QApplication 的基础样式上，而不是放在 MainWindow::setStyle() 上。
+// Qt 5.15 对“控件自定义 QStyle + QSS”支持不完整，后者会导致 qproperty-* 不生效；
+// 全局基础样式则会被 QStyleSheetStyle 正常包裹，既能接收主题属性，又能截取 Dock
+// 分隔条绘制。它只改写 Dock separator，其余控件全部交给原始 Qt 样式。
+class DockSeparatorStyle final : public QProxyStyle
+{
+public:
+    explicit DockSeparatorStyle(QStyle* baseStyle)
+        : QProxyStyle(baseStyle)
+    {
+    }
+
+    int pixelMetric(PixelMetric metric,
+                    const QStyleOption* option,
+                    const QWidget* widget) const override
+    {
+        if (metric == PM_DockWidgetSeparatorExtent)
+            return kDockSeparatorHitExtent;
+        return QProxyStyle::pixelMetric(metric, option, widget);
+    }
+
+    void drawPrimitive(PrimitiveElement element,
+                       const QStyleOption* option,
+                       QPainter* painter,
+                       const QWidget* widget) const override
+    {
+        if (element != PE_IndicatorDockWidgetResizeHandle ||
+            option == nullptr || painter == nullptr || !option->rect.isValid()) {
+            QProxyStyle::drawPrimitive(element, option, painter, widget);
+            return;
+        }
+
+        // QMainWindow 传入的是完整 5px 命中矩形。宽大于高表示上下 Dock 之间的
+        // 横线，高大于宽表示左右 Dock 之间的竖线；这样不依赖 Qt 内部较反直觉的
+        // State_Horizontal 标记含义，也能同时覆盖上下和左右两种布局。
+        QRect visibleRect = option->rect;
+        if (visibleRect.width() >= visibleRect.height()) {
+            visibleRect.setTop(
+                visibleRect.center().y() - (kDockSeparatorVisibleExtent - 1) / 2);
+            visibleRect.setHeight(kDockSeparatorVisibleExtent);
+        } else {
+            visibleRect.setLeft(
+                visibleRect.center().x() - (kDockSeparatorVisibleExtent - 1) / 2);
+            visibleRect.setWidth(kDockSeparatorVisibleExtent);
+        }
+
+        // 颜色由 QSS 通过 MainWindow 的 Qt 属性写入；如果当前样式没有设置属性，
+        // 就使用调色板保证默认主题仍然可见。
+        const char* colorProperty = option->state.testFlag(State_MouseOver)
+            ? "dockSeparatorHoverColor"
+            : "dockSeparatorColor";
+        const QColor propertyColor = widget != nullptr
+            ? widget->property(colorProperty).value<QColor>()
+            : QColor();
+        const QColor color = propertyColor.isValid()
+            ? propertyColor
+            : option->palette.color(option->state.testFlag(State_MouseOver)
+                                        ? QPalette::Highlight
+                                        : QPalette::Mid);
+
+        // fillRect 不启用抗锯齿，不会把 1px 颜色扩散到相邻像素；命中区其余位置
+        // 保持透明，由 QMainWindow 自己的背景正常显示。
+        painter->fillRect(visibleRect, color);
+    }
+};
+
+// 在应用生命周期内只安装一次。QApplication::setStyle 会接管新样式对象的所有权，
+// QProxyStyle 同时接管原来的 Qt 样式，应用退出时由 Qt 按父子关系完整释放。
+void ensureDockSeparatorStyle(QApplication* application)
+{
+    if (application == nullptr ||
+        application->property(kDockSeparatorStyleInstalledProperty).toBool()) {
+        return;
+    }
+
+    QStyle* currentStyle = application->style();
+    if (currentStyle == nullptr)
+        return;
+    application->setStyle(new DockSeparatorStyle(currentStyle));
+    application->setProperty(kDockSeparatorStyleInstalledProperty, true);
+}
 
 // 统一写入可选错误输出，避免每个校验分支重复判断 nullptr。
 void setError(QString* errorMessage, const QString& message)
@@ -43,6 +132,9 @@ bool StyleManager::loadStyleSheet(const QString& filePath,
         return false;
     }
 
+    // 先安装代理再应用 QSS，保证 QStyleSheetStyle 在没有 separator 背景规则时把
+    // 绘制请求转发给代理；QSS 只负责主窗口的普通/悬停颜色属性。
+    ensureDockSeparatorStyle(application);
     application->setStyleSheet(styleSheet);
     // QApplication 接受样式后再更新快照并通知子进程。
     currentFilePath_ = QFileInfo(filePath).absoluteFilePath();

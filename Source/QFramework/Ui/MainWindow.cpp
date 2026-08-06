@@ -1,17 +1,20 @@
 #include "MainWindow.h"
 
 #include <QAction>
-#include <QApplication>
 #include <QEvent>
 #include <QFileDialog>
+#include <QGuiApplication>
 #include <QIcon>
 #include <QLabel>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QScreen>
 #include <QSignalBlocker>
 #include <QStatusBar>
 #include <QStyle>
+#include <QTimer>
+#include <QWindow>
 
 #include "InProcessUiModule.h"
 #include "LayoutManager.h"
@@ -130,11 +133,19 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
       layoutManager_(new LayoutManager(this)),
       moduleManagerDialog_(new ModuleManagerDialog(modules, this)),
       statusSummaryLabel_(new QLabel(this)),
-      saveLayoutAction_(nullptr)
+      saveLayoutAction_(nullptr),
+      dockSeparatorColor_(),
+      dockSeparatorHoverColor_()
 {
     // 先建立模块状态快照，再创建依赖这些状态的菜单和 Dock。
     setObjectName(QStringLiteral("QFrameworkMainWindow"));
     setWindowTitle(QStringLiteral("QFramework"));
+
+    // Qt 5.15 的 QStyleSheetStyle 会先读取 qproperty-* 的当前值类型，再决定怎样
+    // 解析 QSS。先放入有效 QColor，后续的 #RRGGBB 才会走 QColor 解析分支；同时
+    // 这两个调色板颜色也是未加载 QSS 时的合理默认值。
+    dockSeparatorColor_ = palette().color(QPalette::Mid);
+    dockSeparatorHoverColor_ = palette().color(QPalette::Highlight);
 
     // FramelessWindowHint 删除 Windows 原生标题栏；窗口仍保留系统菜单、最小化、
     // 最大化和关闭 flags，随后由 nativeEvent() 补回拖动、缩放和任务栏工作区行为。
@@ -149,6 +160,10 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
     // 接下来会承载原有 QAction，业务动作仍由 MainWindow 保存和连接。
     setMenuWidget(titleBar_);
     connect(titleBar_,
+            &WindowTitleBar::moveRequested,
+            this,
+            &MainWindow::startWindowMove);
+    connect(titleBar_,
             &WindowTitleBar::minimizeRequested,
             this,
             &MainWindow::minimizeWindow);
@@ -161,6 +176,12 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
             this,
             &MainWindow::closeWindow);
     setDockNestingEnabled(true);
+    // ProcessWindowHost 内部承载跨进程原生 HWND。QMainWindow 默认会为 Dock 重排启动
+    // AnimatedDocks，在 HWND 连续改变父级和尺寸的过程中，Qt 可能暂时保留 pluggingWidget
+    // 或鼠标捕获状态，导致动画结束前后分隔条、标题栏拖动和关闭按钮都收不到事件。
+    // 关闭的只是视觉过渡，不影响 DockWidgetMovable、上下左右停靠或 QSS 外观；布局会
+    // 立即完成，原生子窗口也能在同一轮 Qt 事件循环内收到最终尺寸。
+    setAnimated(false);
     setTabPosition(Qt::AllDockWidgetAreas, QTabWidget::North);
     resize(1200, 760);
 
@@ -218,6 +239,33 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
 
 // 子控件和借用管理器均由 Qt/FrameworkRuntime 按父子及依赖顺序回收。
 MainWindow::~MainWindow() = default;
+
+QColor MainWindow::dockSeparatorColor() const
+{
+    return dockSeparatorColor_;
+}
+
+void MainWindow::setDockSeparatorColor(const QColor& color)
+{
+    if (dockSeparatorColor_ == color)
+        return;
+    dockSeparatorColor_ = color;
+    // 分隔条不是独立 QWidget，只能请求整个 QMainWindow 重绘；Qt 会按脏区域裁剪。
+    update();
+}
+
+QColor MainWindow::dockSeparatorHoverColor() const
+{
+    return dockSeparatorHoverColor_;
+}
+
+void MainWindow::setDockSeparatorHoverColor(const QColor& color)
+{
+    if (dockSeparatorHoverColor_ == color)
+        return;
+    dockSeparatorHoverColor_ = color;
+    update();
+}
 
 // 把已成功加载的主进程 QWidget 替换对应占位页并登记为可用。
 void MainWindow::attachInProcessUiModules()
@@ -419,14 +467,14 @@ void MainWindow::onWindowHandleReady(const QString& moduleId, quintptr windowId)
     setUiAvailable(moduleId, true);
 }
 
-// 宿主连续 resize 合并后只把最终客户区尺寸转发给仍在显示的当前 generation。
+// 宿主连续 resize 合并后，只把最终客户区尺寸转发给用户仍要求显示的当前 generation。
 void MainWindow::onProcessWindowSizeChanged(const QString& moduleId,
                                             const QSize& size)
 {
     ProcessWindowHost* host = processHosts_.value(moduleId, nullptr);
     ManagedDockWidget* dockWidget = moduleDocks_.value(moduleId, nullptr);
     if (host == nullptr || dockWidget == nullptr || processSupervisor_ == nullptr ||
-        !host->hasEmbeddedWindow() || !dockWidget->isVisible() ||
+        !host->hasEmbeddedWindow() ||
         !requestedDockVisibility_.value(moduleId, false) ||
         !uiAvailable_.value(moduleId, false) ||
         processSupervisor_->state(moduleId) != QStringLiteral("Running") ||
@@ -434,6 +482,9 @@ void MainWindow::onProcessWindowSizeChanged(const QString& moduleId,
         return;
     }
 
+    // 这里不能再检查 dockWidget->isVisible()：QMainWindow 调整 Dock 标签/分隔区域时
+    // 会让 Dock 短暂不可见，但用户菜单仍是勾选状态。requestedDockVisibility_ 才是
+    // “用户明确要求显示”的稳定依据；真正取消勾选时它为 false，上面的条件仍会拦截。
     QString error;
     if (!processSupervisor_->resizeWindow(moduleId,
                                           size.width(),
@@ -478,29 +529,35 @@ void MainWindow::loadLayoutFromDialog()
 // 保存到当前活动布局；首次保存时转到另存为流程。
 void MainWindow::saveCurrentLayout()
 {
-    // 尚未建立 activeFilePath 时自动转到“另存为”，避免无目标保存。
-    if (layoutManager_->activeFilePath().isEmpty()) {
+    // 先固定本次保存目标。这个路径只会在布局成功加载或成功另存为后由
+    // LayoutManager 记录，因此“保存当前布局”不会再次询问路径，也不会误写其他文件。
+    const QString currentFilePath = layoutManager_->activeFilePath();
+    // 当前会话还没有成功加载/保存过布局时没有覆盖目标，此时才进入“另存为”。
+    if (currentFilePath.isEmpty()) {
         saveLayoutAs();
         return;
     }
     QString error;
-    if (!layoutManager_->saveLayout(layoutManager_->activeFilePath(),
+    if (!layoutManager_->saveLayout(currentFilePath,
                                     requestedDockVisibility_,
                                     &error)) {
         reportStateFailure(QString::fromUtf8(u8"布局保存失败"), error);
         return;
     }
-    statusBar()->showMessage(QString::fromUtf8(u8"当前布局已保存"), 4000);
+    // 显示实际覆盖的文件，让用户能够直接确认“保存当前”和“另存为”的区别。
+    statusBar()->showMessage(
+        QString::fromUtf8(u8"当前布局已保存：%1").arg(currentFilePath), 5000);
 }
 
 // 选择新路径并保存布局，必要时自动补齐 .qflayout 后缀。
 void MainWindow::saveLayoutAs()
 {
-    // 用户省略扩展名时自动补 .qflayout，LayoutManager 仍会再次验证。
+    // “另存为”无论当前是否已经加载布局都必须显示路径选择框；当前文件路径只作为
+    // 初始建议位置，用户确认的新路径会在保存成功后成为后续“保存当前”的目标。
     QString filePath = QFileDialog::getSaveFileName(
         this,
         QString::fromUtf8(u8"布局另存为"),
-        QString(),
+        layoutManager_->activeFilePath(),
         QString::fromUtf8(u8"QFramework 布局 (*.qflayout)"),
         nullptr,
         QFileDialog::DontUseNativeDialog);
@@ -585,7 +642,7 @@ void MainWindow::createActions()
     // 菜单按文件、模块、样式三组构造；模块菜单可提前记录晚到窗口的显示意图。
     // 复用原有 QAction 和槽，只更换菜单栏宿主，避免出现两套功能不一致的菜单。
     QMenuBar* titleMenuBar = titleBar_->menuBar();
-    QMenu* fileMenu = titleMenuBar->addMenu(QString::fromUtf8(u8"文件(&F)"));
+    QMenu* fileMenu = titleMenuBar->addMenu(QString::fromUtf8(u8"布局(&L)"));
     QAction* loadLayoutAction = fileMenu->addAction(
         themedIcon(this, QStringLiteral("document-open"), QStyle::SP_DialogOpenButton),
         QString::fromUtf8(u8"加载布局..."));
@@ -593,12 +650,9 @@ void MainWindow::createActions()
         themedIcon(this, QStringLiteral("document-save"), QStyle::SP_DialogSaveButton),
         QString::fromUtf8(u8"保存当前布局"));
     QAction* saveAsAction = fileMenu->addAction(QString::fromUtf8(u8"布局另存为..."));
-    fileMenu->addSeparator();
-    QAction* exitAction = fileMenu->addAction(QString::fromUtf8(u8"退出"));
     connect(loadLayoutAction, &QAction::triggered, this, &MainWindow::loadLayoutFromDialog);
     connect(saveLayoutAction_, &QAction::triggered, this, &MainWindow::saveCurrentLayout);
     connect(saveAsAction, &QAction::triggered, this, &MainWindow::saveLayoutAs);
-    connect(exitAction, &QAction::triggered, qApp, &QApplication::quit);
 
     QMenu* moduleMenu = titleMenuBar->addMenu(QString::fromUtf8(u8"模块(&M)"));
     QAction* managerAction = moduleMenu->addAction(
@@ -817,6 +871,63 @@ void MainWindow::changeEvent(QEvent* event)
         titleBar_->updateWindowControlState(isMaximized());
 }
 
+// 使用 Qt 官方系统移动接口启动拖动。普通状态直接交给窗口管理器；最大化状态先
+// 恢复到 normalGeometry()，并按鼠标在最大化窗口中的横向比例放置恢复窗口，避免
+// 窗口突然跳到屏幕一侧。下一轮事件循环开始系统拖动时，鼠标左键仍保持按下。
+void MainWindow::startWindowMove(const QPoint& globalPosition,
+                                 const QPoint& titleBarPosition)
+{
+    QWindow* nativeWindow = windowHandle();
+    if (nativeWindow == nullptr)
+        return;
+
+    if (!isMaximized()) {
+        nativeWindow->startSystemMove();
+        return;
+    }
+
+    QRect restoredGeometry = normalGeometry();
+    if (!restoredGeometry.isValid() || restoredGeometry.width() <= 0 ||
+        restoredGeometry.height() <= 0) {
+        restoredGeometry = QRect(QPoint(), QSize(1200, 760));
+    }
+
+    const int currentWidth = qMax(1, width());
+    const qreal horizontalRatio = qBound(
+        0.0,
+        static_cast<qreal>(globalPosition.x() - frameGeometry().left()) /
+            static_cast<qreal>(currentWidth),
+        1.0);
+    QPoint restoredTopLeft(
+        globalPosition.x() - qRound(horizontalRatio * restoredGeometry.width()),
+        globalPosition.y() - titleBarPosition.y());
+
+    QScreen* targetScreen = QGuiApplication::screenAt(globalPosition);
+    if (targetScreen == nullptr)
+        targetScreen = nativeWindow->screen();
+    if (targetScreen != nullptr) {
+        const QRect available = targetScreen->availableGeometry();
+        const int maximumX = qMax(
+            available.left(), available.right() - restoredGeometry.width() + 1);
+        const int maximumY = qMax(
+            available.top(), available.bottom() - restoredGeometry.height() + 1);
+        restoredTopLeft.setX(qBound(available.left(),
+                                    restoredTopLeft.x(),
+                                    maximumX));
+        restoredTopLeft.setY(qBound(available.top(),
+                                    restoredTopLeft.y(),
+                                    maximumY));
+    }
+
+    showNormal();
+    setGeometry(QRect(restoredTopLeft, restoredGeometry.size()));
+    QTimer::singleShot(0, this, [this]() {
+        QWindow* restoredWindow = windowHandle();
+        if (restoredWindow != nullptr)
+            restoredWindow->startSystemMove();
+    });
+}
+
 // 无边框窗口不再有 Windows 原生非客户区，所以这里把“边缘/标题栏/客户区”的命中
 // 结果交给 Windows。Windows 收到 HT* 返回值后负责移动、八方向缩放和贴边，不需要
 // 自己调用 QWidget::move() 写一个持续运行的鼠标循环。
@@ -883,18 +994,22 @@ bool MainWindow::nativeEvent(const QByteArray& eventType,
                     const QPoint titleBarPoint = titleBar_->mapFrom(
                         this, logicalClientPoint);
                     if (titleBar_->rect().contains(titleBarPoint)) {
-                        // 菜单和三个按钮必须返回 HTCLIENT，Windows 才不会把点击误当
-                        // 成拖动；只有标题栏空白区域返回 HTCAPTION 才能移动和双击最大化。
-                        *result = titleBar_->isInteractiveAt(titleBarPoint)
-                            ? HTCLIENT : HTCAPTION;
+                        // 整个自绘标题栏保持 Qt 客户区。菜单和按钮由各自控件处理；空白区
+                        // 由 WindowTitleBar 的 mousePressEvent 调用 QWindow::startSystemMove()。
+                        // 不再返回 HTCAPTION，避免无边框+最大化+原生子窗口组合下 Windows
+                        // 非客户区拖动链失效，同时保留 Qt 双击最大化/还原处理。
+                        *result = HTCLIENT;
                         return true;
                     }
                 }
             }
 
-            // 其他客户区交给 Qt 控件处理，保证 Dock、状态栏和菜单弹出不会被拖动逻辑抢走。
-            *result = HTCLIENT;
-            return true;
+            // Dock 标题栏、关闭按钮和 QMainWindow::separator 都属于普通 Qt 客户区。
+            // 这里不能提前返回“已经处理”：那会截断 Qt/Windows 后续的客户区命中链，
+            // 无边框窗口最大化后尤其容易表现为 Dock 看得见但收不到拖动或点击。
+            // 只让本函数接管上面的窗口边缘和自绘顶部标题栏，其余区域回到
+            // QMainWindow/QWidget 的默认 nativeEvent 路径，由 Qt 把鼠标交给实际子控件。
+            return QMainWindow::nativeEvent(eventType, message, result);
         }
     }
 #else

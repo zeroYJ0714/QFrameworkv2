@@ -63,18 +63,28 @@ private slots:
     void singleInstancePerDirectory();
     // 检查 Dock 布局保存、恢复和不可用模块处理。
     void layoutPersistenceAndDockingRules();
+    // 检查加载布局后“保存当前”直接覆盖活动文件，不进入另存为。
+    void saveCurrentLayoutOverwritesLoadedFile();
+    // 检查没有活动布局时“保存当前”才转入另存为对话框。
+    void saveCurrentLayoutFallsBackToSaveAs();
     void moduleMenuTogglesRequestedVisibility();
     void dockCloseClearsRequestedVisibility();
+    // 检查无边框主窗口最大化后，主进程 UI Dock 的标题栏关闭按钮仍可点击。
+    void inProcessDockTitleBarControlsAfterMaximize();
     void tabSwitchKeepsRequestedVisibility();
     void layoutPreservesTabbedVisibilityIntent();
     void layoutDefersUnavailableDockUntilReady();
     void layoutHiddenDockStaysHiddenAfterReady();
     void processUiLateWindowHonorsLayoutVisibility();
+    // 检查上下拆分 Dock 后无需缩放主窗口，子进程客户区就能立即贴合宿主。
+    void processUiResizeSurvivesVerticalDockRelayout();
     void legacyLayoutLoadsWithoutCorruptingCurrentState();
     // 检查 QSS 重载和失败时保留旧样式。
     void styleSheetReloadAndFailureRecovery();
     // 检查无边框标题栏复用三组菜单，并把窗口按钮请求交回 MainWindow。
     void framelessTitleBarAndWindowControls();
+    // 检查模块管理操作列的图标按钮完整落在单元格内。
+    void moduleManagerActionButtonsFit();
     // 检查 TechDashboard 的 QMenuBar 状态和 QMainWindow Dock 分隔条规则。
     void techDashboardMenuAndDockStyle();
     // 检查默认/非法配置回退 100 ms，并由后台线程自动落盘。

@@ -4,6 +4,7 @@
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QLabel>
+#include <QSize>
 #include <QStyle>
 #include <QTableWidget>
 #include <QToolButton>
@@ -16,6 +17,16 @@ namespace qframework
 {
 namespace
 {
+// 操作列最多同时显示“打开界面”和“重启子进程”两个按钮。这里使用稳定的 Qt 逻辑
+// 像素尺寸，并给操作列预留布局边距，避免全局 QSS padding 把图标挤出单元格。
+const QSize kActionButtonSize(32, 28);
+const QSize kActionIconSize(18, 18);
+const int kActionColumnWidth = 96;
+const int kActionRowHeight = 44;
+const int kActionCellHorizontalMargin = 6;
+const int kActionCellVerticalMargin = 2;
+const int kActionButtonSpacing = 4;
+
 // 判断模块是否提供可以显示的界面按钮。
 bool isUiType(ModuleType type)
 {
@@ -50,12 +61,21 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
     tableWidget_->setSelectionBehavior(QAbstractItemView::SelectRows);
     tableWidget_->setSelectionMode(QAbstractItemView::SingleSelection);
     tableWidget_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    tableWidget_->setObjectName(QStringLiteral("ModuleManagerTable"));
     tableWidget_->verticalHeader()->setVisible(false);
+    // QSS 会改变表格 item 的 size hint，并为单元格绘制区域预留边距。显式固定
+    // 44px 垂直 section，使实际 cell 仍能容纳 28px 按钮和上下布局边距。
+    tableWidget_->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
+    tableWidget_->verticalHeader()->setMinimumSectionSize(kActionRowHeight);
+    tableWidget_->verticalHeader()->setDefaultSectionSize(kActionRowHeight);
     tableWidget_->horizontalHeader()->setStretchLastSection(false);
     tableWidget_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
     tableWidget_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
     tableWidget_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
-    tableWidget_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    // ResizeToContents 不会可靠计算 setCellWidget() 内部布局的两个按钮，因此操作列使用
+    // 固定逻辑宽度。其他列仍按内容/窗口宽度自适应。
+    tableWidget_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
+    tableWidget_->setColumnWidth(3, kActionColumnWidth);
 
     // 按配置顺序创建行，并把 moduleId 保存到按钮动态属性。
     int row = 0;
@@ -76,9 +96,14 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
                 ? QString::fromUtf8(u8"等待启动") : QString::fromUtf8(u8"已禁用")));
 
         QWidget* actionWidget = new QWidget(tableWidget_);
+        actionWidget->setObjectName(
+            QStringLiteral("ModuleActionCell.%1").arg(module.id));
         QHBoxLayout* actionLayout = new QHBoxLayout(actionWidget);
-        actionLayout->setContentsMargins(4, 1, 4, 1);
-        actionLayout->setSpacing(2);
+        actionLayout->setContentsMargins(kActionCellHorizontalMargin,
+                                         kActionCellVerticalMargin,
+                                         kActionCellHorizontalMargin,
+                                         kActionCellVerticalMargin);
+        actionLayout->setSpacing(kActionButtonSpacing);
 
         if (isUiType(module.type)) {
             // showButton 初始禁用，直到对应 UI 对象/窗口句柄准备完成。
@@ -87,9 +112,14 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
             if (icon.isNull())
                 icon = style()->standardIcon(QStyle::SP_DialogOpenButton);
             showButton->setIcon(icon);
+            showButton->setIconSize(kActionIconSize);
             showButton->setToolTip(QString::fromUtf8(u8"显示模块界面"));
             showButton->setAutoRaise(true);
-            showButton->setFixedSize(28, 28);
+            showButton->setFixedSize(kActionButtonSize);
+            showButton->setObjectName(
+                QStringLiteral("ModuleShowButton.%1").arg(module.id));
+            // 专用 role 让 QSS 取消通用 QToolButton 的文字按钮 padding。
+            showButton->setProperty("role", QStringLiteral("moduleAction"));
             showButton->setProperty("moduleId", module.id);
             showButton->setEnabled(false);
             connect(showButton,
@@ -106,9 +136,13 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
             if (icon.isNull())
                 icon = style()->standardIcon(QStyle::SP_BrowserReload);
             restartButton->setIcon(icon);
+            restartButton->setIconSize(kActionIconSize);
             restartButton->setToolTip(QString::fromUtf8(u8"重新启动子进程"));
             restartButton->setAutoRaise(true);
-            restartButton->setFixedSize(28, 28);
+            restartButton->setFixedSize(kActionButtonSize);
+            restartButton->setObjectName(
+                QStringLiteral("ModuleRestartButton.%1").arg(module.id));
+            restartButton->setProperty("role", QStringLiteral("moduleAction"));
             restartButton->setProperty("moduleId", module.id);
             restartButton->setProperty("configuredEnabled", module.enabled);
             restartButton->setEnabled(module.enabled);
@@ -122,7 +156,7 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
         }
         actionLayout->addStretch();
         tableWidget_->setCellWidget(row, 3, actionWidget);
-        tableWidget_->setRowHeight(row, 34);
+        tableWidget_->setRowHeight(row, kActionRowHeight);
         ++row;
     }
 

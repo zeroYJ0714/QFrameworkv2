@@ -8,6 +8,7 @@
 
 #include <QApplication>
 #include <QAction>
+#include <QAbstractButton>
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
@@ -16,14 +17,22 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonDocument>
+#include <QFileDialog>
+#include <QHeaderView>
+#include <QImage>
 #include <QLocalSocket>
 #include <QMainWindow>
+#include <QMenu>
 #include <QMenuBar>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QPluginLoader>
+#include <QPainter>
+#include <QResizeEvent>
 #include <QSignalSpy>
+#include <QStatusBar>
 #include <QStyle>
+#include <QTableWidget>
 #include <QTemporaryDir>
 #include <QToolButton>
 #include <QTest>
@@ -46,6 +55,7 @@
 #include "MainWindow.h"
 #include "ManagedDockWidget.h"
 #include "MessageBus.h"
+#include "ModuleManagerDialog.h"
 #include "PluginManager.h"
 #include "ProcessProtocol.h"
 #include "ProcessSupervisor.h"
@@ -74,6 +84,97 @@ QSize nativeWindowClientSize(quintptr windowId)
     if (handle == nullptr || !IsWindow(handle) || !GetClientRect(handle, &rect))
         return QSize();
     return QSize(rect.right - rect.left, rect.bottom - rect.top);
+}
+
+// 返回任意 Win32 窗口在屏幕物理像素中的外框。与只检查宽高相比，这个矩形还能
+// 发现子进程 HWND 在 Dock 重排后仍停留在旧位置、覆盖相邻主进程 Dock 的问题。
+QRect nativeWindowScreenRect(quintptr windowId)
+{
+    const HWND handle = reinterpret_cast<HWND>(windowId);
+    RECT rect = {};
+    if (handle == nullptr || !IsWindow(handle) || !GetWindowRect(handle, &rect))
+        return QRect();
+    return QRect(rect.left,
+                 rect.top,
+                 rect.right - rect.left,
+                 rect.bottom - rect.top);
+}
+
+// 把 QWidget 内的逻辑坐标转换成 Win32 使用的屏幕物理像素。只取顶层窗口 HWND，
+// 不会为了测试调用子控件 winId()，因而不会改变 QDockWidget 的原生窗口层级。
+QPoint nativeScreenPoint(const QWidget* widget, const QPoint& localPoint)
+{
+    if (widget == nullptr || widget->window() == nullptr)
+        return QPoint();
+    QWidget* topLevel = widget->window();
+    const QPoint logicalPoint = widget->mapTo(topLevel, localPoint);
+    const qreal scale = topLevel->devicePixelRatioF() > 0.0
+        ? topLevel->devicePixelRatioF() : 1.0;
+    POINT nativePoint = {
+        qRound(static_cast<qreal>(logicalPoint.x()) * scale),
+        qRound(static_cast<qreal>(logicalPoint.y()) * scale)
+    };
+    const HWND topLevelHandle = reinterpret_cast<HWND>(topLevel->winId());
+    if (topLevelHandle == nullptr ||
+        !ClientToScreen(topLevelHandle, &nativePoint)) {
+        return QPoint();
+    }
+    return QPoint(nativePoint.x, nativePoint.y);
+}
+
+// 查询屏幕坐标最终命中的 HWND。这个检查比 QTest::mouseClick 更接近用户实际
+// 操作：QTest 可以直接把事件送给 Qt 子控件，却不能发现上方跨进程 HWND 已经
+// 在 Windows 命中测试阶段把鼠标截走。
+HWND nativeWindowFromScreenPoint(const QPoint& screenPoint)
+{
+    POINT point = {screenPoint.x(), screenPoint.y()};
+    return WindowFromPoint(point);
+}
+
+// 向顶层 HWND 发送真实 WM_NCHITTEST，检查无边框标题栏最终交给 Windows 的
+// 命中结果。这里不直接调用 MainWindow::nativeEvent()，避免测试绕过 Qt/Win32 边界。
+long nativeHitTestResult(QWidget* widget, const QPoint& localPoint)
+{
+    if (widget == nullptr || widget->window() == nullptr)
+        return HTERROR;
+    const QPoint screenPoint = nativeScreenPoint(widget, localPoint);
+    const HWND topLevelHandle =
+        reinterpret_cast<HWND>(widget->window()->winId());
+    if (topLevelHandle == nullptr)
+        return HTERROR;
+    return static_cast<long>(SendMessage(
+        topLevelHandle,
+        WM_NCHITTEST,
+        0,
+        MAKELPARAM(screenPoint.x(), screenPoint.y())));
+}
+
+// 判断 candidate 是否是 ancestor 本身或其后代窗口。Qt 的原生容器和外部
+// ProcessUi HWND 都可能出现在同一条父子链上，因此只比较一个句柄不够。
+bool isSameOrDescendantWindow(HWND candidate, HWND ancestor)
+{
+    if (candidate == nullptr || ancestor == nullptr)
+        return false;
+    HWND current = candidate;
+    while (current != nullptr) {
+        if (current == ancestor)
+            return true;
+        current = GetParent(current);
+    }
+    return false;
+}
+
+// 由 QWidget 当前几何计算其屏幕物理像素矩形，供外部 HWND 的位置做同一坐标系比较。
+QRect nativeWidgetScreenRect(const QWidget* widget)
+{
+    if (widget == nullptr)
+        return QRect();
+    const QPoint topLeft = nativeScreenPoint(widget, QPoint(0, 0));
+    const qreal scale = widget->window()->devicePixelRatioF() > 0.0
+        ? widget->window()->devicePixelRatioF() : 1.0;
+    return QRect(topLeft,
+                 QSize(qRound(static_cast<qreal>(widget->width()) * scale),
+                       qRound(static_cast<qreal>(widget->height()) * scale)));
 }
 
 // 原生可见性可区分“只收到 windowReady 并完成嵌入”和“随后真正执行 showWindow”。
@@ -2655,6 +2756,106 @@ void BaselineTest::layoutPersistenceAndDockingRules()
     QCOMPARE(manager.activeFilePath(), activeBeforeFailure);
 }
 
+// 用户先加载 A.qflayout，再调整模块显示意图并点击“保存当前布局”。测试直接调用
+// MainWindow 的 Qt slot，断言 A 的内容被覆盖且活动路径没有变化；如果实现错误地进入
+// QFileDialog，测试定时器会关闭对话框并让断言失败，不会永久阻塞测试进程。
+void BaselineTest::saveCurrentLayoutOverwritesLoadedFile()
+{
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const QString layoutPath = directory.filePath(QStringLiteral("loaded.qflayout"));
+
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(QStringLiteral("SaveUi"),
+                                qframework::ModuleType::InProcessUi));
+
+    // 用独立窗口创建待加载文件，避免测试窗口通过 saveLayout() 提前获得活动路径。
+    qframework::MainWindow sourceWindow(modules, nullptr, nullptr, nullptr);
+    QHash<QString, bool> initialVisibility;
+    initialVisibility.insert(QStringLiteral("SaveUi"), false);
+    QString error;
+    QVERIFY2(sourceWindow.layoutManager()->saveLayout(
+                 layoutPath, initialVisibility, &error), qPrintable(error));
+
+    qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
+    QVERIFY2(window.loadLayoutFile(layoutPath, &error), qPrintable(error));
+    QCOMPARE(window.layoutManager()->activeFilePath(),
+             QFileInfo(layoutPath).absoluteFilePath());
+
+    QAction* moduleAction =
+        window.findChild<QAction*>(QStringLiteral("ModuleAction.SaveUi"));
+    QVERIFY(moduleAction != nullptr);
+    QVERIFY(!moduleAction->isChecked());
+    moduleAction->trigger();
+    QVERIFY(moduleAction->isChecked());
+
+    // 即使未来错误地进入 QFileDialog，也由测试定时器关闭，避免回归测试永久阻塞。
+    bool unexpectedDialogSeen = false;
+    QTimer unexpectedDialogCloser;
+    unexpectedDialogCloser.setInterval(10);
+    connect(&unexpectedDialogCloser, &QTimer::timeout, [&unexpectedDialogSeen]() {
+        const QWidgetList topLevelWidgets = QApplication::topLevelWidgets();
+        for (QWidget* widget : topLevelWidgets) {
+            QFileDialog* dialog = qobject_cast<QFileDialog*>(widget);
+            if (dialog == nullptr || !dialog->isVisible())
+                continue;
+            unexpectedDialogSeen = true;
+            dialog->reject();
+            return;
+        }
+    });
+    unexpectedDialogCloser.start();
+    QVERIFY(QMetaObject::invokeMethod(
+        &window, "saveCurrentLayout", Qt::DirectConnection));
+    unexpectedDialogCloser.stop();
+    QVERIFY(!unexpectedDialogSeen);
+    QCOMPARE(window.layoutManager()->activeFilePath(),
+             QFileInfo(layoutPath).absoluteFilePath());
+    QVERIFY(window.statusBar()->currentMessage().contains(
+        QFileInfo(layoutPath).absoluteFilePath()));
+
+    QFile savedFile(layoutPath);
+    QVERIFY(savedFile.open(QIODevice::ReadOnly));
+    const QJsonObject savedRoot = QJsonDocument::fromJson(savedFile.readAll()).object();
+    const QJsonObject savedModules =
+        savedRoot.value(QStringLiteral("modules")).toObject();
+    const QJsonObject savedModule =
+        savedModules.value(QStringLiteral("SaveUi")).toObject();
+    QVERIFY(savedModule.value(QStringLiteral("requestedVisible")).toBool());
+}
+
+// 新窗口没有成功加载或另存为过布局，因此不存在可覆盖文件。定时器只负责关闭进入的
+// 非原生 QFileDialog；看到标题“布局另存为”即可证明首次“保存当前”走了正确分支。
+void BaselineTest::saveCurrentLayoutFallsBackToSaveAs()
+{
+    qframework::MainWindow window(
+        QVector<qframework::ModuleConfig>(), nullptr, nullptr, nullptr);
+    QVERIFY(window.layoutManager()->activeFilePath().isEmpty());
+
+    bool saveAsDialogSeen = false;
+    QTimer dialogCloser;
+    dialogCloser.setInterval(10);
+    connect(&dialogCloser, &QTimer::timeout, [&saveAsDialogSeen]() {
+        const QWidgetList topLevelWidgets = QApplication::topLevelWidgets();
+        for (QWidget* widget : topLevelWidgets) {
+            QFileDialog* dialog = qobject_cast<QFileDialog*>(widget);
+            if (dialog == nullptr || !dialog->isVisible())
+                continue;
+            saveAsDialogSeen =
+                dialog->windowTitle() == QString::fromUtf8(u8"布局另存为");
+            dialog->reject();
+            return;
+        }
+    });
+    dialogCloser.start();
+    QVERIFY(QMetaObject::invokeMethod(
+        &window, "saveCurrentLayout", Qt::DirectConnection));
+    dialogCloser.stop();
+
+    QVERIFY(saveAsDialogSeen);
+    QVERIFY(window.layoutManager()->activeFilePath().isEmpty());
+}
+
 // 菜单勾选表示用户意图，取消勾选必须立即隐藏已经 ready 的 Dock。
 void BaselineTest::moduleMenuTogglesRequestedVisibility()
 {
@@ -2697,6 +2898,70 @@ void BaselineTest::dockCloseClearsRequestedVisibility()
     QTRY_VERIFY(dock->isVisible());
     QVERIFY(dock->close());
     QTRY_VERIFY(!action->isChecked());
+}
+
+// 这个用例不调用 dock->close()，而是点击 QDockWidget 自己创建的标题栏关闭按钮，
+// 这样可以区分“closeEvent 业务逻辑正常”和“无边框窗口实际鼠标命中正常”。最大化
+// 是用户反馈的触发条件；主进程 UI 内容本身不参与标题栏事件处理。
+void BaselineTest::inProcessDockTitleBarControlsAfterMaximize()
+{
+    const QString stylePath = QDir(QCoreApplication::applicationDirPath())
+        .filePath(QStringLiteral("../../../../config/Styles/TechDashboard.qss"));
+    const QString originalStyleSheet = qApp->styleSheet();
+    qframework::StyleManager styleManager;
+    QString styleError;
+    QVERIFY2(styleManager.loadStyleSheet(stylePath, &styleError),
+             qPrintable(styleError));
+
+    const QString moduleId = QStringLiteral("DockTitleUi");
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(moduleId, qframework::ModuleType::InProcessUi));
+    qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
+    window.show();
+    QVERIFY(!window.isAnimated());
+
+    QVERIFY(QMetaObject::invokeMethod(&window,
+                                      "setUiAvailable",
+                                      Qt::DirectConnection,
+                                      Q_ARG(QString, moduleId),
+                                      Q_ARG(bool, true)));
+    QAction* action = window.findChild<QAction*>(
+        QStringLiteral("ModuleAction.%1").arg(moduleId));
+    QDockWidget* dock = window.findChild<QDockWidget*>(
+        QStringLiteral("ModuleDock.%1").arg(moduleId));
+    QVERIFY(action != nullptr);
+    QVERIFY(dock != nullptr);
+    action->trigger();
+    QTRY_VERIFY(dock->isVisible());
+
+    window.showMaximized();
+    QTRY_VERIFY(window.isMaximized());
+    QCoreApplication::processEvents();
+    QVERIFY(dock->features().testFlag(QDockWidget::DockWidgetMovable));
+    QVERIFY(dock->features().testFlag(QDockWidget::DockWidgetClosable));
+
+    QAbstractButton* closeButton = nullptr;
+    QStringList titleButtonNames;
+    const QList<QAbstractButton*> titleButtons = dock->findChildren<QAbstractButton*>();
+    for (QAbstractButton* button : titleButtons) {
+        if (button == nullptr)
+            continue;
+        titleButtonNames.append(button->objectName());
+        if (button->objectName().contains(QStringLiteral("close"), Qt::CaseInsensitive)) {
+            closeButton = button;
+            break;
+        }
+    }
+    QVERIFY2(closeButton != nullptr,
+             qPrintable(QString::fromUtf8(u8"没有找到 Dock 标题栏关闭按钮，实际按钮：%1")
+                            .arg(titleButtonNames.join(QStringLiteral(", ")))));
+    QVERIFY(closeButton->isEnabled());
+    QVERIFY(closeButton->isVisible());
+
+    QTest::mouseClick(closeButton, Qt::LeftButton);
+    QTRY_VERIFY(!dock->isVisible());
+    QVERIFY(!action->isChecked());
+    qApp->setStyleSheet(originalStyleSheet);
 }
 
 // 两个标签来回 raise 只改变 Qt 当前绘制页，不改变两个 QAction 的用户意图。
@@ -2917,6 +3182,252 @@ void BaselineTest::processUiLateWindowHonorsLayoutVisibility()
     QVERIFY(bus.stopQueues(2000));
 }
 
+// QMainWindow 在把两个标签页改成上下 Dock 时，会短暂隐藏并重新布置内部 QWidget。
+// 这个测试专门覆盖该瞬间：不调用 MainWindow::resize()，直接确认下方 ProcessUi 的
+// 原生客户区已经采用 ProcessWindowHost 的新尺寸。随后用 Qt 的 resizeDocks() 模拟
+// 用户拖动分隔条，证明上下比例可以继续调整，且子进程底部不会残留旧尺寸造成的空白。
+void BaselineTest::processUiResizeSurvivesVerticalDockRelayout()
+{
+    const QString processModuleId = QStringLiteral("ProcessUiExample");
+    const QString companionModuleId = QStringLiteral("VerticalCompanionUi");
+    const QString executablePath = processModulePath(processModuleId);
+    QVERIFY2(QFileInfo::exists(executablePath), qPrintable(executablePath));
+
+    qframework::MessageBusConfig busConfig;
+    busConfig.defaultQueueCapacity = 32;
+    busConfig.maxMessageBytes = 1024 * 1024;
+    busConfig.sharedMemoryThresholdBytes = 256;
+    busConfig.shutdownDrainTimeoutMs = 2000;
+    qframework::ProcessConfig processConfig;
+    processConfig.registrationTimeoutMs = 5000;
+    processConfig.heartbeatIntervalMs = 100;
+    processConfig.heartbeatTimeoutMs = 1000;
+    processConfig.stopTimeoutMs = 2000;
+    processConfig.restartDelayMs = 100;
+    processConfig.restartWindowMs = 5000;
+    processConfig.maxRestartCount = 2;
+
+    qframework::MessageBus bus(busConfig);
+    qframework::ProcessSupervisor supervisor(&bus, busConfig, processConfig);
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(companionModuleId,
+                                qframework::ModuleType::InProcessUi));
+    modules.append(processModuleConfig(processModuleId,
+                                       qframework::ModuleType::ProcessUi));
+
+    qframework::MainWindow window(modules, nullptr, &supervisor, nullptr);
+    window.resize(900, 700);
+    window.show();
+
+    QAction* companionAction = window.findChild<QAction*>(
+        QStringLiteral("ModuleAction.%1").arg(companionModuleId));
+    QAction* processAction = window.findChild<QAction*>(
+        QStringLiteral("ModuleAction.%1").arg(processModuleId));
+    QDockWidget* companionDock = window.findChild<QDockWidget*>(
+        QStringLiteral("ModuleDock.%1").arg(companionModuleId));
+    QDockWidget* processDock = window.findChild<QDockWidget*>(
+        QStringLiteral("ModuleDock.%1").arg(processModuleId));
+    qframework::ProcessWindowHost* host =
+        qobject_cast<qframework::ProcessWindowHost*>(
+            processDock == nullptr ? nullptr : processDock->widget());
+    QVERIFY(companionAction != nullptr);
+    QVERIFY(processAction != nullptr);
+    QVERIFY(companionDock != nullptr);
+    QVERIFY(processDock != nullptr);
+    QVERIFY(host != nullptr);
+
+    // 先记录两个模块都应显示的用户意图。普通 Qt Dock 可以立即 ready；ProcessUi
+    // 要等监督器收到子进程 HWND 后，MainWindow 才会嵌入并真正显示它。
+    companionAction->trigger();
+    processAction->trigger();
+    QVERIFY(QMetaObject::invokeMethod(
+        &window,
+        "setUiAvailable",
+        Qt::DirectConnection,
+        Q_ARG(QString, companionModuleId),
+        Q_ARG(bool, true)));
+    QTRY_VERIFY_WITH_TIMEOUT(companionDock->isVisible(), 2000);
+
+    qRegisterMetaType<quintptr>("quintptr");
+    QSignalSpy windowSpy(&supervisor, &qframework::ProcessSupervisor::windowHandleReady);
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(processModuleId),
+                              QStringLiteral("Running"),
+                              10000);
+    QTRY_VERIFY_WITH_TIMEOUT(windowSpy.count() >= 1, 5000);
+    const quintptr windowId = static_cast<quintptr>(
+        windowSpy.first().at(1).toULongLong());
+    QVERIFY(windowId != 0);
+    QTRY_VERIFY_WITH_TIMEOUT(processDock->isVisible(), 2000);
+
+#ifdef Q_OS_WIN
+    QTRY_COMPARE_WITH_TIMEOUT(nativeWindowClientSize(windowId), host->size(), 2000);
+#endif
+    const QSize sizeBeforeSplit = host->size();
+
+    // 按用户截图的实际顺序把 processDock 放在上方、companionDock 放在下方。这里
+    // 故意不 resize 主窗口；旧实现会在 Qt 重排时丢掉 resize 通知，只能等用户随后
+    // 改变整个框架窗口大小才恢复。
+    // 鼠标从标签组拖出 Dock 时，Qt 会先把被拖动项从原标签组摘下，再放入新的
+    // split 区域。程序化测试先临时放到右侧，以明确解除 Qt 保存的原标签关系，
+    // 否则仅调用 removeDockWidget() 后，splitDockWidget() 仍可能恢复原标签组。
+    window.removeDockWidget(companionDock);
+    window.addDockWidget(Qt::RightDockWidgetArea, companionDock);
+    window.splitDockWidget(processDock, companionDock, Qt::Vertical);
+    companionDock->show();
+    processDock->show();
+    QTRY_VERIFY_WITH_TIMEOUT(window.tabifiedDockWidgets(companionDock).isEmpty(), 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(window.tabifiedDockWidgets(processDock).isEmpty(), 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(companionDock->isVisible(), 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(processDock->isVisible(), 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(host->size() != sizeBeforeSplit, 2000);
+#ifdef Q_OS_WIN
+    QTRY_COMPARE_WITH_TIMEOUT(nativeWindowClientSize(windowId), host->size(), 2000);
+
+    // 用户问题只在整个框架最大化后稳定出现，因此必须在最终窗口状态下检查原生
+    // 子窗口的位置，而不能只比较客户区宽高。正常情况下子进程 HWND 的外框应完全
+    // 落在自己的 ProcessWindowHost 内，不能越过分隔条覆盖下方主进程 Dock。
+    window.showMaximized();
+    QTRY_VERIFY_WITH_TIMEOUT(window.isMaximized(), 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(nativeWindowClientSize(windowId), host->size(), 2000);
+    const QRect processWindowRect = nativeWindowScreenRect(windowId);
+    const QRect processHostRect = nativeWidgetScreenRect(host);
+    QVERIFY2(processWindowRect.isValid(), "ProcessUi HWND screen rect is invalid");
+    QVERIFY2(processHostRect.isValid(), "ProcessWindowHost screen rect is invalid");
+    QVERIFY2(processHostRect.contains(processWindowRect),
+             qPrintable(QStringLiteral("ProcessUi HWND=%1,%2 %3x%4, host=%5,%6 %7x%8")
+                            .arg(processWindowRect.x())
+                            .arg(processWindowRect.y())
+                            .arg(processWindowRect.width())
+                            .arg(processWindowRect.height())
+                            .arg(processHostRect.x())
+                            .arg(processHostRect.y())
+                            .arg(processHostRect.width())
+                            .arg(processHostRect.height())));
+
+    // createWindowContainer 必须在第一次显示前成为原生 QWidget。否则外部 HWND
+    // 会直接挂到主窗口顶层，下面的 WindowFromPoint 检查就会在用户截图的两个
+    // 位置暴露出“画面正常但鼠标无效”的问题。
+    QWidget* nativeContainer = nullptr;
+    const QList<QWidget*> hostChildren =
+        host->findChildren<QWidget*>(QString(), Qt::FindDirectChildrenOnly);
+    for (QWidget* child : hostChildren) {
+        if (child != nullptr &&
+            child->objectName() != QStringLiteral("ProcessWindowPlaceholder")) {
+            nativeContainer = child;
+            break;
+        }
+    }
+    QVERIFY(nativeContainer != nullptr);
+    QVERIFY(nativeContainer->testAttribute(Qt::WA_NativeWindow));
+    const HWND nativeContainerHandle =
+        reinterpret_cast<HWND>(nativeContainer->winId());
+    QVERIFY(nativeContainerHandle != nullptr);
+    QCOMPARE(GetParent(reinterpret_cast<HWND>(windowId)), nativeContainerHandle);
+
+    // 主进程 Dock 的关闭按钮由 Qt 绘制。这里只读取按钮中心的屏幕坐标并判断它
+    // 是否落入子进程 HWND；若落入，真实鼠标会先被子进程窗口拿走，即使按钮可见、
+    // enabled 且 QTest 直接发送事件能够通过，用户仍然无法点击或拖动标题栏。
+    QAbstractButton* companionCloseButton = nullptr;
+    const QList<QAbstractButton*> companionTitleButtons =
+        companionDock->findChildren<QAbstractButton*>();
+    for (QAbstractButton* button : companionTitleButtons) {
+        if (button != nullptr &&
+            button->objectName().contains(QStringLiteral("close"),
+                                          Qt::CaseInsensitive)) {
+            companionCloseButton = button;
+            break;
+        }
+    }
+    QVERIFY(companionCloseButton != nullptr);
+    const QPoint closeButtonScreenPoint = nativeScreenPoint(
+        companionCloseButton, companionCloseButton->rect().center());
+    QVERIFY2(!processWindowRect.contains(closeButtonScreenPoint),
+             qPrintable(QStringLiteral("ProcessUi HWND covers companion close button at %1,%2")
+                            .arg(closeButtonScreenPoint.x())
+                            .arg(closeButtonScreenPoint.y())));
+
+    const HWND closeButtonTarget =
+        nativeWindowFromScreenPoint(closeButtonScreenPoint);
+    QVERIFY2(!isSameOrDescendantWindow(closeButtonTarget, nativeContainerHandle),
+             qPrintable(QStringLiteral("ProcessWindowHost container covers companion close button at %1,%2")
+                            .arg(closeButtonScreenPoint.x())
+                            .arg(closeButtonScreenPoint.y())));
+
+    // Qt 5.15 的 QMainWindow 分隔条是内部布局对象，不保证在 QObject 子树中能
+    // 通过 findChild() 找到。这里使用上下两个 Dock 的最终屏幕矩形计算共同边界，
+    // 命中的就是用户实际拖动的横向分隔区域；如果两个矩形紧贴，则取上 Dock 的
+    // 最后一行作为边界点。
+    const QRect processDockScreenRect = nativeWidgetScreenRect(processDock);
+    const QRect companionDockScreenRect = nativeWidgetScreenRect(companionDock);
+    QVERIFY(processDockScreenRect.isValid());
+    QVERIFY(companionDockScreenRect.isValid());
+    const int separatorTop = processDockScreenRect.bottom() + 1;
+    const int separatorBottom = companionDockScreenRect.top() - 1;
+    const int separatorY = separatorTop <= separatorBottom
+        ? (separatorTop + separatorBottom) / 2
+        : processDockScreenRect.bottom();
+    const QPoint separatorScreenPoint(
+        processDockScreenRect.center().x(), separatorY);
+    const HWND separatorTarget =
+        nativeWindowFromScreenPoint(separatorScreenPoint);
+    QVERIFY2(!isSameOrDescendantWindow(separatorTarget, nativeContainerHandle),
+             qPrintable(QStringLiteral("ProcessWindowHost container covers Dock separator at %1,%2")
+                            .arg(separatorScreenPoint.x())
+                            .arg(separatorScreenPoint.y())));
+#endif
+
+    // Qt 在 Dock 拖放重排内部会短暂隐藏子树，但菜单仍保持勾选，这不等于用户关闭了
+    // 模块。这里显式制造同样的中间状态，并直接发送 Qt resize 事件，避免测试结果
+    // 依赖不同 Windows/Qt 补丁版本的事件先后顺序。
+    QSignalSpy hiddenResizeSpy(host, &qframework::ProcessWindowHost::clientSizeChanged);
+    // 先让纵向拆分本身留下的 50 ms 合并计时器结束，再清空 spy；后面的计数
+    // 才能确定来自“临时不可见期间”的 resize，而不是上一阶段的尾部通知。
+    QTest::qWait(120);
+    hiddenResizeSpy.clear();
+    processDock->hide();
+    QVERIFY(processAction->isChecked());
+    const QSize sizeBeforeHiddenResize = host->size();
+    host->resize(sizeBeforeHiddenResize.width() + 23,
+                 sizeBeforeHiddenResize.height() + 31);
+    const QSize hiddenTargetSize = host->size();
+    QVERIFY(hiddenTargetSize != sizeBeforeHiddenResize);
+    QResizeEvent hiddenResizeEvent(hiddenTargetSize, sizeBeforeHiddenResize);
+    QCoreApplication::sendEvent(host, &hiddenResizeEvent);
+
+    // 即使 QWidget 此刻临时不可见，ProcessWindowHost 也必须发出最终客户区尺寸；
+    // MainWindow 再根据“菜单仍勾选、模块 ready 且进程 Running”决定是否转发。
+    QTRY_VERIFY_WITH_TIMEOUT(hiddenResizeSpy.count() >= 1, 2000);
+    processDock->show();
+    QTRY_VERIFY_WITH_TIMEOUT(processDock->isVisible(), 2000);
+#ifdef Q_OS_WIN
+    QTRY_COMPARE_WITH_TIMEOUT(nativeWindowClientSize(windowId), host->size(), 2000);
+#endif
+
+    // resizeDocks() 走的就是 QMainWindow Dock 分隔条尺寸分配路径，可稳定模拟一次
+    // 用户拖动。两个高度变化说明分隔条存在并可调整，而不是仍处于重叠标签状态。
+    const int companionHeightBeforeDrag = companionDock->height();
+    const int processHeightBeforeDrag = processDock->height();
+    QList<QDockWidget*> verticalDocks;
+    verticalDocks << companionDock << processDock;
+    QList<int> verticalSizes;
+    verticalSizes << 220 << 420;
+    window.resizeDocks(verticalDocks, verticalSizes, Qt::Vertical);
+    QTRY_VERIFY_WITH_TIMEOUT(
+        companionDock->height() != companionHeightBeforeDrag ||
+            processDock->height() != processHeightBeforeDrag,
+        2000);
+#ifdef Q_OS_WIN
+    QTRY_COMPARE_WITH_TIMEOUT(nativeWindowClientSize(windowId), host->size(), 2000);
+#endif
+
+    supervisor.shutdown();
+    QVERIFY(supervisor.runningModuleIds().isEmpty());
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(2000));
+}
+
 // 旧布局按 visible 兼容读取；损坏文件仍完整保留当前 state 和活动路径。
 void BaselineTest::legacyLayoutLoadsWithoutCorruptingCurrentState()
 {
@@ -3041,10 +3552,23 @@ void BaselineTest::framelessTitleBarAndWindowControls()
     QVERIFY(titleMenuBar != nullptr);
     QCOMPARE(window.findChildren<QMenuBar*>().size(), 1);
     QCOMPARE(titleMenuBar->actions().size(), 3);
-    QCOMPARE(titleMenuBar->actions().at(0)->text(), QString::fromUtf8(u8"文件(&F)"));
+    QCOMPARE(titleMenuBar->actions().at(0)->text(), QString::fromUtf8(u8"布局(&L)"));
     QCOMPARE(titleMenuBar->actions().at(1)->text(), QString::fromUtf8(u8"模块(&M)"));
     QCOMPARE(titleMenuBar->actions().at(2)->text(), QString::fromUtf8(u8"样式(&S)"));
     QVERIFY(window.findChild<QAction*>(QStringLiteral("ModuleAction.MenuUi")) != nullptr);
+
+    QMenu* fileMenu = titleMenuBar->actions().at(0)->menu();
+    QVERIFY(fileMenu != nullptr);
+    QStringList fileActionTexts;
+    for (QAction* action : fileMenu->actions()) {
+        if (action != nullptr && !action->isSeparator())
+            fileActionTexts.append(action->text());
+    }
+    QCOMPARE(fileActionTexts,
+             QStringList() << QString::fromUtf8(u8"加载布局...")
+                           << QString::fromUtf8(u8"保存当前布局")
+                           << QString::fromUtf8(u8"布局另存为..."));
+    QVERIFY(!fileActionTexts.contains(QString::fromUtf8(u8"退出")));
 
     QToolButton* minimizeButton =
         titleBar->findChild<QToolButton*>(QStringLiteral("WindowMinimizeButton"));
@@ -3062,6 +3586,29 @@ void BaselineTest::framelessTitleBarAndWindowControls()
 
     window.show();
     QTRY_VERIFY(window.isVisible());
+    const QPoint dragPoint = titleBar->rect().center();
+    QVERIFY(!titleBar->isInteractiveAt(dragPoint));
+#ifdef Q_OS_WIN
+    // 标题栏现在始终走 Qt 客户区；空白区拖动由 QWindow::startSystemMove() 发起。
+    QCOMPARE(nativeHitTestResult(titleBar, dragPoint), long(HTCLIENT));
+#endif
+
+    // 先断开真实系统移动槽，避免自动测试启动 Windows 模态拖动循环；这里专门验证
+    // 空白区 Qt 鼠标事件会发出一次移动请求，按钮/菜单的既有点击测试在后面继续执行。
+    QVERIFY(QObject::disconnect(titleBar,
+                                &qframework::WindowTitleBar::moveRequested,
+                                &window,
+                                nullptr));
+    QSignalSpy moveSpy(titleBar, &qframework::WindowTitleBar::moveRequested);
+    QTest::mouseClick(titleBar, Qt::LeftButton, Qt::NoModifier, dragPoint);
+    QCOMPARE(moveSpy.count(), 1);
+
+    // 双击空白区仍应切换最大化/还原，不依赖 Windows 的 HTCAPTION 默认行为。
+    QTest::mouseDClick(titleBar, Qt::LeftButton, Qt::NoModifier, dragPoint);
+    QTRY_VERIFY(window.isMaximized());
+    QTest::mouseDClick(titleBar, Qt::LeftButton, Qt::NoModifier, dragPoint);
+    QTRY_VERIFY(!window.isMaximized());
+
     QTest::mouseClick(maximizeButton, Qt::LeftButton);
     QTRY_VERIFY(window.isMaximized());
     QCOMPARE(maximizeButton->toolTip(), QString::fromUtf8(u8"还原"));
@@ -3078,10 +3625,91 @@ void BaselineTest::framelessTitleBarAndWindowControls()
     QTRY_VERIFY(!window.isVisible());
 }
 
+// 加载真实 TechDashboard QSS 后显示四种模块类型。ProcessUi 行同时有显示/重启两个
+// 按钮，是操作列最宽的情况；测试检查专用 QSS 尺寸和两个按钮都没有越过单元格边界。
+void BaselineTest::moduleManagerActionButtonsFit()
+{
+    const QString stylePath = QDir(QCoreApplication::applicationDirPath())
+        .filePath(QStringLiteral("../../../../config/Styles/TechDashboard.qss"));
+    const QString originalStyleSheet = qApp->styleSheet();
+    qframework::StyleManager styleManager;
+    QString error;
+    const bool styleLoaded = styleManager.loadStyleSheet(stylePath, &error);
+
+    QVector<qframework::ModuleConfig> modules;
+    modules.append(pluginConfig(QStringLiteral("InUi"),
+                                qframework::ModuleType::InProcessUi));
+    modules.append(pluginConfig(QStringLiteral("InNonUi"),
+                                qframework::ModuleType::InProcessNonUi));
+    modules.append(pluginConfig(QStringLiteral("ProcessUi"),
+                                qframework::ModuleType::ProcessUi));
+    modules.append(pluginConfig(QStringLiteral("ProcessNonUi"),
+                                qframework::ModuleType::ProcessNonUi));
+    qframework::ModuleManagerDialog dialog(modules);
+    dialog.show();
+    QCoreApplication::processEvents();
+
+    QTableWidget* table =
+        dialog.findChild<QTableWidget*>(QStringLiteral("ModuleManagerTable"));
+    const QList<QToolButton*> actionButtons = QList<QToolButton*>()
+        << dialog.findChild<QToolButton*>(QStringLiteral("ModuleShowButton.InUi"))
+        << dialog.findChild<QToolButton*>(QStringLiteral("ModuleShowButton.ProcessUi"))
+        << dialog.findChild<QToolButton*>(QStringLiteral("ModuleRestartButton.ProcessUi"))
+        << dialog.findChild<QToolButton*>(QStringLiteral("ModuleRestartButton.ProcessNonUi"));
+    bool allButtonsFit = table != nullptr && actionButtons.size() == 4;
+    bool allIconsSized = allButtonsFit;
+    QStringList fitFailures;
+    if (allButtonsFit) {
+        allButtonsFit = table->horizontalHeader()->sectionResizeMode(3) ==
+                            QHeaderView::Fixed &&
+                        table->columnWidth(3) >= 96;
+        if (!allButtonsFit) {
+            fitFailures.append(QStringLiteral("operationColumnWidth=%1")
+                                   .arg(table->columnWidth(3)));
+        }
+        for (QToolButton* button : actionButtons) {
+            QWidget* actionCell = button != nullptr ? button->parentWidget() : nullptr;
+            if (button == nullptr || actionCell == nullptr ||
+                !actionCell->rect().contains(button->geometry())) {
+                allButtonsFit = false;
+                if (button == nullptr) {
+                    fitFailures.append(QStringLiteral("missingButton"));
+                } else if (actionCell == nullptr) {
+                    fitFailures.append(
+                        QStringLiteral("%1 missingParent").arg(button->objectName()));
+                } else {
+                    const QRect cellRect = actionCell->rect();
+                    const QRect buttonRect = button->geometry();
+                    fitFailures.append(
+                        QStringLiteral("%1 cell=%2x%3 button=(%4,%5 %6x%7)")
+                            .arg(button->objectName())
+                            .arg(cellRect.width())
+                            .arg(cellRect.height())
+                            .arg(buttonRect.x())
+                            .arg(buttonRect.y())
+                            .arg(buttonRect.width())
+                            .arg(buttonRect.height()));
+                }
+            }
+            if (button == nullptr || button->icon().isNull() ||
+                button->iconSize() != QSize(18, 18) ||
+                button->width() < button->iconSize().width() ||
+                button->height() < button->iconSize().height()) {
+                allIconsSized = false;
+            }
+        }
+    }
+
+    dialog.close();
+    qApp->setStyleSheet(originalStyleSheet);
+    QVERIFY2(styleLoaded, qPrintable(error));
+    QVERIFY2(allButtonsFit, qPrintable(fitFailures.join(QStringLiteral("; "))));
+    QVERIFY(allIconsSized);
+}
+
 // 读取仓库中的真实 TechDashboard 文件，而不是在测试中复制一份简化样式。
-// 这样可以同时确认 StyleManager 的 UTF-8/结构校验通过，并确认 Qt 样式表最终
-// 看到了 QMenuBar 和 QMainWindow::separator 规则。样式恢复放在所有断言之前，
-// 避免这个测试污染后续 Qt Test 的 QApplication 全局状态。
+// 除菜单状态外，还直接让 MainWindow 的真实样式在透明图片上绘制 Dock 分隔条：
+// 透明像素代表只用于鼠标命中的区域，不透明像素代表用户实际看到的 1px 线。
 void BaselineTest::techDashboardMenuAndDockStyle()
 {
     const QString stylePath = QDir(QCoreApplication::applicationDirPath())
@@ -3089,6 +3717,8 @@ void BaselineTest::techDashboardMenuAndDockStyle()
     QVERIFY2(QFileInfo::exists(stylePath), qPrintable(stylePath));
 
     const QString originalStyleSheet = qApp->styleSheet();
+    QVector<qframework::ModuleConfig> modules;
+    qframework::MainWindow window(modules, nullptr, nullptr, nullptr);
     qframework::StyleManager manager;
     QString error;
     const bool loaded = manager.loadStyleSheet(stylePath, &error);
@@ -3101,19 +3731,73 @@ void BaselineTest::techDashboardMenuAndDockStyle()
         appliedStyleSheet.contains(QStringLiteral("QMenuBar::item:selected")) &&
         appliedStyleSheet.contains(QStringLiteral("QMenuBar::item:pressed")) &&
         appliedStyleSheet.contains(QStringLiteral("QMenuBar::item:disabled"));
-    const bool hasDockSeparatorStates =
-        appliedStyleSheet.contains(QStringLiteral("QMainWindow::separator")) &&
-        appliedStyleSheet.contains(QStringLiteral("QMainWindow::separator:hover"));
+    const bool hasDockSeparatorColors =
+        appliedStyleSheet.contains(QStringLiteral("qproperty-dockSeparatorColor")) &&
+        appliedStyleSheet.contains(QStringLiteral("qproperty-dockSeparatorHoverColor"));
+    const bool hasDockTitleControls =
+        appliedStyleSheet.contains(QStringLiteral("QDockWidget::title")) &&
+        appliedStyleSheet.contains(QStringLiteral("QDockWidget::close-button"));
 
-    QMainWindow window;
+    window.show();
+    QCoreApplication::processEvents();
     const int separatorExtent = window.style()->pixelMetric(
         QStyle::PM_DockWidgetSeparatorExtent, nullptr, &window);
+
+    // 11x5 模拟上下 Dock 之间的横向分隔区域，5x11 模拟左右 Dock 之间的纵向
+    // 分隔区域。两张图都应只留下 11 个不透明像素，即一整行或一整列 1px 线。
+    const auto renderSeparator = [&window](const QSize& size,
+                                           QStyle::State state) {
+        QImage image(size, QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::transparent);
+        QStyleOption option;
+        option.rect = image.rect();
+        option.state = state;
+        option.palette = window.palette();
+        {
+            QPainter painter(&image);
+            window.style()->drawPrimitive(
+                QStyle::PE_IndicatorDockWidgetResizeHandle,
+                &option,
+                &painter,
+                &window);
+        }
+        return image;
+    };
+    const auto countPaintedPixels = [](const QImage& image) {
+        int paintedPixels = 0;
+        for (int y = 0; y < image.height(); ++y) {
+            for (int x = 0; x < image.width(); ++x) {
+                if (qAlpha(image.pixel(x, y)) != 0)
+                    ++paintedPixels;
+            }
+        }
+        return paintedPixels;
+    };
+    const QImage horizontalSeparator =
+        renderSeparator(QSize(11, separatorExtent), QStyle::State_Enabled);
+    const QImage verticalSeparator =
+        renderSeparator(QSize(separatorExtent, 11), QStyle::State_Enabled);
+    const QImage hoveredHorizontalSeparator = renderSeparator(
+        QSize(11, separatorExtent),
+        QStyle::State_Enabled | QStyle::State_MouseOver);
+    const int horizontalPaintedPixels = countPaintedPixels(horizontalSeparator);
+    const int verticalPaintedPixels = countPaintedPixels(verticalSeparator);
+    const int hoveredPaintedPixels = countPaintedPixels(hoveredHorizontalSeparator);
+    const QColor separatorColor = window.dockSeparatorColor();
+    const QColor separatorHoverColor = window.dockSeparatorHoverColor();
+
+    window.close();
     qApp->setStyleSheet(originalStyleSheet);
 
     QVERIFY(hasMenuBarStates);
-    QVERIFY(hasDockSeparatorStates);
-    QVERIFY2(separatorExtent >= 6,
-             qPrintable(QString::fromUtf8(u8"Dock 分隔条命中尺寸过小：%1").arg(separatorExtent)));
+    QVERIFY(hasDockSeparatorColors);
+    QVERIFY(hasDockTitleControls);
+    QCOMPARE(separatorColor, QColor(QStringLiteral("#26383c")));
+    QCOMPARE(separatorHoverColor, QColor(QStringLiteral("#4b8c8c")));
+    QCOMPARE(separatorExtent, 5);
+    QCOMPARE(horizontalPaintedPixels, 11);
+    QCOMPARE(verticalPaintedPixels, 11);
+    QCOMPARE(hoveredPaintedPixels, 11);
 }
 
 // 测试程序的双身份入口：普通启动运行 Qt Test；带监督器参数时运行故障/IPC

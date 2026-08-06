@@ -72,6 +72,17 @@ bool ProcessWindowHost::attachWindow(quintptr windowId, QString* errorMessage)
         return false;
     }
 
+    // Qt 5.15 默认可能让 QWindowContainer 保持“非原生 QWidget”，然后把外部
+    // QWindow 直接挂到 QMainWindow 的顶层 HWND。这样画面虽然通常仍落在当前
+    // Dock 内，但外部窗口没有经过 ProcessWindowHost 的原生裁剪，最大化后可能
+    // 继续覆盖下方 Dock 的分隔条和关闭按钮。
+    //
+    // 强制容器在第一次显示前创建自己的 HWND。QWindowContainer 看到 internalWinId()
+    // 后会使用原生父子链，把 foreignWindow_ 设为这个容器的子窗口；Qt/Windows
+    // 才能同时保证尺寸同步、WS_CLIPCHILDREN 裁剪和正确的鼠标命中范围。
+    windowContainer_->setAttribute(Qt::WA_NativeWindow);
+    windowContainer_->winId();
+
     // 外部 QWindow 的 sizeHint 可能把 QDockWidget 最小尺寸放大到屏幕之外；
     // 宿主尺寸由自己的客户区决定，不能让外部窗口反向污染布局约束。
     windowContainer_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
@@ -132,14 +143,21 @@ QSize ProcessWindowHost::minimumSizeHint() const
 
 void ProcessWindowHost::scheduleClientSizeNotification()
 {
-    if (windowContainer_ == nullptr || !isVisible())
+    // QMainWindow 在 Dock 拖动、上下拆分和 restoreState() 过程中，会短暂隐藏
+    // ProcessWindowHost，再用新的几何尺寸重新布置它。此时 resizeEvent 仍然代表
+    // 有效的最终客户区尺寸，不能因为 QWidget::isVisible() 暂时为 false 就丢弃。
+    // 用户是否真正要求隐藏模块，由 MainWindow 保存的菜单/布局意图统一判断。
+    if (windowContainer_ == nullptr)
         return;
     resizeTimer_->start();
 }
 
 void ProcessWindowHost::flushClientSizeNotification()
 {
-    if (windowContainer_ == nullptr || !isVisible())
+    // 50 ms 到期时 Dock 可能仍处于 Qt 内部重排阶段；只要嵌入容器仍存在，就把
+    // 最后一次有效尺寸交给 MainWindow。故障或重启会先 clearEmbeddedWindow()，
+    // 因而不会把旧 HWND 的尺寸误发给下一代子进程。
+    if (windowContainer_ == nullptr)
         return;
     windowContainer_->setGeometry(rect());
     const QSize clientSize = rect().size();

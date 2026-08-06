@@ -3,6 +3,7 @@
 #include <QAbstractButton>
 #include <QHBoxLayout>
 #include <QMenuBar>
+#include <QMouseEvent>
 #include <QSizePolicy>
 #include <QStyle>
 #include <QToolButton>
@@ -87,6 +88,32 @@ bool WindowTitleBar::isInteractiveAt(const QPoint& titleBarPoint) const
     if (!rect().contains(titleBarPoint))
         return false;
     return isInteractiveTitleBarChild(childAt(titleBarPoint));
+}
+
+// 标题栏是 Qt 客户区 QWidget。空白处按下后把位置交给 MainWindow，由它调用
+// QWindow::startSystemMove()，从而保留 Windows 贴边、跨屏和系统拖动行为。
+void WindowTitleBar::mousePressEvent(QMouseEvent* event)
+{
+    if (event != nullptr && event->button() == Qt::LeftButton &&
+        !isInteractiveAt(event->pos())) {
+        emit moveRequested(event->globalPos(), event->pos());
+        event->accept();
+        return;
+    }
+    QWidget::mousePressEvent(event);
+}
+
+// Windows 原生标题栏通常支持双击最大化/还原；无边框后由这个 Qt 事件补回。
+// 菜单和三个按钮属于交互控件，不会触发窗口状态切换。
+void WindowTitleBar::mouseDoubleClickEvent(QMouseEvent* event)
+{
+    if (event != nullptr && event->button() == Qt::LeftButton &&
+        !isInteractiveAt(event->pos())) {
+        emit maximizeRestoreRequested();
+        event->accept();
+        return;
+    }
+    QWidget::mouseDoubleClickEvent(event);
 }
 
 // 最大化时使用 NormalButton 图标，普通状态使用 MaxButton 图标；窗口状态变化由

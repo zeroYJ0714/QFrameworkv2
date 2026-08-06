@@ -287,6 +287,17 @@ QToolButton {
     padding: 0 6px;
 }
 
+/* 模块管理操作列只显示图标。取消通用文字按钮的横向 padding，确保 18px 图标在
+   固定按钮和表格单元格内完整显示，不影响工具栏及其他 QToolButton。 */
+QToolButton[role="moduleAction"] {
+    /* Qt QSS 的 min/max 尺寸按内容框计算；再加两侧 1px border 后，外框正好 32x28。 */
+    min-width: 30px;
+    max-width: 30px;
+    min-height: 26px;
+    max-height: 26px;
+    padding: 0;
+}
+
 QToolButton::menu-indicator {
     image: none;
 }
@@ -616,7 +627,7 @@ QMenu {
     border: 1px solid #3a6064;
 }
 
-/* QMenu 是展开后的下拉菜单；QMenuBar 则是标题栏中的文件/模块/样式行。
+/* QMenu 是展开后的下拉菜单；QMenuBar 则是标题栏中的布局/模块/样式行。
    两者必须分别设置状态颜色，否则系统默认 hover 背景可能覆盖主题文字。 */
 QMenuBar {
     padding: 0;
@@ -692,16 +703,48 @@ QToolBar::separator {
     background-color: #2c4448;
 }
 
-/* QMainWindow 使用内部 Dock 布局管理器；这里的 separator 才是 Dock 之间的
-   调整手柄。QSplitter::handle 仍保留给真正使用 QSplitter 的业务控件。 */
-QMainWindow::separator {
-    width: 6px;
-    height: 6px;
-    background-color: #26383c;
+/* Dock 标题栏是模块移动和关闭的主要鼠标区域。显式留出稳定高度，并为关闭按钮
+   提供清晰的悬停/按下反馈；Qt 5 的系统 Dock 按钮实际命中矩形仍由当前 QStyle 决定。 */
+QDockWidget {
+    color: #d8e4e6;
+    font-weight: 600;
 }
 
-QMainWindow::separator:hover {
-    background-color: #4b8c8c;
+QDockWidget::title {
+    min-height: 28px;
+    padding: 5px 34px 5px 8px;
+    text-align: left;
+    background-color: #111c20;
+    border-bottom: 1px solid #26383c;
+}
+
+QDockWidget::close-button {
+    subcontrol-origin: margin;
+    subcontrol-position: top right;
+    width: 22px;
+    height: 22px;
+    margin: 3px 4px 3px 2px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    background-color: transparent;
+}
+
+QDockWidget::close-button:hover {
+    background-color: #284246;
+    border-color: #3f676b;
+}
+
+QDockWidget::close-button:pressed {
+    background-color: #34565a;
+}
+
+/* Dock 分隔条的 5px 命中范围和中央 1px 绘制由 QApplication 基础 QProxyStyle 分开
+   处理。这里通过 Qt 属性只提供颜色；不要再给 QMainWindow::separator 设置
+   background-color，否则 Qt 5.15 的样式表引擎会重新填满整个 5px 区域。 */
+QMainWindow#QFrameworkMainWindow {
+    qproperty-dockSeparatorColor: #26383c;
+    qproperty-dockSeparatorHoverColor: #4b8c8c;
 }
 
 QToolButton#WindowMinimizeButton,

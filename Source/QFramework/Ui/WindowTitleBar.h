@@ -12,6 +12,7 @@
 #include "QFrameworkGlobal.h"
 
 class QMenuBar;
+class QMouseEvent;
 class QToolButton;
 
 namespace qframework
@@ -35,6 +36,10 @@ public:
     void updateWindowControlState(bool maximized);
 
 signals:
+    // 标题栏空白区按下时请求系统移动窗口。两个坐标供最大化状态恢复窗口时
+    // 保持鼠标仍位于原来的标题栏位置，具体窗口操作仍由 MainWindow 完成。
+    void moveRequested(const QPoint& globalPosition,
+                       const QPoint& titleBarPosition);
     // 信号只描述用户意图，具体窗口状态变化由 MainWindow 的槽完成。
     void minimizeRequested();
     void maximizeRestoreRequested();
@@ -45,6 +50,11 @@ private slots:
     void onMinimizeButtonClicked();
     void onMaximizeButtonClicked();
     void onCloseButtonClicked();
+
+protected:
+    // 菜单和按钮继续按普通 Qt 控件处理；只有标题栏空白区请求移动或双击切换状态。
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
 
 private:
     // 菜单/按钮以外的标题栏子控件仍可作为拖动空白区。

@@ -4,8 +4,10 @@
 // MainWindow 把模块状态映射到菜单、Dock、状态栏和管理对话框，但不实现
 // 插件加载、进程监督、布局序列化或 QSS 解析本身。
 
+#include <QColor>
 #include <QHash>
 #include <QMainWindow>
+#include <QPoint>
 #include <QSize>
 #include <QVector>
 
@@ -31,6 +33,14 @@ class WindowTitleBar;
 class QFRAMEWORK_EXPORT MainWindow : public QMainWindow
 {
     Q_OBJECT
+    // QSS 只负责给出颜色，不再直接绘制 separator 背景。实际绘制由 Qt 样式类完成，
+    // 因而可以把 5px 鼠标命中区和中央 1px 可见线分开处理。
+    Q_PROPERTY(QColor dockSeparatorColor
+               READ dockSeparatorColor
+               WRITE setDockSeparatorColor)
+    Q_PROPERTY(QColor dockSeparatorHoverColor
+               READ dockSeparatorHoverColor
+               WRITE setDockSeparatorHoverColor)
 
 public:
     // 三个管理器指针均为借用；MainWindow 由 FrameworkRuntime 先于它们删除。
@@ -40,6 +50,13 @@ public:
                StyleManager* styleManager,
                QWidget* parent = nullptr);
     ~MainWindow() override;
+
+    // 这两个属性主要供 QSS 的 qproperty-* 使用；未加载 TechDashboard 时使用
+    // 当前 Qt 调色板中的 Mid/Highlight 颜色，分隔线仍然自然可见。
+    QColor dockSeparatorColor() const;
+    void setDockSeparatorColor(const QColor& color);
+    QColor dockSeparatorHoverColor() const;
+    void setDockSeparatorHoverColor(const QColor& color);
 
     // 插件启动后把 QWidget 放进 Dock；关闭前先解除父子关系再卸载 DLL。
     void attachInProcessUiModules();
@@ -74,6 +91,9 @@ private slots:
     void selectStyleSheet();
     void reloadStyleSheet();
     void setUiAvailable(const QString& moduleId, bool available);
+    // 标题栏空白区请求由 Qt 原生窗口管理器开始移动；最大化时先恢复正常尺寸。
+    void startWindowMove(const QPoint& globalPosition,
+                         const QPoint& titleBarPosition);
     // 标题栏按钮请求都回到 MainWindow，由这里统一改变顶层窗口状态。
     void minimizeWindow();
     void toggleMaximizedState();
@@ -132,5 +152,7 @@ private:
     QHash<QString, QString> moduleStates_;
     QLabel* statusSummaryLabel_;
     QAction* saveLayoutAction_;
+    QColor dockSeparatorColor_;
+    QColor dockSeparatorHoverColor_;
 };
 }

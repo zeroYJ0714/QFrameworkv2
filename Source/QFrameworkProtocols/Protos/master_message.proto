@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package qframework.protocols;
+
+//消息类型
+enum MsgType {
+  None = 0; //无用消息
+  Test = 1; //测试消息
+}
+
+//外层消息结构
+message Msg{
+  MsgType type = 1; //消息类型
+  int64 time = 2;   //消息发送时间
+  string src = 3;   //消息来源名称
+  string dst = 4;   //消息对象名称
+  string str = 5;   //具体消息
+}

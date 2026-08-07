@@ -10,7 +10,6 @@ class QLabel;
 class InProcessUiExample final : public qframework::InProcessUiModule
 {
     Q_OBJECT
-    Q_PLUGIN_METADATA(IID QFRAMEWORK_PLUGIN_IID FILE "InProcessUiExample.json")
 
 public:
     // statusLabel_ 和按钮由构造函数创建，QObject 父子关系负责回收。

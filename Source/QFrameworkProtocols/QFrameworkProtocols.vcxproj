@@ -121,32 +121,19 @@
     <ClInclude Include="MessageTopics.h" />
     <ClInclude Include="ProtocolVersion.h" />
     <ClInclude Include="..\QFrameworkSdk\QFrameworkGlobal.h" />
-    <ClInclude Include="Generated\image_messages.pb.h" />
-    <ClInclude Include="Generated\log_messages.pb.h" />
-    <ClInclude Include="Generated\status_messages.pb.h" />
     <ClCompile Include="ProtocolVersion.cpp" />
-    <ClCompile Include="Generated\image_messages.pb.cc" />
-    <ClCompile Include="Generated\log_messages.pb.cc" />
-    <ClCompile Include="Generated\status_messages.pb.cc" />
   </ItemGroup>
   <ItemGroup>
-    <CustomBuild Include="Protos\image_messages.proto">
-      <Message>生成图像协议 C++ 源码</Message>
+    <ProtoFile Include="Protos\*.proto" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="@(ProtoFile->'Generated\%(Filename).pb.h')" />
+    <ClCompile Include="@(ProtoFile->'Generated\%(Filename).pb.cc')" />
+    <CustomBuild Include="@(ProtoFile)">
+      <Message>Generate Protobuf C++: %(Filename).proto</Message>
       <Command>"$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe" --proto_path="$(ProjectDir)Protos" --cpp_out=dllexport_decl=QFRAMEWORK_PROTOCOLS_EXPORT:"$(ProjectDir)Generated" "%(FullPath)"</Command>
-      <Outputs>$(ProjectDir)Generated\image_messages.pb.cc;$(ProjectDir)Generated\image_messages.pb.h;%(Outputs)</Outputs>
-      <AdditionalInputs>$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe;%(AdditionalInputs)</AdditionalInputs>
-    </CustomBuild>
-    <CustomBuild Include="Protos\log_messages.proto">
-      <Message>生成日志协议 C++ 源码</Message>
-      <Command>"$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe" --proto_path="$(ProjectDir)Protos" --cpp_out=dllexport_decl=QFRAMEWORK_PROTOCOLS_EXPORT:"$(ProjectDir)Generated" "%(FullPath)"</Command>
-      <Outputs>$(ProjectDir)Generated\log_messages.pb.cc;$(ProjectDir)Generated\log_messages.pb.h;%(Outputs)</Outputs>
-      <AdditionalInputs>$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe;%(AdditionalInputs)</AdditionalInputs>
-    </CustomBuild>
-    <CustomBuild Include="Protos\status_messages.proto">
-      <Message>生成状态协议 C++ 源码</Message>
-      <Command>"$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe" --proto_path="$(ProjectDir)Protos" --cpp_out=dllexport_decl=QFRAMEWORK_PROTOCOLS_EXPORT:"$(ProjectDir)Generated" "%(FullPath)"</Command>
-      <Outputs>$(ProjectDir)Generated\status_messages.pb.cc;$(ProjectDir)Generated\status_messages.pb.h;%(Outputs)</Outputs>
-      <AdditionalInputs>$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe;%(AdditionalInputs)</AdditionalInputs>
+      <Outputs>$(ProjectDir)Generated\%(Filename).pb.cc;$(ProjectDir)Generated\%(Filename).pb.h;%(Outputs)</Outputs>
+      <AdditionalInputs>$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe;@(ProtoFile);%(AdditionalInputs)</AdditionalInputs>
     </CustomBuild>
   </ItemGroup>
   <Target Name="CopyProtobufRuntime" AfterTargets="Build">

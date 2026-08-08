@@ -115,6 +115,17 @@ QString detailWithPrefix(const QString& prefix, const QString& detail)
     return prefix + QStringLiteral(": ") + detail;
 }
 
+int maxConfiguredMessageBytes(const MessageBusConfig& config)
+{
+    // 命令行绝对上限和 Socket 帧解析上限必须覆盖所有主题专用值。
+    // 主题规则仍会在实际入队前做第二次校验，不能用较小的全局默认值提前
+    // 截断视频主题，也不能因为绝对上限较大而放宽普通主题。
+    int result = qMax(1, config.maxMessageBytes);
+    for (const TopicConfig& topic : config.topics)
+        result = qMax(result, qMax(1, topic.maxMessageBytes));
+    return result;
+}
+
 struct OutgoingMessage
 {
     // 这是“父进程准备发给某个子进程”的待发送项。
@@ -122,7 +133,8 @@ struct OutgoingMessage
     // messageId。这样被 Latest 丢弃的等待项不会留下永远等不到 ACK 的记录。
     QString topic;
     QString senderModuleId;
-    QByteArray data;
+    // 父进程等待队列持有不可变共享载荷；真正写入跨进程介质后释放引用。
+    MessagePayload payload;
 };
 
 TopicConfig effectiveTopicConfig(const MessageBusConfig& config,
@@ -220,7 +232,10 @@ public:
         // MessageBus 只把消息交给桥接器；桥接器不在这里直接写 Socket。
         // 真正的 Socket 写入统一由 ProcessSupervisor 所在线程排空有界队列，
         // 因此慢子进程不会让 MessageBus 的回调线程同步等待网络或磁盘。
-        supervisor_->enqueueMessageToChild(moduleId_, topic, senderModuleId, data);
+        // onMessage 公共签名保持 QByteArray；这里创建的新对象继续隐式共享
+        // 原始字节缓冲，直到 QSharedMemory/base64 边界才执行跨进程复制。
+        supervisor_->enqueueMessageToChild(
+            moduleId_, topic, senderModuleId, makeMessagePayload(data));
     }
 
 private:
@@ -767,7 +782,7 @@ bool ProcessSupervisor::beginStartEntry(Entry* entry, QString* errorMessage)
               << QStringLiteral("--qframework-shared-memory-threshold")
               << QString::number(messageBusConfig_.sharedMemoryThresholdBytes)
               << QStringLiteral("--qframework-max-message-bytes")
-              << QString::number(messageBusConfig_.maxMessageBytes)
+              << QString::number(maxConfiguredMessageBytes(messageBusConfig_))
               << QStringLiteral("--qframework-shutdown-drain-timeout")
               << QString::number(messageBusConfig_.shutdownDrainTimeoutMs)
               << QStringLiteral("--qframework-debugger-timeout-ms")
@@ -834,7 +849,7 @@ void ProcessSupervisor::onSocketReadyRead()
         const process::FrameResult result = process::takeFrame(
             &entry->inputBuffer,
             &frame,
-            maxFrameBytes(messageBusConfig_.maxMessageBytes),
+            maxFrameBytes(maxConfiguredMessageBytes(messageBusConfig_)),
             &error);
         if (result == process::FrameResult::Incomplete)
             return;
@@ -1082,7 +1097,7 @@ void ProcessSupervisor::handleFrame(Entry* entry, const QJsonObject& frame)
                 const int declaredSize = frame.value(QStringLiteral("size")).toInt();
                 const int copySize = qMin(shared.size(), qMax(0, declaredSize));
                 if (declaredSize > 0 && copySize == declaredSize &&
-                    copySize <= messageBusConfig_.maxMessageBytes) {
+                    copySize <= maxConfiguredMessageBytes(messageBusConfig_)) {
                     data = QByteArray(static_cast<const char*>(shared.constData()), copySize);
                 } else {
                     valid = false;
@@ -1103,8 +1118,12 @@ void ProcessSupervisor::handleFrame(Entry* entry, const QJsonObject& frame)
     }
     bool accepted = false;
     const TopicConfig config = effectiveTopicConfig(messageBusConfig_, topic);
-    if (valid && data.size() <= config.maxMessageBytes)
-        accepted = messageBus_->publishFromModule(entry->config.id, topic, data);
+    if (valid && data.size() <= config.maxMessageBytes) {
+        // 跨进程接收已经得到一份独立 QByteArray；移动到 MessagePayload 后，
+        // 主进程所有订阅者共用该对象，ACK 结果仍表示 MessageBus 是否接收。
+        accepted = messageBus_->publishSharedFromModule(
+            entry->config.id, topic, makeMessagePayload(qMove(data)));
+    }
 
     // 这个 ACK 与父到子的 deliveryAck 是两件事：这里确认的是“父进程的
     // MessageBus 已接收/拒绝”，子进程据此释放自己的在途槽位和共享段。
@@ -1193,7 +1212,7 @@ void ProcessSupervisor::onSupervisionTick()
 bool ProcessSupervisor::enqueueMessageToChild(const QString& moduleId,
                                               const QString& topic,
                                               const QString& senderModuleId,
-                                              const QByteArray& data)
+                                              const MessagePayload& payload)
 {
     Entry* entry = findEntry(moduleId);
     if (entry == nullptr || topic.isEmpty())
@@ -1209,7 +1228,7 @@ bool ProcessSupervisor::enqueueMessageToChild(const QString& moduleId,
         QMutexLocker locker(&entry->outgoingMutex);
         // 这里是父进程到子进程的“第一道闸门”。停止、断线或重启会把
         // outgoingAccepting 置为 false，所以生产者不会进入旧 generation。
-        if (data.size() > config.maxMessageBytes ||
+        if (payload.isNull() || payload->size() > config.maxMessageBytes ||
             !entry->outgoingAccepting || entry->outgoingStopping) {
             ++entry->outgoingRejected;
             accepted = false;
@@ -1244,7 +1263,7 @@ bool ProcessSupervisor::enqueueMessageToChild(const QString& moduleId,
             OutgoingMessage message;
             message.topic = topic;
             message.senderModuleId = senderModuleId;
-            message.data = data;
+            message.payload = payload;
             entry->outgoingQueue.enqueue(message);
             if (!entry->outgoingWakeScheduled) {
                 // 用一个布尔标记把很多并发入队合并为一次 Qt 唤醒事件。
@@ -1326,6 +1345,7 @@ void ProcessSupervisor::drainChildQueue(const QString& moduleId)
         }
         if (!haveMessage)
             break;
+        const QByteArray& data = *message.payload;
 
         // 等待队列中的项故意没有 messageId；现在它已经占用一个在途槽位，
         // 才生成唯一 ID，并建立 ID->主题映射供 deliveryAck 回收计数。
@@ -1340,12 +1360,12 @@ void ProcessSupervisor::drainChildQueue(const QString& moduleId)
         frame.insert(QStringLiteral("topic"), message.topic);
         frame.insert(QStringLiteral("senderModuleId"), message.senderModuleId);
         frame.insert(QStringLiteral("messageId"), messageId);
-        if (message.data.size() >= messageBusConfig_.sharedMemoryThresholdBytes) {
+        if (data.size() >= messageBusConfig_.sharedMemoryThresholdBytes) {
             // 大消息只在共享内存中复制一次；Socket 里只放 key 和 size 等控制信息。
             // 共享段的所有权仍在父进程，必须一直保留到子进程 ACK。
             const QString key = makeSharedKey(moduleId);
             QSharedMemory* shared = new QSharedMemory(key, this);
-            if (!shared->create(message.data.size())) {
+            if (!shared->create(data.size())) {
                 delete shared;
                 discardChildMessageBeforeSend(entry, messageId);
                 continue;
@@ -1357,8 +1377,8 @@ void ProcessSupervisor::drainChildQueue(const QString& moduleId)
                 continue;
             }
             std::memcpy(shared->data(),
-                        message.data.constData(),
-                        static_cast<size_t>(message.data.size()));
+                        data.constData(),
+                        static_cast<size_t>(data.size()));
             shared->unlock();
             {
                 QMutexLocker locker(&entry->outgoingMutex);
@@ -1366,13 +1386,13 @@ void ProcessSupervisor::drainChildQueue(const QString& moduleId)
             }
             frame.insert(QStringLiteral("transport"), QStringLiteral("shared"));
             frame.insert(QStringLiteral("sharedKey"), key);
-            frame.insert(QStringLiteral("size"), message.data.size());
+            frame.insert(QStringLiteral("size"), data.size());
         } else {
             // 小消息直接放进 JSON 控制帧。它仍然受单条大小上限约束，且不会
             // 作为 QByteArray 参数附着在每个 Qt queued event 上。
             frame.insert(QStringLiteral("transport"), QStringLiteral("inline"));
             frame.insert(QStringLiteral("data"),
-                         QString::fromLatin1(message.data.toBase64()));
+                         QString::fromLatin1(data.toBase64()));
         }
 
         if (!sendFrame(entry, frame)) {

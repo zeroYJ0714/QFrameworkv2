@@ -96,7 +96,8 @@ struct OutboundMessage
     // 等待队列中的对象没有 messageId；只有真正进入“已发送、等待父进程 ACK”
     // 状态时才分配 ID，避免被 Latest 覆盖的项留下悬挂状态。
     QString topic;
-    QByteArray data;
+    // 等待发送期间持有同一份不可变载荷；写入跨进程介质后即可释放此引用。
+    MessagePayload payload;
 };
 
 int queuedTopicCount(const QQueue<OutboundMessage>& queue,
@@ -128,9 +129,18 @@ public:
                            const QString& topic,
                            const QByteArray& data) override
     {
+        // 兼容直接调用旧宿主接口的代码；统一包装后进入共享队列。
+        return publishSharedFromModule(moduleId, topic, makeMessagePayload(data));
+    }
+
+    // 模块业务线程只复制 MessagePayload 引用，不直接访问 Runtime 的 Socket。
+    bool publishSharedFromModule(const QString& moduleId,
+                                 const QString& topic,
+                                 const MessagePayload& payload) override
+    {
         // 运行时已经绑定唯一模块，moduleId 只满足统一接口，不再重复校验。
         Q_UNUSED(moduleId)
-        return runtime_->queuePublish(topic, data);
+        return runtime_->queuePublish(topic, payload);
     }
 
     void logFromModule(LogLevel level,
@@ -170,7 +180,7 @@ public:
 
     // 从任意模块线程入队；满队列按 TopicSettings 选择覆盖或拒绝。
     bool enqueue(const QString& topic,
-                 const QByteArray& data,
+                 const MessagePayload& payload,
                  const ProcessRuntime::TopicSettings& config,
                  bool* logWarning,
                  Stats* stats)
@@ -194,12 +204,12 @@ public:
             };
             // accepting_ 在断线、stop 和析构时会被关闭；所有生产者都先检查它，
             // 因此停止过程不需要依赖一个可能永远不返回的阻塞发送。
-            if (!accepting_) {
+            if (!accepting_ || payload.isNull()) {
                 ++stats_.rejected;
                 changed = true;
                 return finish(false);
             }
-            if (data.size() > config.maxMessageBytes) {
+            if (payload->size() > config.maxMessageBytes) {
                 ++stats_.rejected;
                 changed = true;
                 return finish(false);
@@ -234,7 +244,7 @@ public:
 
             OutboundMessage message;
             message.topic = topic;
-            message.data = data;
+            message.payload = payload;
             queue_.enqueue(message);
             if (!wakeScheduled_) {
                 // 只安排一次无参数 Qt 唤醒。后续消息仍留在 queue_，由 drain
@@ -425,12 +435,12 @@ public:
     // 进入输入边界；Latest 覆盖同主题最旧等待项，Reliable 满时返回 false。
     bool enqueue(const QString& topic,
                  const QString& senderModuleId,
-                 const QByteArray& data)
+                 const MessagePayload& payload)
     {
         QMutexLocker locker(&mutex_);
         // 这是子进程的输入边界：父进程收到消息后只需把数据复制到这里，
         // 随即发送 deliveryAck，不会等待真正的 onMessage() 消费速度。
-        if (!accepting_)
+        if (!accepting_ || payload.isNull())
             return false;
         const ProcessRuntime::TopicSettings config =
             topicConfigs_.value(topic, defaultConfig_);
@@ -455,7 +465,7 @@ public:
         Message message;
         message.topic = topic;
         message.senderModuleId = senderModuleId;
-        message.data = data;
+        message.payload = payload;
         messages_.enqueue(message);
         available_.wakeOne();
         return true;
@@ -499,7 +509,7 @@ protected:
             try {
                 module_->onMessage(message.topic,
                                    message.senderModuleId,
-                                   message.data);
+                                   *message.payload);
             } catch (...) {
                 module_->logError(QString::fromUtf8(u8"onMessage 未知异常"));
             }
@@ -507,13 +517,13 @@ protected:
     }
 
 private:
-    // 输入消息按值保存，离开 Socket/共享内存解析作用域后仍然有效。
+    // 输入消息保存不可变共享所有权，离开 Socket/共享内存解析作用域后仍然有效。
     struct Message
     {
-        // 主题和发送者用于业务路由，data 是完整负载副本。
+        // 主题和发送者用于业务路由；payload 是接收边界创建的唯一 QByteArray。
         QString topic;
         QString senderModuleId;
-        QByteArray data;
+        MessagePayload payload;
     };
 
     // module_ 是 ProcessRuntime 拥有的业务对象；配置快照构造后不再修改。
@@ -1062,8 +1072,12 @@ void ProcessRuntime::handleFrame(const QJsonObject& frame)
     const ProcessRuntime::TopicSettings config = topicConfig(topic);
     if (data.size() > maxMessageBytes_ || data.size() > config.maxMessageBytes)
         valid = false;
+    // 跨进程边界已经复制出独立 QByteArray；转移进共享载荷后，子进程内
+    // 输入队列和 onMessage 回调不再创建第二个 QByteArray 对象。
+    const MessagePayload payload = valid
+        ? makeMessagePayload(qMove(data)) : MessagePayload();
     const bool accepted = valid && messageQueue_ != nullptr &&
-                          messageQueue_->enqueue(topic, sender, data);
+                          messageQueue_->enqueue(topic, sender, payload);
     // delivery ACK 表示消息已经进入子进程有界队列；不等待慢消费者的
     // onMessage() 返回，父进程即可释放在途槽位和共享内存。
     if (!sendDeliveryAck(messageId, accepted))
@@ -1089,6 +1103,7 @@ void ProcessRuntime::drainPublishQueue()
         OutboundMessage message;
         if (!publishQueue_->takeNext(topicConfigs_, topicConfig(QString()), &message))
             break;
+        const QByteArray& data = *message.payload;
 
         // 从等待队列取出后才分配 messageId。父进程会把这个 ID 原样放回
         // publishAck，子进程据此释放对应的 in-flight 槽位。
@@ -1099,12 +1114,12 @@ void ProcessRuntime::drainPublishQueue()
         frame.insert(QStringLiteral("topic"), message.topic);
         frame.insert(QStringLiteral("senderModuleId"), moduleId_);
         frame.insert(QStringLiteral("messageId"), messageId);
-        if (message.data.size() >= sharedMemoryThresholdBytes_) {
+        if (data.size() >= sharedMemoryThresholdBytes_) {
             // 共享内存只承载大 payload；Socket 发送的 JSON 是很小的控制信息。
             // 句柄放入 outgoingSharedSegments_，在父进程 ACK 前不能释放。
             const QString key = sharedKey(moduleId_);
             QSharedMemory* shared = new QSharedMemory(key, this);
-            if (!shared->create(message.data.size())) {
+            if (!shared->create(data.size())) {
                 delete shared;
                 publishQueue_->discardBeforeSend(messageId);
                 continue;
@@ -1116,19 +1131,19 @@ void ProcessRuntime::drainPublishQueue()
                 continue;
             }
             std::memcpy(shared->data(),
-                        message.data.constData(),
-                        static_cast<size_t>(message.data.size()));
+                        data.constData(),
+                        static_cast<size_t>(data.size()));
             shared->unlock();
             outgoingSharedSegments_.insert(messageId, shared);
             frame.insert(QStringLiteral("transport"), QStringLiteral("shared"));
             frame.insert(QStringLiteral("sharedKey"), key);
-            frame.insert(QStringLiteral("size"), message.data.size());
+            frame.insert(QStringLiteral("size"), data.size());
         } else {
             // 小 payload 使用 base64 放进控制帧。它仍然通过有界队列进入，
             // 不会因为 Qt::QueuedConnection 而为每帧复制一个无上限事件参数。
             frame.insert(QStringLiteral("transport"), QStringLiteral("inline"));
             frame.insert(QStringLiteral("data"),
-                         QString::fromLatin1(message.data.toBase64()));
+                         QString::fromLatin1(data.toBase64()));
         }
         if (!sendFrame(frame)) {
             publishQueue_->discardBeforeSend(messageId);
@@ -1161,7 +1176,7 @@ void ProcessRuntime::onSendLog(int level, const QString& text)
 }
 
 // ModuleHost 的发布入口：业务线程只进入受锁保护的本地有界队列。
-bool ProcessRuntime::queuePublish(const QString& topic, const QByteArray& data)
+bool ProcessRuntime::queuePublish(const QString& topic, const MessagePayload& payload)
 {
     bool logWarning = false;
     PublishQueue::Stats stats;
@@ -1173,7 +1188,7 @@ bool ProcessRuntime::queuePublish(const QString& topic, const QByteArray& data)
             return false;
         ProcessRuntime::TopicSettings config = topicConfig(topic);
         config.maxMessageBytes = qMin(config.maxMessageBytes, maxMessageBytes_);
-        accepted = publishQueue_->enqueue(topic, data, config, &logWarning, &stats);
+        accepted = publishQueue_->enqueue(topic, payload, config, &logWarning, &stats);
     }
     if (logWarning) {
         queueLog(LogLevel::Warning,

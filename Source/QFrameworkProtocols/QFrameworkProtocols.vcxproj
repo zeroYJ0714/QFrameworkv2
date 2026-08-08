@@ -120,20 +120,17 @@
   <ItemGroup>
     <ClInclude Include="MessageTopics.h" />
     <ClInclude Include="ProtocolVersion.h" />
+    <ClInclude Include="Generated\master_message.pb.h" />
     <ClInclude Include="..\QFrameworkSdk\QFrameworkGlobal.h" />
     <ClCompile Include="ProtocolVersion.cpp" />
+    <ClCompile Include="Generated\master_message.pb.cc" />
   </ItemGroup>
   <ItemGroup>
-    <ProtoFile Include="Protos\*.proto" />
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="@(ProtoFile->'Generated\%(Filename).pb.h')" />
-    <ClCompile Include="@(ProtoFile->'Generated\%(Filename).pb.cc')" />
-    <CustomBuild Include="@(ProtoFile)">
-      <Message>Generate Protobuf C++: %(Filename).proto</Message>
+    <CustomBuild Include="Protos\master_message.proto">
+      <Message>生成统一 QFramework/ADB Protobuf C++ 源码</Message>
       <Command>"$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe" --proto_path="$(ProjectDir)Protos" --cpp_out=dllexport_decl=QFRAMEWORK_PROTOCOLS_EXPORT:"$(ProjectDir)Generated" "%(FullPath)"</Command>
-      <Outputs>$(ProjectDir)Generated\%(Filename).pb.cc;$(ProjectDir)Generated\%(Filename).pb.h;%(Outputs)</Outputs>
-      <AdditionalInputs>$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe;@(ProtoFile);%(AdditionalInputs)</AdditionalInputs>
+      <Outputs>$(ProjectDir)Generated\master_message.pb.cc;$(ProjectDir)Generated\master_message.pb.h;%(Outputs)</Outputs>
+      <AdditionalInputs>$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe;%(AdditionalInputs)</AdditionalInputs>
     </CustomBuild>
   </ItemGroup>
   <Target Name="CopyProtobufRuntime" AfterTargets="Build">

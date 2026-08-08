@@ -73,6 +73,11 @@ public:
     bool publishFromModule(const QString& moduleId,
                            const QString& topic,
                            const QByteArray& data) override;
+    // ModuleEndpoint::publishShared 的主进程宿主实现；校验完成后把同一个
+    // MessagePayload 引用放入所有订阅者队列，不复制 QByteArray 对象。
+    bool publishSharedFromModule(const QString& moduleId,
+                                 const QString& topic,
+                                 const MessagePayload& payload) override;
     // ModuleEndpoint 的日志宿主实现，转交单例 Logger。
     void logFromModule(LogLevel level,
                        const QString& moduleId,

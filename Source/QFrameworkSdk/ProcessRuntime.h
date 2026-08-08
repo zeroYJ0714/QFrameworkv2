@@ -84,8 +84,9 @@ private:
     TopicSettings topicConfig(const QString& topic) const;
     // 解析 registerAck 下发的 QJsonArray 主题规则。
     bool parseTopicConfigs(const QJsonObject& frame);
-    // publish() 的非阻塞本地入口；返回值不代表父进程最终结果。
-    bool queuePublish(const QString& topic, const QByteArray& data);
+    // publish()/publishShared() 的非阻塞本地入口；队列持有不可变共享载荷，
+    // 返回值只表示本地队列接收，不代表父进程最终 publishAck 结果。
+    bool queuePublish(const QString& topic, const MessagePayload& payload);
     // 从任意模块线程安全地排队一条小型日志。
     void queueLog(LogLevel level, const QString& text);
     // 只允许 Runtime 所属线程访问 QLocalSocket；Debug 测试靠断言守住边界。

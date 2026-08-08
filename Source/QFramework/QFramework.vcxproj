@@ -126,6 +126,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\QFrameworkSdk\LogLevel.h" />
+    <ClInclude Include="..\QFrameworkSdk\MessagePayload.h" />
     <ClInclude Include="..\QFrameworkSdk\ModuleEndpoint.h" />
     <ClInclude Include="..\QFrameworkSdk\QFrameworkPlugin.h" />
     <QtMoc Include="..\QFrameworkSdk\InProcessNonUiModule.h" />

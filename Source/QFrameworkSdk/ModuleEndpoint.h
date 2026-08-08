@@ -10,6 +10,7 @@
 #include <QStringList>
 
 #include "LogLevel.h"
+#include "MessagePayload.h"
 #include "QFrameworkGlobal.h"
 
 namespace qframework
@@ -29,6 +30,11 @@ public:
     virtual bool publishFromModule(const QString& moduleId,
                                    const QString& topic,
                                    const QByteArray& data) = 0;
+    // 共享发布入口只借用 payload 引用并复制智能指针；实现方不得修改其 QByteArray。
+    // 空智能指针表示调用错误，合法的零字节消息必须使用非空 QByteArray 对象。
+    virtual bool publishSharedFromModule(const QString& moduleId,
+                                         const QString& topic,
+                                         const MessagePayload& payload) = 0;
     // 将模块日志交给集中 Logger；调用者不需要自己打开 QFile。
     virtual void logFromModule(LogLevel level,
                                const QString& moduleId,
@@ -62,6 +68,9 @@ public:
 
     // 发布消息。返回 false 表示未运行、主题未声明、大小超限或有界队列已满。
     bool publish(const QString& topic, const QByteArray& data);
+    // 发布调用方已经持有的不可变载荷。同进程多个订阅队列共享同一个
+    // QByteArray 对象；跨进程宿主仍会在 QSharedMemory 边界复制字节。
+    bool publishShared(const QString& topic, const MessagePayload& payload);
     // 长循环可定期查询；停止开始后返回 true，便于协作退出 onMessage。
     bool isStopRequested() const;
     // 四个日志快捷方法最终都会进入同一个集中日志线程。

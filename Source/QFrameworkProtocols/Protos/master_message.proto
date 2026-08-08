@@ -2,17 +2,829 @@ syntax = "proto3";
 
 package qframework.protocols;
 
-//消息类型
+// 兼容旧示例的消息类型；新的 ADB 协议在 Msg.str 中承载 AdbRequest/AdbResponse。
 enum MsgType {
-  None = 0; //无用消息
-  Test = 1; //测试消息
+  None = 0; // 兼容旧协议的空消息类型。
+  Test = 1; // 兼容旧协议的测试消息类型。
 }
 
-//外层消息结构
-message Msg{
-  MsgType type = 1; //消息类型
-  int64 time = 2;   //消息发送时间
-  string src = 3;   //消息来源名称
-  string dst = 4;   //消息对象名称
-  string str = 5;   //具体消息
+// 通用外层消息；ADB 主题使用 src/dst 路由，并把内层 Proto 原始字节放入 str。
+message Msg {
+  MsgType type = 1; // 兼容旧协议的消息类型。
+  int64 time = 2; // 消息发送时间，单位为毫秒。
+  string src = 3; // 消息来源模块名称。
+  string dst = 4; // 消息目标模块名称；ADB 广播事件使用空字符串。
+  bytes str = 5; // 内层 Proto 序列化后的原始字节；不得经过 QString/UTF-8 文本转换。
+}
+
+// 原始图像帧；对应 QFRAMEWORK_IMAGE_RAW，由图像发布模块序列化后发送。
+message ImageFrame {
+  uint64 sequence = 1; // 发布者生成的单调帧序号。
+  uint32 width = 2; // 图像宽度，单位为像素。
+  uint32 height = 3; // 图像高度，单位为像素。
+  string format = 4; // 发布者约定的像素格式名称。
+  bytes payload = 5; // 不经过文本编码转换的图像原始字节。
+  int64 timestamp_ms = 6; // 图像采集或生成时间，单位为毫秒。
+}
+
+// 处理后图像；对应 QFRAMEWORK_IMAGE_PROCESSED，可通过 source_sequence 对齐原帧。
+message ProcessedImage {
+  ImageFrame image = 1; // 算法处理后输出的完整图像。
+  uint64 source_sequence = 2; // 对应输入 ImageFrame.sequence。
+  string processor_module_id = 3; // 生成该结果的模块 ID。
+}
+
+// 结构化日志显示消息；对应 QFRAMEWORK_LOG_DISPLAY，由 UI 模块的 onMessage 接收。
+message LogDisplayMessage {
+  string level = 1; // 日志级别文本，例如 INFO、WARNING 或 ERROR。
+  string module_id = 2; // 产生日志的模块 ID。
+  string text = 3; // 供界面显示的日志正文。
+  int64 timestamp_ms = 4; // 日志时间戳，单位为毫秒。
+  uint64 thread_id = 5; // 产生日志的线程标识，仅用于诊断。
+}
+
+// 模块生命周期状态；作为 ModuleStatus.state 通过 QFRAMEWORK_STATUS 发布。
+enum ModuleState {
+  MODULE_STATE_UNKNOWN = 0; // 尚未取得可靠生命周期状态。
+  MODULE_STATE_STARTING = 1; // 模块正在启动。
+  MODULE_STATE_RUNNING = 2; // 模块已经运行。
+  MODULE_STATE_STOPPING = 3; // 模块正在停止。
+  MODULE_STATE_STOPPED = 4; // 模块已经停止。
+  MODULE_STATE_FAILED = 5; // 模块启动或运行失败。
+  MODULE_STATE_RESTARTING = 6; // 模块正在由监督器重启。
+}
+
+// 模块状态消息；对应 QFRAMEWORK_STATUS，由声明订阅该主题的模块接收。
+message ModuleStatus {
+  string module_id = 1; // 状态所属模块 ID。
+  ModuleState state = 2; // 当前生命周期状态。
+  string detail = 3; // 可选诊断详情。
+  int64 timestamp_ms = 4; // 状态产生时间，单位为毫秒。
+  uint32 restart_count = 5; // 当前监督窗口内的重启次数。
+}
+
+// 明确表示 SQLite NULL；不能用空字符串代替，因为空字符串是有效文本值。
+message SqlNull {}
+
+// SQL 参数和结果值；所有分支都保持原始值语义，不经过 QVariant 文本猜测。
+message SqlValue {
+  oneof value {
+    SqlNull null_value = 1; // SQLite NULL。
+    bool bool_value = 2; // SQLite INTEGER 的布尔约定。
+    sint64 sint64_value = 3; // 有符号整数。
+    double double_value = 4; // 浮点数。
+    string string_value = 5; // UTF-8 文本。
+    bytes bytes_value = 6; // 原始 BLOB 字节。
+  }
+}
+
+// 一个命名 SQL 参数；name 必须包含调用方 SQL 中的命名占位符，例如 :device_id。
+message SqlParameter {
+  string name = 1; // 命名占位符名称，不允许拼接到 SQL 文本之外。
+  SqlValue value = 2; // 要绑定的值。
+}
+
+// 一条 SQL 语句和它的命名参数。
+message SqlStatement {
+  string sql = 1; // SQLite SQL 文本。
+  repeated SqlParameter parameters = 2; // 绑定参数列表。
+}
+
+// 执行非查询 SQL；结果通过 SqlResponse 返回受影响行数和最后插入 ID。
+message SqlExecuteRequest {
+  SqlStatement statement = 1; // 要 prepare/bind/exec 的语句。
+}
+
+// 执行查询 SQL；调用方只能降低系统的行数/字节上限，不能提高上限。
+message SqlQueryRequest {
+  SqlStatement statement = 1; // 要 prepare/bind/逐行读取的语句。
+  uint32 max_rows = 2; // 可选行数上限，0 表示使用系统上限 10000。
+  uint32 max_bytes = 3; // 可选结果字节上限，0 表示使用系统 16 MiB 上限。
+}
+
+// 在一个 SQLite 事务内按顺序执行的语句；任一失败都必须回滚全部语句。
+message SqlBatchRequest {
+  repeated SqlStatement statements = 1; // 事务内按 FIFO 顺序执行。
+}
+
+// SQL 请求总线负载；request_id 是原始字节，不能经过 QString 或 UTF-8 转换。
+message SqlRequest {
+  bytes request_id = 1; // 调用方生成的关联 ID，响应必须原样返回。
+  oneof operation {
+    SqlExecuteRequest execute = 2; // 非查询执行。
+    SqlQueryRequest query = 3; // 查询并返回列/行。
+    SqlBatchRequest batch = 4; // 事务批量执行。
+  }
+}
+
+// SQL 失败分类；error_message 仍保留 SQLite 原始文字。
+enum SqlErrorCode {
+  SQL_ERROR_NONE = 0; // 成功。
+  SQL_ERROR_INVALID_REQUEST = 1; // 请求缺少语句或参数不合法。
+  SQL_ERROR_OPEN = 2; // 数据库打开失败。
+  SQL_ERROR_PREPARE = 3; // prepare 失败。
+  SQL_ERROR_BIND = 4; // 参数绑定失败。
+  SQL_ERROR_EXECUTE = 5; // exec/step 失败。
+  SQL_ERROR_RESULT_LIMIT = 6; // 行数或序列化字节超过限制。
+  SQL_ERROR_STOPPED = 7; // SQL Worker 已停止。
+  SQL_ERROR_UNKNOWN = 8; // 未分类错误。
+}
+
+// 查询结果列定义。
+message SqlColumn {
+  string name = 1; // SQLite 返回的列名。
+}
+
+// 查询结果的一行；values 顺序与 SqlResponse.columns 一致。
+message SqlRow {
+  repeated SqlValue values = 1; // 当前行的列值。
+}
+
+// SQL 统一应答；失败时不得发布半截成功行。
+message SqlResponse {
+  bytes request_id = 1; // 原样返回 SqlRequest.request_id。
+  bool success = 2; // 是否完整成功。
+  SqlErrorCode error_code = 3; // 失败分类。
+  string error_message = 4; // SQLite 原始错误文字或限制说明。
+  int64 affected_rows = 5; // 非查询受影响行数。
+  int64 last_insert_id = 6; // SQLite 最后插入 rowid。
+  repeated SqlColumn columns = 7; // 查询列；非查询为空。
+  repeated SqlRow rows = 8; // 查询行；失败或超限时为空。
+}
+
+// ImageShow 启动时主动查询当前已保存设备；request_id 必须原样回传。
+message CurrentDeviceQuery {
+  bytes request_id = 1; // 查询模块生成的关联 ID。
+}
+
+// 当前设备查询结果；android_id 为空表示当前没有可用的已保存设备。
+message CurrentDeviceResponse {
+  bytes request_id = 1; // 原样返回 CurrentDeviceQuery.request_id。
+  string android_id = 2; // 当前已确认设备的 android_id，空值表示无选择。
+}
+
+// 当前设备发生变化的广播；只携带 android_id，不携带 serial、名称或媒体状态。
+message CurrentDeviceChanged {
+  string android_id = 1; // 当前已确认设备的 android_id，空值表示清空选择。
+}
+
+// ------------------------------ ADB 公共枚举和数据 ------------------------------
+
+// ADB 设备状态；对应主题：QFRAMEWORK_ADB_DEVICE_EVENT 中的状态事件。
+enum AdbDeviceState {
+  ADB_DEVICE_STATE_UNKNOWN = 0; // 无法判断设备状态。
+  ADB_DEVICE_STATE_OFFLINE = 1; // ADB 报告设备离线。
+  ADB_DEVICE_STATE_UNAUTHORIZED = 2; // 设备未授权当前主机。
+  ADB_DEVICE_STATE_BOOTING = 3; // 设备正在启动。
+  ADB_DEVICE_STATE_READY = 4; // 设备可以执行命令。
+  ADB_DEVICE_STATE_DISABLED = 5; // 被调用方主动停用。
+  ADB_DEVICE_STATE_DISCONNECTED = 6; // 从最近一次设备列表中消失。
+  ADB_DEVICE_STATE_ERROR = 7; // 设备发生不可恢复错误。
+}
+
+// 媒体会话状态；对应主题：QFRAMEWORK_ADB_MEDIA_EVENT 中的状态事件。
+enum AdbMediaState {
+  ADB_MEDIA_STATE_STOPPED = 0; // 媒体会话未运行。
+  ADB_MEDIA_STATE_STARTING = 1; // 正在建立 scrcpy 会话。
+  ADB_MEDIA_STATE_RUNNING = 2; // 视频、音频和控制通道已可用。
+  ADB_MEDIA_STATE_RECONNECTING = 3; // 正在自动重连。
+  ADB_MEDIA_STATE_DEGRADED_AUDIO = 4; // 音频不可用但视频仍可用。
+  ADB_MEDIA_STATE_FAILED = 5; // 媒体会话最终失败。
+}
+
+// ADB 错误码；对应主题：QFRAMEWORK_ADB_ERROR_EVENT 和 AdbResponse.error_code。
+enum AdbErrorCode {
+  ADB_ERROR_NONE = 0; // 没有错误。
+  ADB_ERROR_INVALID_CONFIGURATION = 1; // 配置无效。
+  ADB_ERROR_EXECUTABLE_MISSING = 2; // adb、server 或 FFmpeg 文件缺失。
+  ADB_ERROR_DEVICE_NOT_FOUND = 3; // 找不到目标设备。
+  ADB_ERROR_DEVICE_DISABLED = 4; // 目标设备已被停用。
+  ADB_ERROR_DEVICE_OFFLINE = 5; // 目标设备离线。
+  ADB_ERROR_DEVICE_UNAUTHORIZED = 6; // 目标设备未授权。
+  ADB_ERROR_PROCESS_START_FAILED = 7; // adb 进程无法启动。
+  ADB_ERROR_PROCESS_FAILED = 8; // adb 进程异常退出。
+  ADB_ERROR_COMMAND_TIMED_OUT = 9; // 命令超时。
+  ADB_ERROR_COMMAND_CANCELED = 10; // 命令被取消。
+  ADB_ERROR_PROTOCOL = 11; // scrcpy/ADB 协议解析失败。
+  ADB_ERROR_CODEC_UNSUPPORTED = 12; // 编解码器不支持。
+  ADB_ERROR_SOCKET = 13; // 媒体 Socket 错误。
+  ADB_ERROR_BUFFER_LIMIT_EXCEEDED = 14; // 输出或媒体缓冲达到上限。
+  ADB_ERROR_SHUTDOWN = 15; // 管理器正在关闭。
+  ADB_ERROR_UNKNOWN = 16; // 未分类错误。
+}
+
+// 同一设备的 ADB 命令调度策略；由 AdbCommandOptions 携带。
+enum AdbCommandPolicy {
+  ADB_COMMAND_POLICY_SERIAL = 0; // 同一设备命令按顺序执行。
+  ADB_COMMAND_POLICY_PARALLEL = 1; // 允许与同设备其他命令并行执行。
+}
+
+// 旧版 AndroidDeviceManager 初始化配置；仅保留消息定义以兼容已生成代码。
+// 新版 InitializeRequest 为空，外部模块不能再覆盖本地 ADB/scrcpy/FFmpeg 路径。
+message ManagerConfig {
+  string adb_executable = 1; // adb.exe 路径；为空时使用程序目录默认值。
+  string scrcpy_server_path = 2; // scrcpy-server 路径；为空时使用程序目录默认值。
+  string ffmpeg_directory = 3; // FFmpeg DLL 目录；为空时使用程序目录默认值。
+  optional int32 default_command_timeout_ms = 4; // 默认命令超时；0 使用 15000。
+  optional int32 monitor_interval_ms = 5; // 设备监控周期；0 使用 1000。
+  optional int32 reconnect_max_attempts = 6; // 媒体最大重连次数；0 使用 5。
+  optional int32 reconnect_interval_ms = 7; // 媒体重连间隔；0 使用 1000。
+  optional int32 reconnect_total_timeout_ms = 8; // 媒体重连总时限；0 使用 30000。
+  optional int32 media_connection_timeout_ms = 9; // 媒体建连超时；0 使用 45000。
+  optional int32 max_media_packet_bytes = 10; // 媒体单包上限；0 使用 32 MiB。
+  optional int32 max_media_buffer_bytes = 11; // 媒体缓冲上限；0 使用 64 MiB。
+}
+
+// ADB 设备信息；通过 AdbDeviceEvent/AdbDeviceListResult 传输。
+message DeviceInfo {
+  string serial = 1; // 设备序列号。
+  string state_text = 2; // adb devices -l 返回的原始状态文本。
+  string transport_id = 3; // ADB transport_id。
+  string product = 4; // product 属性。
+  string model = 5; // model 属性。
+  string device = 6; // device 属性。
+  AdbDeviceState state = 7; // 框架归一化后的状态。
+  bool enabled = 8; // 是否允许执行设备命令和媒体操作。
+  int64 last_seen_utc_ms = 9; // 最近发现时间，UTC 毫秒。
+}
+
+// ADB 自定义环境变量；由 AdbCommandOptions.environment 使用。
+message EnvironmentEntry {
+  string name = 1; // 环境变量名。
+  string value = 2; // 环境变量值。
+}
+
+// ADB 命令选项；通过 ExecuteHostAdbRequest/ExecuteDeviceAdbRequest 传入。
+message AdbCommandOptions {
+  optional int32 timeout_ms = 1; // 0 使用管理器默认值，负数只由取消或停止结束。
+  AdbCommandPolicy device_policy = 2; // Serial 或 Parallel。
+  optional bool stream_output = 3; // 是否发布实时输出事件；默认 true。
+  optional bool close_stdin_after_start = 4; // 启动后是否关闭 stdin；默认 true。
+  bytes initial_stdin = 5; // 启动后一次性写入 stdin 的字节。
+  string working_directory = 6; // adb 工作目录；为空使用当前目录。
+  repeated EnvironmentEntry environment = 7; // 自定义环境变量列表。
+  optional bool use_custom_environment = 8; // 是否使用上面的环境变量；默认 false。
+  optional int32 max_output_bytes = 9; // stdout+stderr 上限；0 使用 32 MiB。
+}
+
+// ADB 命令完成结果；对应主题：QFRAMEWORK_ADB_COMMAND_FINISHED。
+message AdbCommandResult {
+  string command_id = 1; // AndroidDeviceManager 返回的 QUuid。
+  string serial = 2; // 设备命令的序列号；主机命令为空。
+  repeated string arguments = 3; // 实际传给 adb 的参数列表。
+  bytes standard_output = 4; // 完整 stdout（受 max_output_bytes 限制）。
+  bytes standard_error = 5; // 完整 stderr（受 max_output_bytes 限制）。
+  int32 exit_code = 6; // adb 进程退出码。
+  bool process_crashed = 7; // 进程是否崩溃退出。
+  bool timed_out = 8; // 是否因超时结束。
+  bool canceled = 9; // 是否被调用方取消。
+  bool succeeded = 10; // 命令是否成功完成。
+  AdbErrorCode error_code = 11; // 失败分类。
+  string error_string = 12; // 可读错误文本。
+  int64 duration_ms = 13; // 执行耗时，单位为毫秒。
+}
+
+// scrcpy 媒体启动选项；通过 StartMediaRequest 传入。
+message MediaOptions {
+  optional bool video = 1; // 是否启用视频；默认 true。
+  optional bool audio = 2; // 是否启用音频；默认 true。
+  optional bool control = 3; // 是否启用控制通道；默认 true。
+  optional bool send_device_meta = 4; // 是否发送设备元数据；默认 true。
+  optional bool send_stream_meta = 5; // 是否发送流元数据；默认 true。
+  optional bool send_frame_meta = 6; // 是否发送帧元数据；默认 true。
+  optional bool send_dummy_byte = 7; // 是否发送握手 dummy byte；默认 true。
+  string video_codec = 8; // 视频编码器名称；为空使用 h264。
+  string audio_codec = 9; // 音频编码器名称；为空使用 opus。
+  optional uint32 video_bit_rate = 10; // 视频码率；0 继承 scrcpy 默认值。
+  optional uint32 audio_bit_rate = 11; // 音频码率；0 继承 scrcpy 默认值。
+  optional uint32 max_size = 12; // 最大画面尺寸；0 不限制。
+  optional double max_fps = 13; // 请求的最大帧率；最终还受设备刷新率上限约束。
+  optional int32 max_packet_bytes = 14; // 单包上限；0 继承 ManagerConfig。
+  optional int32 max_buffer_bytes = 15; // 缓冲上限；0 继承 ManagerConfig。
+}
+
+// 编码媒体包；只为旧版 AdbVideoEvent/AdbAudioEvent 的 encoded 字段保留。
+// ADB_InProcessNonUi 新实现不得把该消息发布到 MessageBus。
+message EncodedMediaPacket {
+  string serial = 1; // 设备序列号。
+  uint32 codec_id = 2; // 编解码器 ID。
+  bytes data = 3; // 编码后的媒体数据。
+  int64 timestamp_us = 4; // 媒体时间戳，单位为微秒。
+  uint64 sequence = 5; // 媒体包序号。
+  bool config = 6; // 是否为编解码器配置包。
+  bool key_frame = 7; // 是否为关键帧。
+}
+
+// 解码后的视频帧；作为 AdbVideoEvent 的 frame 负载，对应 videoFrameReady。
+message VideoFrame {
+  string serial = 1; // 设备序列号。
+  uint32 width = 2; // 帧宽度，单位为像素。
+  uint32 height = 3; // 帧高度，单位为像素。
+  string format = 4; // 固定为 QImage::Format_ARGB32。
+  uint32 bytes_per_line = 5; // 每行字节数。
+  bytes pixels = 6; // 按 bytes_per_line 排列的像素数据。
+  int64 timestamp_us = 7; // 帧时间戳，单位为微秒。
+  uint64 sequence = 8; // 帧序号。
+}
+
+// 解码后的 PCM 音频帧；作为 AdbAudioEvent 的 pcm 负载。
+message AudioFrame {
+  string serial = 1; // 设备序列号。
+  bytes pcm = 2; // 交错排列的 PCM 字节。
+  int32 sample_rate = 3; // 采样率，单位为 Hz。
+  int32 channels = 4; // 声道数。
+  int32 bytes_per_sample = 5; // 每个采样点的字节数。
+  int64 timestamp_us = 6; // 音频时间戳，单位为微秒。
+  uint64 sequence = 7; // 音频帧序号。
+}
+
+// 二维坐标；由触控和滚动请求使用。
+message Point {
+  int32 x = 1; // 横坐标，单位为像素。
+  int32 y = 2; // 纵坐标，单位为像素。
+}
+
+// 屏幕尺寸；由触控和滚动请求使用。
+message Size {
+  int32 width = 1; // 屏幕宽度，单位为像素。
+  int32 height = 2; // 屏幕高度，单位为像素。
+}
+
+// scrcpy 显示信息；对应主题：QFRAMEWORK_ADB_DISPLAY_EVENT。
+message DisplayInfo {
+  string serial = 1; // 设备序列号。
+  Size size = 2; // 设备画面尺寸。
+  int32 rotation = 3; // 设备旋转角度。
+  bool client_resized = 4; // 客户端尺寸是否发生变化。
+  double refresh_rate_hz = 5; // 设备刷新率；查询失败填 0，并由实现发布警告后按 60 Hz 回退。
+}
+
+// 媒体统计；作为 AdbMediaEvent 的 statistics 负载。
+message MediaStatistics {
+  string serial = 1; // 设备序列号。
+  uint64 socket_bytes_received = 2; // Socket 接收总字节数。
+  uint64 video_packets = 3; // 视频包数量。
+  uint64 video_bytes = 4; // 视频字节数。
+  uint64 video_frames = 5; // 视频帧数量。
+  uint64 audio_packets = 6; // 音频包数量。
+  uint64 audio_bytes = 7; // 音频字节数。
+  uint64 audio_frames = 8; // 音频帧数量。
+  uint32 video_codec_id = 9; // 当前视频编解码器 ID。
+  uint32 audio_codec_id = 10; // 当前音频编解码器 ID。
+  int64 last_video_timestamp_us = 11; // 最近视频时间戳。
+  int64 last_audio_timestamp_us = 12; // 最近音频时间戳。
+  int64 started_utc_ms = 13; // 会话开始时间，UTC 毫秒。
+  int64 last_updated_utc_ms = 14; // 最近更新时间，UTC 毫秒。
+  int64 connection_uptime_ms = 15; // 连接持续时间，单位为毫秒。
+}
+
+// 设备错误详情；对应主题：QFRAMEWORK_ADB_ERROR_EVENT，也可嵌入应答。
+message DeviceError {
+  string serial = 1; // 发生错误的设备序列号；主机错误为空。
+  AdbErrorCode code = 2; // 错误分类。
+  string message = 3; // 可读错误说明。
+  string command_id = 4; // 关联的 ADB 命令 UUID，可为空。
+  bool recoverable = 5; // 是否允许媒体管理器自动重连。
+}
+
+// ------------------------------ ADB 请求结构 ------------------------------
+// 下面所有 *Request 结构都作为 AdbRequest.operation 的一个分支，统一通过主题
+// QFRAMEWORK_ADB_REQUEST 发送，不为每个函数再创建单独主题。
+
+// 初始化请求；最终调用 CoordinatorWorker/AndroidDeviceManager::initialize。
+// 运行文件路径只能由 ADB 模块从程序目录解析，因此该请求不接受外部字段。
+message InitializeRequest {}
+
+// 查询初始化状态请求；最终调用 AndroidDeviceManager::isInitialized。
+message IsInitializedRequest {}
+
+// 开始监控请求；最终调用 AndroidDeviceManager::startDeviceMonitoring。
+message StartDeviceMonitoringRequest {
+  int32 interval_ms = 1; // 监控周期；0 使用管理器配置。
+}
+
+// 停止监控请求；最终调用 AndroidDeviceManager::stopDeviceMonitoring。
+message StopDeviceMonitoringRequest {}
+
+// 刷新设备请求；最终调用 AndroidDeviceManager::refreshDevices。
+message RefreshDevicesRequest {}
+
+// 查询设备列表请求；最终调用 AndroidDeviceManager::devices。
+message ListDevicesRequest {}
+
+// 查询单个设备请求；最终调用 AndroidDeviceManager::device。
+message GetDeviceRequest {
+  string serial = 1; // 目标设备序列号。
+}
+
+// 启用/停用设备请求；最终调用 AndroidDeviceManager::setDeviceEnabled。
+message SetDeviceEnabledRequest {
+  string serial = 1; // 目标设备序列号。
+  bool enabled = 2; // true 允许设备命令，false 取消命令并停止媒体。
+}
+
+// 查询设备启用状态请求；最终调用 AndroidDeviceManager::isDeviceEnabled。
+message IsDeviceEnabledRequest {
+  string serial = 1; // 目标设备序列号。
+}
+
+// 执行主机级 ADB 请求；最终调用 AndroidDeviceManager::executeHostAdb。
+message ExecuteHostAdbRequest {
+  repeated string arguments = 1; // 每个参数单独传递，不拼接 Shell 字符串。
+  AdbCommandOptions options = 2; // 可选命令选项。
+}
+
+// 执行设备级 ADB 请求；最终调用 AndroidDeviceManager::executeDeviceAdb。
+message ExecuteDeviceAdbRequest {
+  string serial = 1; // 目标设备序列号。
+  repeated string arguments = 2; // 每个参数单独传递。
+  AdbCommandOptions options = 3; // 可选命令选项。
+}
+
+// 写入 ADB 标准输入请求；最终调用 AndroidDeviceManager::writeAdbInput。
+message WriteAdbInputRequest {
+  string command_id = 1; // executeHostAdb/executeDeviceAdb 返回的 UUID。
+  bytes data = 2; // 要写入 stdin 的原始字节。
+}
+
+// 关闭 ADB 标准输入请求；最终调用 AndroidDeviceManager::closeAdbInput。
+message CloseAdbInputRequest {
+  string command_id = 1; // executeHostAdb/executeDeviceAdb 返回的 UUID。
+}
+
+// 取消单个 ADB 命令请求；最终调用 AndroidDeviceManager::cancelAdbCommand。
+message CancelAdbCommandRequest {
+  string command_id = 1; // 要取消的命令 UUID。
+}
+
+// 取消设备全部 ADB 命令请求；最终调用 AndroidDeviceManager::cancelDeviceAdbCommands。
+message CancelDeviceAdbCommandsRequest {
+  string serial = 1; // 目标设备序列号。
+}
+
+// 网络连接请求；最终调用 AndroidDeviceManager::connectNetworkDevice。
+message ConnectNetworkDeviceRequest {
+  string address = 1; // address:port，例如 192.168.1.10:5555。
+}
+
+// 网络断开请求；最终调用 AndroidDeviceManager::disconnectNetworkDevice。
+message DisconnectNetworkDeviceRequest {
+  string address = 1; // address:port，例如 192.168.1.10:5555。
+}
+
+// 安装 APK 请求；最终调用 AndroidDeviceManager::installPackage。
+message InstallPackageRequest {
+  string serial = 1; // 目标设备序列号。
+  string apk_path = 2; // 主机上的 APK 文件路径。
+  bool replace = 3; // 是否追加 adb install -r。
+}
+
+// 卸载应用请求；最终调用 AndroidDeviceManager::uninstallPackage。
+message UninstallPackageRequest {
+  string serial = 1; // 目标设备序列号。
+  string package_name = 2; // Android 包名。
+}
+
+// 执行 shell 请求；最终调用 AndroidDeviceManager::executeShell。
+message ExecuteShellRequest {
+  string serial = 1; // 目标设备序列号。
+  repeated string arguments = 2; // shell 命令及参数，每个元素独立传递。
+  AdbCommandOptions options = 3; // 可选命令选项。
+}
+
+// 推送文件请求；最终调用 AndroidDeviceManager::pushFile。
+message PushFileRequest {
+  string serial = 1; // 目标设备序列号。
+  string local = 2; // 主机源文件路径。
+  string remote = 3; // 设备目标路径。
+}
+
+// 拉取文件请求；最终调用 AndroidDeviceManager::pullFile。
+message PullFileRequest {
+  string serial = 1; // 目标设备序列号。
+  string remote = 2; // 设备源文件路径。
+  string local = 3; // 主机目标路径。
+}
+
+// 重启设备请求；最终调用 AndroidDeviceManager::rebootDevice。
+message RebootDeviceRequest {
+  string serial = 1; // 目标设备序列号。
+  string mode = 2; // 可选模式，例如 bootloader 或 recovery。
+}
+
+// 查询系统属性请求；最终调用 AndroidDeviceManager::querySystemProperties。
+message QuerySystemPropertiesRequest {
+  string serial = 1; // 目标设备序列号。
+}
+
+// 受限的停用设备身份查询；只允许固定 settings get secure android_id 命令。
+message QueryAndroidIdRequest {
+  string serial = 1; // 目标设备序列号；不接受任意 shell 参数。
+}
+
+// 启动 logcat 请求；最终调用 AndroidDeviceManager::startLogcat。
+message StartLogcatRequest {
+  string serial = 1; // 目标设备序列号。
+  repeated string arguments = 2; // logcat 额外参数。
+}
+
+// 端口转发请求；最终调用 AndroidDeviceManager::forwardPort。
+message ForwardPortRequest {
+  string serial = 1; // 目标设备序列号。
+  uint32 local_port = 2; // 主机 TCP 端口，范围 1..65535。
+  uint32 remote_port = 3; // 设备 TCP 端口，范围 1..65535。
+}
+
+// 反向端口转发请求；最终调用 AndroidDeviceManager::reversePort。
+message ReversePortRequest {
+  string serial = 1; // 目标设备序列号。
+  uint32 device_port = 2; // 设备 TCP 端口，范围 1..65535。
+  uint32 local_port = 3; // 主机 TCP 端口，范围 1..65535。
+}
+
+// 启动媒体请求；最终调用 AndroidDeviceManager::startMedia。
+message StartMediaRequest {
+  string serial = 1; // 目标设备序列号。
+  MediaOptions options = 2; // 可选 scrcpy 媒体参数。
+}
+
+// 停止媒体请求；最终调用 AndroidDeviceManager::stopMedia。
+message StopMediaRequest {
+  string serial = 1; // 目标设备序列号。
+}
+
+// 重启媒体请求；最终调用 AndroidDeviceManager::restartMedia。
+message RestartMediaRequest {
+  string serial = 1; // 目标设备序列号。
+}
+
+// 停止全部媒体请求；最终调用 AndroidDeviceManager::stopAllMedia。
+message StopAllMediaRequest {}
+
+// 查询媒体运行状态请求；最终调用 AndroidDeviceManager::isMediaRunning。
+message IsMediaRunningRequest {
+  string serial = 1; // 目标设备序列号。
+}
+
+// 查询活动媒体设备请求；最终调用 AndroidDeviceManager::activeMediaDevices。
+message ActiveMediaDevicesRequest {}
+
+// 查询媒体统计请求；最终调用 AndroidDeviceManager::mediaStatistics。
+message MediaStatisticsRequest {
+  string serial = 1; // 目标设备序列号。
+}
+
+// 点击请求；最终调用 AndroidDeviceManager::tap。
+message TapRequest {
+  string serial = 1; // 目标设备序列号。
+  Point position = 2; // 设备画面坐标。
+  Size screen_size = 3; // 当前设备画面尺寸。
+}
+
+// 滑动请求；最终调用 AndroidDeviceManager::swipe。
+message SwipeRequest {
+  string serial = 1; // 目标设备序列号。
+  Point from = 2; // 起点设备画面坐标。
+  Point to = 3; // 终点设备画面坐标。
+  int32 duration_ms = 4; // 滑动持续时间，单位为毫秒。
+  Size screen_size = 5; // 当前设备画面尺寸。
+}
+
+// 按下触摸请求；最终调用 AndroidDeviceManager::touchDown。
+message TouchDownRequest {
+  string serial = 1; // 目标设备序列号。
+  Point position = 2; // 设备画面坐标。
+  Size screen_size = 3; // 当前设备画面尺寸。
+  uint64 pointer_id = 4; // 多指触控指针 ID。
+}
+
+// 移动触摸请求；最终调用 AndroidDeviceManager::touchMove。
+message TouchMoveRequest {
+  string serial = 1; // 目标设备序列号。
+  Point position = 2; // 设备画面坐标。
+  Size screen_size = 3; // 当前设备画面尺寸。
+  uint64 pointer_id = 4; // 多指触控指针 ID。
+}
+
+// 抬起触摸请求；最终调用 AndroidDeviceManager::touchUp。
+message TouchUpRequest {
+  string serial = 1; // 目标设备序列号。
+  Point position = 2; // 设备画面坐标。
+  Size screen_size = 3; // 当前设备画面尺寸。
+  uint64 pointer_id = 4; // 多指触控指针 ID。
+}
+
+// 滚动请求；最终调用 AndroidDeviceManager::scroll。
+message ScrollRequest {
+  string serial = 1; // 目标设备序列号。
+  Point position = 2; // 设备画面坐标。
+  Point delta = 3; // 横向和纵向滚动增量。
+  Size screen_size = 4; // 当前设备画面尺寸。
+}
+
+// 按键请求；最终调用 AndroidDeviceManager::pressKey。
+message PressKeyRequest {
+  string serial = 1; // 目标设备序列号。
+  int32 android_key_code = 2; // Android KeyEvent keyCode。
+}
+
+// 输入文本请求；最终调用 AndroidDeviceManager::sendText。
+message SendTextRequest {
+  string serial = 1; // 目标设备序列号。
+  string text = 2; // 要输入的文本。
+}
+
+// 设置剪贴板请求；最终调用 AndroidDeviceManager::setDeviceClipboard。
+message SetDeviceClipboardRequest {
+  string serial = 1; // 目标设备序列号。
+  string text = 2; // 剪贴板文本。
+  bool paste = 3; // 是否同时向设备发送粘贴操作。
+}
+
+// ADB 请求总线负载；对应主题：QFRAMEWORK_ADB_REQUEST（调用方 -> ADB_InProcessNonUi）。
+message AdbRequest {
+  string request_id = 1; // 调用方生成的关联 ID；应答会原样返回。
+  reserved 11; // 旧 shutdown 分支字段号；模块停止只能由 ADB_InProcessNonUi::onStop 发起。
+  reserved "shutdown"; // 旧 shutdown 字段名；禁止未来以其他语义复用。
+  oneof operation {
+    InitializeRequest initialize = 10; // 调用 initialize。
+    StartDeviceMonitoringRequest start_device_monitoring = 12; // 调用 startDeviceMonitoring。
+    StopDeviceMonitoringRequest stop_device_monitoring = 13; // 调用 stopDeviceMonitoring。
+    RefreshDevicesRequest refresh_devices = 14; // 调用 refreshDevices。
+    ListDevicesRequest list_devices = 15; // 调用 devices。
+    GetDeviceRequest get_device = 16; // 调用 device。
+    SetDeviceEnabledRequest set_device_enabled = 17; // 调用 setDeviceEnabled。
+    IsDeviceEnabledRequest is_device_enabled = 18; // 调用 isDeviceEnabled。
+    ExecuteHostAdbRequest execute_host_adb = 19; // 调用 executeHostAdb。
+    ExecuteDeviceAdbRequest execute_device_adb = 20; // 调用 executeDeviceAdb。
+    WriteAdbInputRequest write_adb_input = 21; // 调用 writeAdbInput。
+    CloseAdbInputRequest close_adb_input = 22; // 调用 closeAdbInput。
+    CancelAdbCommandRequest cancel_adb_command = 23; // 调用 cancelAdbCommand。
+    CancelDeviceAdbCommandsRequest cancel_device_adb_commands = 24; // 调用 cancelDeviceAdbCommands。
+    ConnectNetworkDeviceRequest connect_network_device = 25; // 调用 connectNetworkDevice。
+    DisconnectNetworkDeviceRequest disconnect_network_device = 26; // 调用 disconnectNetworkDevice。
+    InstallPackageRequest install_package = 27; // 调用 installPackage。
+    UninstallPackageRequest uninstall_package = 28; // 调用 uninstallPackage。
+    ExecuteShellRequest execute_shell = 29; // 调用 executeShell。
+    PushFileRequest push_file = 30; // 调用 pushFile。
+    PullFileRequest pull_file = 31; // 调用 pullFile。
+    RebootDeviceRequest reboot_device = 32; // 调用 rebootDevice。
+    QuerySystemPropertiesRequest query_system_properties = 33; // 调用 querySystemProperties。
+    StartLogcatRequest start_logcat = 34; // 调用 startLogcat。
+    ForwardPortRequest forward_port = 35; // 调用 forwardPort。
+    ReversePortRequest reverse_port = 36; // 调用 reversePort。
+    StartMediaRequest start_media = 37; // 调用 startMedia。
+    StopMediaRequest stop_media = 38; // 调用 stopMedia。
+    RestartMediaRequest restart_media = 39; // 调用 restartMedia。
+    StopAllMediaRequest stop_all_media = 40; // 调用 stopAllMedia。
+    IsMediaRunningRequest is_media_running = 41; // 调用 isMediaRunning。
+    ActiveMediaDevicesRequest active_media_devices = 42; // 调用 activeMediaDevices。
+    MediaStatisticsRequest media_statistics = 43; // 调用 mediaStatistics。
+    TapRequest tap = 44; // 调用 tap。
+    SwipeRequest swipe = 45; // 调用 swipe。
+    TouchDownRequest touch_down = 46; // 调用 touchDown。
+    TouchMoveRequest touch_move = 47; // 调用 touchMove。
+    TouchUpRequest touch_up = 48; // 调用 touchUp。
+    ScrollRequest scroll = 49; // 调用 scroll。
+    PressKeyRequest press_key = 50; // 调用 pressKey。
+    SendTextRequest send_text = 51; // 调用 sendText。
+    SetDeviceClipboardRequest set_device_clipboard = 52; // 调用 setDeviceClipboard。
+    IsInitializedRequest is_initialized = 53; // 调用 isInitialized。
+    QueryAndroidIdRequest query_android_id = 54; // 仅查询已授权在线设备的 android_id。
+  }
+}
+
+// 空应答；用于没有返回值的同步请求；通过 QFRAMEWORK_ADB_RESPONSE 携带。
+message AdbAck {}
+
+// 布尔查询结果；由 isInitialized/isDeviceEnabled/isMediaRunning 返回；通过 QFRAMEWORK_ADB_RESPONSE 携带。
+message AdbBoolResult {
+  bool value = 1; // 查询结果。
+}
+
+// 初始化结果；由 initialize 返回；通过 QFRAMEWORK_ADB_RESPONSE 携带。
+message AdbInitializeResult {
+  bool initialized = 1; // 管理器是否初始化成功。
+}
+
+// 设备列表查询结果；由 devices 返回；通过 QFRAMEWORK_ADB_RESPONSE 携带。
+message AdbDeviceListResult {
+  repeated DeviceInfo devices = 1; // 当前设备快照。
+}
+
+// 单设备查询结果；由 device 返回；通过 QFRAMEWORK_ADB_RESPONSE 携带。
+message AdbDeviceResult {
+  bool found = 1; // 是否找到指定序列号。
+  DeviceInfo device = 2; // 找到时的设备信息。
+}
+
+// 字符串列表查询结果；由 activeMediaDevices 返回；通过 QFRAMEWORK_ADB_RESPONSE 携带。
+message AdbStringListResult {
+  repeated string values = 1; // 查询得到的字符串列表。
+}
+
+// 媒体统计查询结果；由 mediaStatistics 返回；通过 QFRAMEWORK_ADB_RESPONSE 携带。
+message AdbMediaStatisticsResult {
+  MediaStatistics statistics = 1; // 指定设备的统计快照。
+}
+
+// ADB 同步应答；对应主题：QFRAMEWORK_ADB_RESPONSE（ADB_InProcessNonUi -> 调用方）。
+message AdbResponse {
+  string request_id = 1; // 对应 AdbRequest.request_id。
+  bool accepted = 2; // 是否接受并执行该请求。
+  AdbErrorCode error_code = 3; // rejected 时的错误分类。
+  string error_message = 4; // rejected 时的可读错误。
+  string command_id = 5; // 异步 ADB 命令返回的 QUuid；非命令请求为空。
+  oneof result {
+    AdbAck ack = 10; // 无返回值请求的确认。
+    AdbBoolResult bool_result = 11; // 布尔查询结果。
+    AdbInitializeResult initialize = 12; // 初始化结果。
+    AdbDeviceListResult devices = 13; // 设备列表结果。
+    AdbDeviceResult device = 14; // 单设备结果。
+    AdbStringListResult strings = 15; // 字符串列表结果。
+    AdbMediaStatisticsResult media_statistics = 16; // 媒体统计结果。
+  }
+}
+
+// 设备列表变化事件；对应主题：QFRAMEWORK_ADB_DEVICE_EVENT。
+message AdbDeviceSnapshot {
+  repeated DeviceInfo devices = 1; // devicesChanged 的完整快照。
+}
+
+// 单设备状态变化事件；对应主题：QFRAMEWORK_ADB_DEVICE_EVENT。
+message AdbDeviceStateChanged {
+  string serial = 1; // 发生变化的设备序列号。
+  AdbDeviceState state = 2; // deviceStateChanged 的新状态。
+}
+
+// 设备事件；由 devicesChanged/deviceStateChanged 信号转换而来。
+message AdbDeviceEvent {
+  oneof event {
+    AdbDeviceSnapshot snapshot = 1; // 对应 AndroidDeviceManager::devicesChanged。
+    AdbDeviceStateChanged state_changed = 2; // 对应 AndroidDeviceManager::deviceStateChanged。
+  }
+}
+
+// ADB 标准输出/错误输出事件；对应主题：QFRAMEWORK_ADB_COMMAND_OUTPUT。
+message AdbOutputEvent {
+  string serial = 1; // 设备序列号；主机命令为空。
+  string command_id = 2; // 关联的命令 UUID。
+  bytes data = 3; // 本次 readyRead 收到的字节。
+  bool standard_error = 4; // true 对应 adbErrorOutputReady，false 对应 adbOutputReady。
+}
+
+// ADB 命令完成事件；对应主题：QFRAMEWORK_ADB_COMMAND_FINISHED。
+message AdbCommandFinishedEvent {
+  AdbCommandResult result = 1; // 对应 adbCommandFinished 的完整结果。
+}
+
+// 视频事件；对应主题：QFRAMEWORK_ADB_VIDEO_EVENT，实际发布只允许 frame。
+message AdbVideoEvent {
+  oneof payload {
+    EncodedMediaPacket encoded = 1; // 旧协议兼容字段；新实现永远不发布该分支。
+    VideoFrame frame = 2; // 新实现唯一发布分支；对应 videoFrameReady 的 ARGB32 QImage。
+  }
+}
+
+// 音频事件；对应主题：QFRAMEWORK_ADB_AUDIO_EVENT，实际发布只允许 pcm。
+message AdbAudioEvent {
+  oneof payload {
+    EncodedMediaPacket encoded = 1; // 旧协议兼容字段；新实现永远不发布该分支。
+    AudioFrame pcm = 2; // 新实现唯一发布分支；对应 audioPcmReady 的解码 PCM。
+  }
+}
+
+// 显示信息事件；对应主题：QFRAMEWORK_ADB_DISPLAY_EVENT。
+message AdbDisplayEvent {
+  DisplayInfo info = 1; // 对应 displayInfoChanged。
+}
+
+// 媒体状态事件；对应主题：QFRAMEWORK_ADB_MEDIA_EVENT。
+message AdbMediaStateChanged {
+  string serial = 1; // 设备序列号。
+  AdbMediaState state = 2; // 对应 mediaStateChanged。
+}
+
+// 媒体统计事件；对应主题：QFRAMEWORK_ADB_MEDIA_EVENT。
+message AdbMediaStatisticsChanged {
+  MediaStatistics statistics = 1; // 对应 mediaStatisticsChanged。
+}
+
+// 媒体事件；由 mediaStateChanged/mediaStatisticsChanged 信号转换而来。
+message AdbMediaEvent {
+  oneof event {
+    AdbMediaStateChanged state_changed = 1; // 媒体状态变化。
+    AdbMediaStatisticsChanged statistics_changed = 2; // 媒体统计变化。
+  }
+}
+
+// 剪贴板事件；对应主题：QFRAMEWORK_ADB_CLIPBOARD_EVENT；由 clipboardReceived 信号转换而来。
+message AdbClipboardEvent {
+  string serial = 1; // 设备序列号。
+  string text = 2; // 设备剪贴板文本。
+}
+
+// 错误事件；对应主题：QFRAMEWORK_ADB_ERROR_EVENT。
+message AdbErrorEvent {
+  DeviceError error = 1; // 对应 errorOccurred。
 }

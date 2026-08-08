@@ -20,10 +20,11 @@ namespace
 {
 struct QueuedMessage
 {
-    // 消息在总线内部的完整副本；发送者 ID 随数据一起传给订阅模块。
+    // 发送者 ID 随主题一起传给订阅模块；payload 由所有订阅队列共享，
+    // 队列覆盖、拒绝、停止清空和回调结束都会通过引用计数自动释放所有权。
     QString topic;
     QString senderModuleId;
-    QByteArray data;
+    MessagePayload payload;
 };
 
 // 一个模块对应一个消费者线程和一条有界输入队列。
@@ -137,9 +138,10 @@ protected:
             QueuedMessage message;
             {
                 QMutexLocker locker(&mutex_);
-                // 条件变量同时等待“有消息、解除暂停或停止”；beginStop 会唤醒它。
+                // 条件变量同时等待“有消息、解除暂停或停止”；100 ms 是漏唤醒时的
+                // 有界兜底，正常路径仍由 publish/resume/beginStop 的 wakeOne() 即时唤醒。
                 while ((queue_.isEmpty() || paused_) && !stopping_)
-                    available_.wait(&mutex_);
+                    available_.wait(&mutex_, 100);
                 if (queue_.isEmpty() && stopping_)
                     break;
                 if (paused_)
@@ -149,7 +151,9 @@ protected:
 
             try {
                 // 锁已释放，业务回调可以再次 publish，不会形成队列自锁。
-                endpoint_->onMessage(message.topic, message.senderModuleId, message.data);
+                endpoint_->onMessage(message.topic,
+                                     message.senderModuleId,
+                                     *message.payload);
             } catch (const std::exception& exception) {
                 Logger::instance().log(
                     LogLevel::Error,
@@ -421,6 +425,15 @@ bool MessageBus::publishFromModule(const QString& moduleId,
                                    const QString& topic,
                                    const QByteArray& data)
 {
+    // 兼容直接调用宿主旧接口的代码；统一包装后进入共享发布实现。
+    return publishSharedFromModule(moduleId, topic, makeMessagePayload(data));
+}
+
+// 执行发布权限、主题大小和订阅路由检查，再共享同一个不可变载荷引用。
+bool MessageBus::publishSharedFromModule(const QString& moduleId,
+                                         const QString& topic,
+                                         const MessagePayload& payload)
+{
     QMutexLocker locker(&mutex_);
     // 下面所有校验在同一把总线锁内完成，保证注册/关闭不会与广播交错。
     Registration* sender = modules_.value(moduleId, nullptr);
@@ -433,8 +446,13 @@ bool MessageBus::publishFromModule(const QString& moduleId,
         return false;
     }
 
+    if (payload.isNull()) {
+        logRejected(moduleId, QString::fromUtf8(u8"共享消息载荷为空"));
+        return false;
+    }
+
     const TopicConfig effective = topicConfig(topic);
-    if (data.size() > effective.maxMessageBytes) {
+    if (payload->size() > effective.maxMessageBytes) {
         logRejected(moduleId, QString::fromUtf8(u8"消息超过大小上限：%1").arg(topic));
         return false;
     }
@@ -442,7 +460,7 @@ bool MessageBus::publishFromModule(const QString& moduleId,
     QueuedMessage message;
     message.topic = topic;
     message.senderModuleId = moduleId;
-    message.data = data;
+    message.payload = payload;
     bool accepted = true;
     // 每个订阅者独立入队；只要有一个订阅者拒绝，返回值就是 false，
     // 但其他订阅者已经成功接收的消息不会回滚。

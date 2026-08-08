@@ -14,6 +14,7 @@
 #include <QVector>
 
 #include "FrameworkConfig.h"
+#include "MessagePayload.h"
 #include "QFrameworkGlobal.h"
 
 namespace qframework
@@ -147,7 +148,7 @@ private:
     bool enqueueMessageToChild(const QString& moduleId,
                                const QString& topic,
                                const QString& senderModuleId,
-                               const QByteArray& data);
+                               const MessagePayload& payload);
     // 处理子进程 deliveryAck，并回收在途计数及可选共享内存。
     void acknowledgeChildMessage(Entry* entry,
                                  const QString& messageId,

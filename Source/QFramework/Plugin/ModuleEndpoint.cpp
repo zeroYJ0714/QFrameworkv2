@@ -62,6 +62,16 @@ void ModuleEndpoint::onMessage(const QString& topic,
 // 返回 false 只说明宿主未绑定、模块未运行或下游拒绝；本层不缓存消息。
 bool ModuleEndpoint::publish(const QString& topic, const QByteArray& data)
 {
+    // 旧接口只在入口创建一次共享对象，后续总线和订阅队列不再复制 QByteArray 对象。
+    return publishShared(topic, makeMessagePayload(data));
+}
+
+// 将调用方提供的不可变载荷交给当前宿主；本层只读取生命周期快照，不缓存载荷。
+bool ModuleEndpoint::publishShared(const QString& topic, const MessagePayload& payload)
+{
+    if (payload.isNull())
+        return false;
+
     ModuleHost* host = nullptr;
     QString id;
     {
@@ -74,7 +84,7 @@ bool ModuleEndpoint::publish(const QString& topic, const QByteArray& data)
     }
 
     // 宿主调用可能进入总线或本地发送队列，因此不能持有 mutex_。
-    return host->publishFromModule(id, topic, data);
+    return host->publishSharedFromModule(id, topic, payload);
 }
 
 // 与 publish 使用同一把 mutex_ 读取运行态，不增加 ABI 数据成员。

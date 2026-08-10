@@ -17,6 +17,7 @@
 class QAction;
 class QActionGroup;
 class QByteArray;
+class QCloseEvent;
 class QEvent;
 class QLabel;
 class QMenu;
@@ -109,6 +110,8 @@ private slots:
     void closeWindow();
 
 protected:
+    // 应用退出前按配置顺序询问已加载的主进程 UI 模块；任一拒绝都保持窗口。
+    void closeEvent(QCloseEvent* event) override;
     // WindowStateChange 到达后同步标题栏的最大化/还原图标。
     void changeEvent(QEvent* event) override;
     // Windows 无边框窗口的命中测试；非 Windows 平台走 QWidget 默认实现。
@@ -134,6 +137,7 @@ private:
                                  VisibilityOrigin origin);
     void applyRequestedDockVisibility(const QString& moduleId,
                                       VisibilityOrigin origin);
+    bool canHideModule(const QString& moduleId) const;
     void syncModuleAction(const QString& moduleId);
     void updateStatusSummary();
     void reportStateFailure(const QString& title, const QString& detail);

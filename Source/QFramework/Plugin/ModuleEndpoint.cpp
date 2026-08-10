@@ -48,6 +48,14 @@ void ModuleEndpoint::onStop()
 {
 }
 
+// 普通模块没有界面草稿，因此默认不阻止 Dock 隐藏或应用退出。
+// 该回调只由 MainWindow 的 GUI 线程调用，基类不增加跨线程状态。
+bool ModuleEndpoint::canClose(ModuleCloseReason reason)
+{
+    Q_UNUSED(reason)
+    return true;
+}
+
 // 默认消息处理器明确忽略全部参数；只发布、不订阅的模块无需实现空槽。
 void ModuleEndpoint::onMessage(const QString& topic,
                                const QString& senderModuleId,

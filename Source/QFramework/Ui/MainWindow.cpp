@@ -2,6 +2,7 @@
 
 #include <QAction>
 #include <QActionGroup>
+#include <QCloseEvent>
 #include <QEvent>
 #include <QFileDialog>
 #include <QGuiApplication>
@@ -923,9 +924,47 @@ void MainWindow::setRequestedDockVisible(const QString& moduleId,
 {
     if (!moduleDocks_.contains(moduleId))
         return;
+    if (!visible &&
+        (origin == VisibilityOrigin::UserAction ||
+         origin == VisibilityOrigin::CloseButton) &&
+        !canHideModule(moduleId)) {
+        // QAction 在 triggered(false) 前已经变成未勾选；保持原显示意图并立即
+        // 回写，避免取消关闭后菜单状态与仍可见的 Dock 不一致。
+        syncModuleAction(moduleId);
+        return;
+    }
     requestedDockVisibility_.insert(moduleId, visible);
     syncModuleAction(moduleId);
     applyRequestedDockVisibility(moduleId, origin);
+}
+
+// ProcessUi 没有同进程 QWidget 接口，继续沿用原关闭行为；只有已经加载的
+// InProcessUi 模块可能通过 canClose(Hide) 拒绝丢弃本地草稿。
+bool MainWindow::canHideModule(const QString& moduleId) const
+{
+    if (pluginManager_ == nullptr)
+        return true;
+    InProcessUiModule* module = pluginManager_->uiModule(moduleId);
+    return module == nullptr || module->canClose(ModuleCloseReason::Hide);
+}
+
+// 顶层窗口关闭是模块停止之前唯一仍可让用户保存草稿的边界。按配置顺序调用
+// 已加载 UI 插件；取消、保存失败或保存超时都会忽略本次退出事件。
+void MainWindow::closeEvent(QCloseEvent* event)
+{
+    if (pluginManager_ != nullptr) {
+        for (const ModuleConfig& config : modules_) {
+            if (!config.enabled || config.type != ModuleType::InProcessUi)
+                continue;
+            InProcessUiModule* module = pluginManager_->uiModule(config.id);
+            if (module != nullptr &&
+                !module->canClose(ModuleCloseReason::ApplicationExit)) {
+                event->ignore();
+                return;
+            }
+        }
+    }
+    QMainWindow::closeEvent(event);
 }
 
 // 实际显示必须同时满足“用户希望显示”和“模块界面已经 ready”。

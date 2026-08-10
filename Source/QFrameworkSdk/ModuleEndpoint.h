@@ -17,6 +17,14 @@ namespace qframework
 {
 class ModuleEndpoint;
 
+// 框架只区分“隐藏一个 Dock”和“退出整个应用”两种用户关闭意图。
+// 该枚举不携带 QWidget，非 UI 模块仍可继承同一端点而不依赖界面实现。
+enum class ModuleCloseReason
+{
+    Hide,
+    ApplicationExit
+};
+
 // ModuleHost 是框架侧接口：主进程由 MessageBus 实现，子进程由 RuntimeHost 实现。
 // 模块只借用该对象，不能保存到框架生命周期之外，也不能主动 delete。
 class QFRAMEWORK_EXPORT ModuleHost
@@ -61,6 +69,9 @@ public:
     virtual bool onStart();
     // 停止回调在框架停止接受新消息后执行；应尽快返回。
     virtual void onStop();
+    // GUI 线程在可能丢失界面草稿前调用。默认允许关闭；有未保存内容的
+    // UI 模块可以同步显示确认框，并用有界 Qt 事件循环等待一次保存结果。
+    virtual bool canClose(ModuleCloseReason reason);
     // 异步消息回调。输入 data 是本次消息的副本，模块不拥有传输层资源。
     virtual void onMessage(const QString& topic,
                            const QString& senderModuleId,

@@ -127,7 +127,7 @@
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="Protos\master_message.proto">
-      <Message>生成统一 QFramework/ADB Protobuf C++ 源码</Message>
+      <Message>生成 QFramework Protobuf C++ 源码</Message>
       <Command>"$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe" --proto_path="$(ProjectDir)Protos" --cpp_out=dllexport_decl=QFRAMEWORK_PROTOCOLS_EXPORT:"$(ProjectDir)Generated" "%(FullPath)"</Command>
       <Outputs>$(ProjectDir)Generated\master_message.pb.cc;$(ProjectDir)Generated\master_message.pb.h;%(Outputs)</Outputs>
       <AdditionalInputs>$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe;%(AdditionalInputs)</AdditionalInputs>

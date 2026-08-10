@@ -21,7 +21,13 @@ ManagedDockWidget::ManagedDockWidget(const QString& title,
 // QDockWidget 的 visibilityChanged(false) 也可能来自标签切换，不能代表用户关闭。
 void ManagedDockWidget::closeEvent(QCloseEvent* event)
 {
+    // 先拒绝 QDockWidget 自己的立即关闭。MainWindow 收到同步信号后会询问
+    // 对应 UI 模块；只有模块同意，统一可见性入口才真正 hide 当前 Dock。
+    event->ignore();
     emit closeRequested();
-    QDockWidget::closeEvent(event);
+    // closeRequested 使用同线程直连。允许关闭时 MainWindow 已经 hide，重新接受
+    // 事件可保持 QWidget::close() 的 true 返回契约；veto 时仍可见并保持 ignore。
+    if (!isVisible())
+        event->accept();
 }
 }

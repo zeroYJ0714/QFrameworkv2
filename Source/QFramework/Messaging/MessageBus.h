@@ -1,8 +1,18 @@
 #pragma once
 
-// 文件职责：定义中央消息总线的公开管理接口。
-// MessageBus 不直接调用订阅者，而是为每个注册模块创建独立 ModuleQueue，
-// 这样一个慢模块只影响自己的容量和统计。
+// 初学者阅读提示：MessageBus 是进程内的“邮局”。模块 publish 一条消息后，总线
+// 根据主题声明把同一个 Qt 值载荷分别放进每个订阅模块的专属 ModuleQueue；模块
+// 自己的队列线程再串行调用 onMessage。一个模块处理慢，只会耗尽自己的容量。
+//
+// 两种队列策略：Reliable 满时拒绝新消息，旧消息一条不覆盖；Latest 满时只删除
+// 同主题最老的等待项，再保留最新项，其他主题和顺序不受影响。ModuleQueueStats
+// 的 delivered/dropped/rejected 分别记录已回调、策略丢弃、准入拒绝，拒绝日志另按
+// “模块+原因”每秒限频，不改变 rejected 计数和队列行为。
+//
+// 线程与所有权：MessageBus 的注册表由 mutex_ 保护；每个 ModuleQueue 是一条 QThread，
+// endpoint 是借用指针，Registration/queue 由 MessageBus 创建并回收。停止先禁止发布，
+// 再唤醒队列；所有等待有总 deadline，超时模块会 quarantine，不能被立即删除，避免
+// 正在执行的 onMessage 使用悬空对象。没有 BlockingQueuedConnection。
 
 #include <QHash>
 #include <QMutex>
@@ -85,14 +95,25 @@ public:
 
 private:
     struct Registration;
+    struct RejectionLogState
+    {
+        // 所有字段只在 MessageBus::mutex_ 保护下访问；重复拒绝只累计，不创建
+        // 新线程或等待磁盘，下一次允许记录时把 suppressed 合并到一条摘要日志。
+        qint64 lastLoggedUtcMs = 0;
+        quint64 suppressed = 0;
+    };
 
     TopicConfig topicConfig(const QString& topic) const;
+    // 调用方已持有 mutex_；日志本身仍走 Logger 的异步队列，避免每次拒绝同步写盘。
     void logRejected(const QString& moduleId, const QString& reason) const;
 
     // mutex_ 保护模块注册表和 accepting/deliveryEnabled 状态。
     MessageBusConfig config_;
     mutable QMutex mutex_;
     QHash<QString, Registration*> modules_;
+    // key 是“模块 + 原因”的稳定组合；1 秒窗口内不重复输出 Warning，但 rejected
+    // 统计仍由 ModuleQueue 每次拒绝递增，可靠/最新消息策略完全不受影响。
+    mutable QHash<QString, RejectionLogState> rejectionLogs_;
     bool accepting_;
     bool deliveryEnabled_;
     bool stopQueuesRequested_;

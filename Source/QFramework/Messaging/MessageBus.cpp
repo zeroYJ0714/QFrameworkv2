@@ -1,6 +1,7 @@
 #include "MessageBus.h"
 
 #include <QDeadlineTimer>
+#include <QDateTime>
 #include <QMutexLocker>
 #include <QQueue>
 #include <QSet>
@@ -13,6 +14,11 @@
 
 // 本文件的两个层次：ModuleQueue 负责一个模块的线程安全输入队列，
 // MessageBus 负责注册、权限检查、广播和全局关闭顺序。
+//
+// 发布链路是：publishFromModule()/publishSharedFromModule() 在 mutex_ 内校验
+// accepting、发送权限、主题大小 -> 逐个调用订阅者 ModuleQueue::enqueue() ->
+// enqueue 只短暂持锁并 wakeOne -> run() 锁外调用 endpoint->onMessage()。
+// 这样业务回调可以再次 publish，不会形成总线自锁；停止时条件变量也会被唤醒。
 
 namespace qframework
 {
@@ -43,6 +49,8 @@ public:
     }
 
     // 按主题容量入队：Reliable 满时拒绝，Latest 满时删除同主题最旧等待项。
+    // 注意容量按 topic 分别计算，不是整个模块所有主题共用一个数字；因此视频 Latest
+    // 不会占掉 SQL Reliable 的槽位。payload 是共享不可变值，覆盖/清空后自动释放。
     bool enqueue(const QueuedMessage& message, const TopicConfig& config)
     {
         QMutexLocker locker(&mutex_);
@@ -104,7 +112,8 @@ public:
         available_.wakeOne();
     }
 
-    // 只做一次有界等待；超时表示回调仍在执行，调用方不得删除本 QThread。
+    // 只做一次有界等待；超时表示回调仍在执行，调用方不得删除本 QThread，也不能
+    // 为了“快点退出”调用 terminate。调用方应把该 Registration 留在 quarantine。
     ModuleQueueStopResult finishStop(int timeoutMs)
     {
         if (isFinished() ||
@@ -499,6 +508,25 @@ TopicConfig MessageBus::topicConfig(const QString& topic) const
 // 统一记录发布拒绝原因，保持调用点的错误文字和来源格式一致。
 void MessageBus::logRejected(const QString& moduleId, const QString& reason) const
 {
-    Logger::instance().log(LogLevel::Warning, moduleId, reason);
+    // 日志限频只针对 Warning 文本，不改变真正的 rejected 统计，也不改变 Reliable
+    // 拒绝或 Latest 覆盖。窗口内首条立即记录，重复项只累计次数，下一条日志再附带
+    // “此前 N 次相同拒绝已限频”，帮助初学者看出错误是否持续发生。
+    constexpr qint64 kLogIntervalMs = 1000;
+    const QString key = moduleId + QChar(0x1f) + reason;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    RejectionLogState& state = rejectionLogs_[key];
+    if (state.lastLoggedUtcMs > 0
+        && now - state.lastLoggedUtcMs < kLogIntervalMs) {
+        ++state.suppressed;
+        return;
+    }
+    QString text = reason;
+    if (state.suppressed > 0) {
+        text += QString::fromUtf8(u8"（此前 %1 次相同拒绝已限频）")
+                    .arg(state.suppressed);
+        state.suppressed = 0;
+    }
+    state.lastLoggedUtcMs = now;
+    Logger::instance().log(LogLevel::Warning, moduleId, text);
 }
 }

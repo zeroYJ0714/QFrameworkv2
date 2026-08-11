@@ -13,6 +13,11 @@
 
 // 日志数据流：调用线程 -> Worker::queue_ -> batch -> QFile。
 // 只有 Worker 线程操作 QFile，因此不会出现多个业务线程同时 flush 的竞态。
+//
+// 初学者阅读提示：Logger::log() 不写磁盘，只把 QString/QDateTime 等值复制进有锁队列；
+// Logger::Worker::run() 每次搬走一批，在自己的线程打开/滚动/flush QFile。flush() 用
+// serial+条件变量等待“至少调用前的记录已经 flush”，stop() 先从 Logger 摘除 Worker，
+// 最多等待 5 秒；超时不删除仍在写文件的线程，而是等 finished 后由 deleteLater 回收。
 
 namespace qframework
 {
@@ -95,20 +100,20 @@ public:
         }
     }
 
-    // 唤醒 Worker 写完尾部队列并等待有限时间；极端卡死时才终止线程兜底。
-    void stopAndWait()
+    // 唤醒 Worker 写完尾部队列并等待最多 5 秒。超时只把所有权交给 finished
+    // 自清理，绝不强制终止可能仍持有 QFile/互斥锁的线程。
+    bool stopAndWait()
     {
         {
             QMutexLocker locker(&mutex_);
             // stop 唤醒正常等待和“空队列但即将停止”的分支，让 run() 做完
-            // 最后一批后退出；wait 的两个阶段都有限时。
+            // 最后一批后退出；调用线程只做一次固定上限等待。
             stopping_ = true;
             available_.wakeAll();
         }
-        if (!wait(5000)) {
-            terminate();
-            wait(1000);
-        }
+        // wait 只等待 Worker 自然 finished；强制终止线程会破坏 QFile 和互斥锁的
+        // 生命周期，因此这里明确禁止。run() 会在写完最后一批并 flush 后自行退出。
+        return wait(5000);
     }
 
 protected:
@@ -342,10 +347,16 @@ void Logger::stop()
         worker_ = nullptr;
     }
     if (worker != nullptr) {
+        // worker_ 先置空后，新的 log() 会安全丢弃，而当前 stop 仍可独占旧 Worker。
         // 先从共享指针中摘除 Worker，阻止新的 log() 把记录交给正在停止的线程，
-        // 再等待其写尾并删除对象。
-        worker->stopAndWait();
-        delete worker;
+        // 再等待其写尾。超时后 Worker 仍独占自己的 QFile 和队列，未来自然结束时
+        // 在创建线程通过 deleteLater 回收；Logger::stop() 本身仍在 5 秒内返回。
+        const QMetaObject::Connection finishedCleanup = QObject::connect(
+            worker, &QThread::finished, worker, &QObject::deleteLater);
+        if (worker->stopAndWait()) {
+            QObject::disconnect(finishedCleanup);
+            delete worker;
+        }
     }
 }
 

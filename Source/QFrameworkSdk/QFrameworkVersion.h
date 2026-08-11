@@ -6,6 +6,7 @@
 
 namespace qframework
 {
-// 返回静态存储的版本字符串，调用方不需要释放，也不应修改返回内容。
+/// @brief 查询当前 QFramework 二进制版本。
+/// @return 指向静态只读、以 NUL 结尾的版本字符串；调用方不得释放或修改。
 QFRAMEWORK_EXPORT const char* frameworkVersion();
 }

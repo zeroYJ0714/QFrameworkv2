@@ -14,9 +14,12 @@ class QFRAMEWORK_EXPORT ProcessUiModule : public QWidget, public ModuleEndpoint
     Q_OBJECT
 
 public:
-    // 窗口对象由模块创建，ProcessRuntime 负责在生命周期边界显示和停止。
+    /// @brief 创建子进程 QWidget 模块基类；参数：parent 是可选父控件；返回值：无。
+    /// @param parent Qt 父对象或父控件；用于建立所有权关系，允许为空。
+    /// @return 无。
     explicit ProcessUiModule(QWidget* parent = nullptr);
-    // 释放窗口资源；父进程只保存句柄，不拥有这个 QWidget。
+    /// @brief 释放子进程窗口资源；参数：无；返回值：无。
+    /// @return 无。
     ~ProcessUiModule() override;
 };
 }

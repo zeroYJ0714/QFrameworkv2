@@ -1,3 +1,6 @@
+// 文件职责：编码和解析进程间控制帧、认证帧、心跳帧以及 Latest/Reliable 消息帧。
+// 本文件只处理 QByteArray 和协议结构，不创建线程、Socket 或 QWidget；调用方负责决定
+// 帧进入哪个队列。解析失败返回明确错误，长度字段和 payload 上限在这里统一校验。
 #include "ProcessProtocol.h"
 
 #include <QDataStream>

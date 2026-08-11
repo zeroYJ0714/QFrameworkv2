@@ -1,3 +1,7 @@
+// 文件职责：实现插件基类与 ModuleHost 之间的生命周期和发布适配。
+// ModuleEndpoint 不拥有宿主，只保存受互斥量保护的指针、running 标志和模块 ID；
+// 只有绑定宿主且进入 Running 后才允许 publish/log。停止时先关闭发布入口，再由宿主等待已接收
+// 消息结束；所有跨线程调用通过 Qt/宿主提供的安全入口，不直接触碰 MessageBus 内部队列。
 #include "ModuleEndpoint.h"
 
 #include <QMutexLocker>
@@ -77,6 +81,8 @@ bool ModuleEndpoint::publish(const QString& topic, const QByteArray& data)
 // 将调用方提供的不可变载荷交给当前宿主；本层只读取生命周期快照，不缓存载荷。
 bool ModuleEndpoint::publishShared(const QString& topic, const MessagePayload& payload)
 {
+    // 先检查共享载荷非空，再在锁内复制宿主指针/模块 ID；调用宿主时释放 mutex，
+    // 因为宿主可能回调总线或再次进入本端点，持锁会造成自锁。
     if (payload.isNull())
         return false;
 
@@ -129,6 +135,8 @@ void ModuleEndpoint::logError(const QString& text)
 // 框架在注册时绑定，在注销时传入空 ID/nullptr 解除绑定。
 void ModuleEndpoint::bindHost(const QString& moduleId, ModuleHost* host)
 {
+    // bindHost 是注册/注销边界，不转移 host 所有权；传入空指针表示解绑，之后 publish
+    // 会立即失败，避免调用已经销毁的 MessageBus/RuntimeHost。
     QMutexLocker locker(&mutex_);
     // 绑定和解绑都在生命周期边界发生；解绑后后续 publish 立即返回 false。
     moduleId_ = moduleId;

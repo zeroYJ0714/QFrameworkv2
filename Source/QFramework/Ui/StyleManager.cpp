@@ -1,3 +1,6 @@
+// 文件职责：加载并应用 QFramework 的 Qt 样式表、字体和高 DPI 相关界面设置。
+// StyleManager 只在 GUI 线程访问 QApplication/QWidget；它保存的是样式值和路径，不拥有
+// 插件窗口，也不在样式切换时触碰 MessageBus、ADB 或 SQLite。
 #include "StyleManager.h"
 
 #include <QApplication>

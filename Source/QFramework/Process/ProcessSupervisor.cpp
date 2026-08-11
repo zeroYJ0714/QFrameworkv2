@@ -1,3 +1,8 @@
+// 文件职责：监督 ProcessUi/ProcessNonUi 子进程及其本地 IPC。
+// 本类拥有 QProcess、QLocalServer、QLocalSocket 和共享内存对象，全部在监督器线程创建/使用/销毁；
+// 注册、认证、心跳、Latest/Reliable 队列、窗口嵌入和停止状态都由同一状态机推进。
+// 每个请求有独立 deadline，整体 shutdown 还有总预算；子进程不响应时报告 fault/timeout 并自然回收，
+// 不在 GUI 线程同步等待，也不调用强制终止线程的方式破坏 Qt 对象生命周期。
 #include "ProcessSupervisor.h"
 
 #include <QCoreApplication>
@@ -335,6 +340,10 @@ ProcessSupervisor::~ProcessSupervisor()
 bool ProcessSupervisor::startAll(const QVector<ModuleConfig>& modules,
                                   QStringList* errors)
 {
+    // 启动批次只接受配置中启用的 ProcessUi/ProcessNonUi，逐个创建 Entry 并异步启动；
+    // 返回值表示请求是否全部被接受，真正 Running/Failed 结果通过批次信号给出。
+    // Supervisor 属于框架线程，QProcess、QLocalSocket 和子进程窗口控制帧都在此线程
+    // 串行处理。心跳定时器只推进状态机，不在 timeout 槽中同步等待进程。
     if (errors != nullptr)
         errors->clear();
     if (startupBatchActive_) {
@@ -390,6 +399,8 @@ bool ProcessSupervisor::restart(const QString& moduleId, QString* errorMessage)
 // 停止请求关闭入口并发送 stop 后立即返回，QProcess 信号继续推进状态。
 bool ProcessSupervisor::requestStop(const QString& moduleId, QString* errorMessage)
 {
+    // stop 是非阻塞状态转换：先关闭父子消息入口，再发送 stop 控制帧；QProcess 的
+    // ACK、退出、超时和故障由后续信号/心跳推进，不让 GUI 卡在某个子进程上。
     Entry* entry = findEntry(moduleId);
     if (entry == nullptr) {
         if (errorMessage != nullptr)
@@ -411,6 +422,8 @@ bool ProcessSupervisor::requestStop(const QString& moduleId, QString* errorMessa
 // 手动重启只启动状态转换；重复点击不会创建第二轮 generation。
 bool ProcessSupervisor::requestRestart(const QString& moduleId, QString* errorMessage)
 {
+    // restart 复用同一个 Entry；运行中先完整 stop，退出后才按延迟创建新 QProcess，
+    // 避免旧 Socket、窗口句柄和新一代运行时混在一起。
     Entry* entry = findEntry(moduleId);
     if (entry == nullptr) {
         if (errorMessage != nullptr)
@@ -541,6 +554,8 @@ bool ProcessSupervisor::terminate(const QString& moduleId)
 // 先并行发送 stop，再用一个总 QDeadlineTimer 收尾，期间不泵送普通 GUI 事件。
 void ProcessSupervisor::shutdown()
 {
+    // 全局关闭先并行向所有子进程发 stop，再用一份总 deadline 等 ACK/进程退出；
+    // 预算耗尽后统一升级为 terminate/kill，仍不调用 QThread::terminate。
     if (shuttingDown_)
         return;
     shuttingDown_ = true;
@@ -1558,6 +1573,8 @@ void ProcessSupervisor::closeEntryIngress(Entry* entry)
 // 建立单个 Entry 的停止 deadline；函数不等待 QProcess 或 Socket。
 void ProcessSupervisor::beginStopEntry(Entry* entry, StopPurpose purpose)
 {
+    // 单个 Entry 的固定顺序是：关闭父/子消息入口 -> 建立 deadline -> 发送 stop ->
+    // 等 ACK -> 等进程退出 -> 按目的决定 Stopped、Failed 或 Restarting。
     if (entry == nullptr)
         return;
     entry->stopPurpose = purpose;
@@ -1607,6 +1624,8 @@ void ProcessSupervisor::advanceStopEntry(Entry* entry)
 // QProcess 已退出后清理本轮资源，并按 StopPurpose 决定停止、失败或下一次启动。
 void ProcessSupervisor::finishEntryAfterProcessExit(Entry* entry, const QString& detail)
 {
+    // QProcess 真正退出后才能销毁 Runtime。若 pendingStart 仍为 true，转入 RestartDelay；
+    // 否则发布最终 Stopped/Failed 并清除 operationBusy，等待方由状态信号唤醒。
     if (entry == nullptr)
         return;
     const StopPurpose purpose = entry->stopPurpose;

@@ -1,3 +1,6 @@
+// 文件职责：保存和恢复主窗口 Dock/Tab 布局，并处理版本化布局键。
+// QSettings、QMainWindow 和 QDockWidget 只在 GUI 线程访问；布局管理器不拥有 Dock 或插件，
+// 恢复失败时保留 Qt 默认布局并返回错误，避免破坏用户当前窗口状态。
 #include "LayoutManager.h"
 
 #include <QDockWidget>

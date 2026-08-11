@@ -24,11 +24,20 @@ enum class FrameResult
 };
 
 // 把一个 JSON 对象编码成可直接写入 QLocalSocket 的完整帧。
+/// @brief 执行 `encodeFrame` 所定义的类职责。
+/// @param object 用于反查所属记录的 QObject 指针。
+/// @return 返回对应 Qt 值或容器的安全副本。
 QFRAMEWORK_EXPORT QByteArray encodeFrame(const QJsonObject& object);
 // 从累计缓冲区最多取出一帧；成功后会移除已消费字节。
+/// @brief 执行 `takeFrame` 所定义的类职责。
+/// @param buffer 传给该操作的 `buffer` 参数；取值应符合声明类型和函数用途。
+/// @param object 用于反查所属记录的 QObject 指针。
+/// @param maxFrameBytes 传给该操作的 `maxFrameBytes` 参数；取值应符合声明类型和函数用途。
+/// @param errorMessage 可选错误说明输出参数。
+/// @return 返回声明类型的结果值。
 QFRAMEWORK_EXPORT FrameResult takeFrame(QByteArray* buffer,
                                         QJsonObject* object,
                                         int maxFrameBytes,
-                                        QString* errorMessage = nullptr);
+                                        QString* errorMessage = nullptr); ///< `errorMessage` 对应的对象指针；所有权和线程归属见本类文件级说明。
 }
 }

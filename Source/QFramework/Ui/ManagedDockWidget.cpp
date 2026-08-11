@@ -1,3 +1,7 @@
+// 文件职责：提供带统一标题栏/可见意图的 QDockWidget 包装。
+// 对象归 GUI 主窗口所有；关闭按钮只改变 requestedVisible/隐藏状态，不销毁插件和业务线程。
+// Dock ready、标签页切换、布局恢复和模块菜单都通过 MainWindow 的 Qt 信号槽协调，避免在
+// QDockWidget 事件中直接访问 MessageBus 或跨线程模块对象。
 #include "ManagedDockWidget.h"
 
 #include <QCloseEvent>

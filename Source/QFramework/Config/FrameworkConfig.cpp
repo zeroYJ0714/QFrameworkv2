@@ -1,3 +1,6 @@
+// 文件职责：读取和校验 QFramework 的本地配置文件，并生成模块/进程运行配置。
+// 配置对象是值类型，解析过程不创建 UI、QProcess 或数据库连接；调用方在 GUI/框架线程
+// 取得副本后再把具体工作交给对应 Worker。错误通过返回值和 QString 输出，不抛出异常。
 #include "FrameworkConfig.h"
 
 #include <QDir>

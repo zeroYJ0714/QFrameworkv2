@@ -1,3 +1,6 @@
+// 文件职责：组装 QFramework 主进程的核心对象，包括配置、日志、MessageBus、插件管理
+// 和子进程监督器，并推进启动/停止状态机。FrameworkRuntime 通常由 GUI 主线程拥有；
+// 它不越过对象线程边界直接访问插件 QWidget，关闭时按固定顺序停止消息入口、插件和进程。
 #include "FrameworkRuntime.h"
 
 #include <QApplication>

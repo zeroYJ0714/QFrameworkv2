@@ -1,3 +1,6 @@
+// 文件职责：实现自定义窗口标题栏的拖动、最小化、最大化和关闭按钮。
+// 所有 QWidget、鼠标事件和 QAction 都只在 GUI 线程处理；标题栏不拥有业务模块，关闭
+// 请求交给 MainWindow 的统一保存/放弃/取消流程，避免直接销毁未保存的插件界面。
 #include "WindowTitleBar.h"
 
 #include <QAbstractButton>

@@ -1,3 +1,6 @@
+// 文件职责：实现进程模块侧的运行时宿主、认证握手、心跳和父子进程消息转发。
+// QLocalSocket、共享内存和进程端 QTimer 只在该运行时线程使用；本类不拥有父进程的
+// Supervisor，只借用连接并在断开/超时/停止时关闭自己的入口，所有消息按协议保留原始字节。
 #include "ProcessRuntime.h"
 
 #include <QCoreApplication>

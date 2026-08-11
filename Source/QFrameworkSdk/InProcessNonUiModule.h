@@ -14,9 +14,12 @@ class QFRAMEWORK_EXPORT InProcessNonUiModule : public QObject, public ModuleEndp
     Q_OBJECT
 
 public:
-    // parent 由插件管理器决定；模块通常不需要自己管理 QObject 生命周期。
+    /// @brief 创建主进程无界面模块基类；参数：parent 是 Qt 所有者；返回值：无。
+    /// @param parent Qt 父对象或父控件；用于建立所有权关系，允许为空。
+    /// @return 无。
     explicit InProcessNonUiModule(QObject* parent = nullptr);
-    // 虚析构保证通过 ModuleEndpoint 指针销毁派生模块时行为正确。
+    /// @brief 通过虚析构完整释放派生模块和 QObject 子对象；参数：无；返回值：无。
+    /// @return 无。
     ~InProcessNonUiModule() override;
 };
 }

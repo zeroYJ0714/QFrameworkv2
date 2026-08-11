@@ -1,3 +1,6 @@
+// 文件职责：显示模块启用状态、启动状态和错误信息，并把用户操作交给 FrameworkRuntime。
+// 对话框及其控件只在 GUI 线程使用；它不直接加载 DLL、执行 QProcess 或修改 MessageBus，
+// 所有权由调用方通过 parent 管理，关闭只结束对话框，不擅自停止正在运行的模块。
 #include "ModuleManagerDialog.h"
 
 #include <QHeaderView>

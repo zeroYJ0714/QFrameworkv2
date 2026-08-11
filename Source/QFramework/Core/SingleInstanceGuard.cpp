@@ -1,3 +1,6 @@
+// 文件职责：用 QLocalServer/QLocalSocket 实现单实例门禁和重复启动通知。
+// 所有 socket 只在创建该对象的 GUI/主线程使用；server 由本对象拥有，重复实例只发送
+// 一次唤醒消息后退出。析构时关闭监听并释放本地 IPC 名称，不强杀其他进程。
 #include "SingleInstanceGuard.h"
 
 #include <QCryptographicHash>

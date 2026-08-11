@@ -1,3 +1,7 @@
+// 文件职责：把框架模块状态映射为菜单、Dock、状态栏和模块管理对话框。
+// MainWindow 只在 GUI 线程使用 QWidget/QAction/QTimer；插件加载、MessageBus 和子进程监督由
+// 其他对象完成，本类通过 Qt 信号槽接收状态。关闭流程先询问各模块 canClose，再在 5 秒内等待保存
+// 结果；取消、失败或超时必须拒绝 closeEvent，避免用户编辑内容被静默丢弃。
 #include "MainWindow.h"
 
 #include <QAction>

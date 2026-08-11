@@ -1,3 +1,6 @@
+// 文件职责：发现、加载、注册和卸载进程内 Qt 插件，并把模块主题交给 MessageBus。
+// QPluginLoader 和插件对象由 PluginManager 所在线程拥有；插件 onStart/onStop/onMessage
+// 不在这里跨线程直接调用，关闭时先停止发布入口，再等待消息队列按有界流程收尾。
 #include "PluginManager.h"
 
 #include <QFileInfo>

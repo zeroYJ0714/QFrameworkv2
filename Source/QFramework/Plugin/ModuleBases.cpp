@@ -1,3 +1,6 @@
+// 文件职责：提供四类模块基类的最小默认行为（空主题、默认启动/停止和消息忽略）。
+// 基类不拥有宿主或业务资源，也不创建线程；具体模块在自己的实现文件中声明主题并覆写
+// onStart/onStop/onMessage。默认实现保持幂等，便于测试模块只覆写需要的部分。
 #include "InProcessNonUiModule.h"
 #include "InProcessUiModule.h"
 #include "ProcessNonUiModule.h"

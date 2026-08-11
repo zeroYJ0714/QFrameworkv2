@@ -1,3 +1,7 @@
+// 文件职责：实现进程内消息总线的注册、路由、容量控制和有界停止。
+// publish() 在发布线程只做轻量校验并把不可变 QByteArray/共享载荷放入订阅者队列；
+// 每个订阅模块有自己的投递线程和停止状态。Latest 只替换同主题最旧项，Reliable 满时拒绝新项，
+// 两者都记录统计和限频日志。stopQueues() 会唤醒等待中的队列、等待 ACK/回调或超时，不强删运行对象。
 #include "MessageBus.h"
 
 #include <QDeadlineTimer>
@@ -53,6 +57,8 @@ public:
     // 不会占掉 SQL Reliable 的槽位。payload 是共享不可变值，覆盖/清空后自动释放。
     bool enqueue(const QueuedMessage& message, const TopicConfig& config)
     {
+        // 生产者可能来自任意线程，但这里始终只复制不可变 Qt 值并在短锁内修改队列；
+        // 真正的 ModuleEndpoint::onMessage 在 run() 的锁外执行。
         QMutexLocker locker(&mutex_);
         // 生产者只在锁内修改队列和统计，消费者取出副本后才调用业务回调。
         if (!accepting_) {
@@ -142,6 +148,8 @@ protected:
     // 串行取消息并在锁外调用模块回调，停止且队列清空后退出。
     void run() override
     {
+        // 每个模块独占一个 QThread，消息按入队顺序逐条消费；业务回调异常会被捕获，
+        // 不会让总线线程直接崩溃，也不会阻止后续模块消息。
         // 一个 ModuleQueue 一个线程，保证同一模块的 onMessage 串行且顺序稳定。
         for (;;) {
             QueuedMessage message;
@@ -232,6 +240,8 @@ bool MessageBus::registerModule(const QString& moduleId,
                                 ModuleEndpoint* endpoint,
                                 QString* errorMessage)
 {
+    // 注册一次性冻结模块的发布/订阅主题，并创建专属队列线程；deliveryEnabled_ 为 false
+    // 时线程先暂停消费，等框架把所有模块注册完再统一放行。
     // 主题声明在注册时冻结，后续 publish 不再接受动态新增主题。
     if (moduleId.trimmed().isEmpty() || endpoint == nullptr) {
         if (errorMessage != nullptr)
@@ -328,6 +338,8 @@ void MessageBus::beginShutdown()
 // 在一份总 deadline 内回收全部模块线程；超时队列留在注册表中 quarantine。
 MessageBusStopReport MessageBus::stopQueues(int drainTimeoutMs)
 {
+    // 用一份总 deadline 分配给所有模块，先停止生产再尽量排空可靠消息；某一模块超时
+    // 会进入 quarantine，调用方不能删除仍可能执行 onMessage 的线程对象。
     QVector<QPair<QString, ModuleQueue*>> queues;
     {
         QMutexLocker locker(&mutex_);
@@ -443,6 +455,8 @@ bool MessageBus::publishSharedFromModule(const QString& moduleId,
                                          const QString& topic,
                                          const MessagePayload& payload)
 {
+    // 发布的所有权限、主题和大小检查都在总线锁内完成，然后逐订阅者入队；
+    // 某个订阅者满了只影响返回值，不回滚已经成功进入其他队列的副本。
     QMutexLocker locker(&mutex_);
     // 下面所有校验在同一把总线锁内完成，保证注册/关闭不会与广播交错。
     Registration* sender = modules_.value(moduleId, nullptr);

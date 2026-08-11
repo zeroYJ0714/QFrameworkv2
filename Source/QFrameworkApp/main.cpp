@@ -1,3 +1,7 @@
+// 文件职责：创建 Qt 应用、初始化框架运行时并进入 GUI 事件循环。
+// QApplication 和所有顶层 QWidget 都属于主 GUI 线程；本文件不直接执行 SQLite、ADB
+// 或媒体解码。框架对象在事件循环开始前完成配置，退出时先按统一关闭门禁清理模块，
+// 最后由 QApplication::exec() 返回进程退出码。
 #include <QApplication>
 #include <QCoreApplication>
 #include <QDir>

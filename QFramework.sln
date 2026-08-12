@@ -2,21 +2,19 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio 15
 VisualStudioVersion = 15.0.28307.168
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "QFrameworkProtocols", "Source\QFrameworkProtocols\QFrameworkProtocols.vcxproj", "{5A8EFF77-405B-470C-B5E0-E1BF5F62CB58}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "QFrameworkProtocols", "Source\QFrameworkProtocols\QFrameworkProtocols.vcxproj", "{5A8EFF77-405B-470C-B5E0-E1BF5F62CB58}"
 EndProject
-Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "QFramework", "Source\QFramework\QFramework.vcxproj", "{1667C69C-7CC6-41FE-9C13-817AB15454D8}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "QFramework", "Source\QFramework\QFramework.vcxproj", "{1667C69C-7CC6-41FE-9C13-817AB15454D8}"
 EndProject
-Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "QFrameworkApp", "Source\QFrameworkApp\QFrameworkApp.vcxproj", "{6BC7BC9B-2F8D-480C-B8FB-C6B08C23E027}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "QFrameworkApp", "Source\QFrameworkApp\QFrameworkApp.vcxproj", "{6BC7BC9B-2F8D-480C-B8FB-C6B08C23E027}"
 EndProject
-Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "QFrameworkTests", "Tests\QFrameworkTests\QFrameworkTests.vcxproj", "{AD166D35-ABE7-4C78-AAC4-D049E88F6F5A}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "InProcessUiExample", "Modules\InProcessUiExample\InProcessUiExample.vcxproj", "{D79E457E-8337-4A2E-9807-2D59E460A576}"
 EndProject
-Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "InProcessUiExample", "Modules\InProcessUiExample\InProcessUiExample.vcxproj", "{D79E457E-8337-4A2E-9807-2D59E460A576}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "InProcessNonUiExample", "Modules\InProcessNonUiExample\InProcessNonUiExample.vcxproj", "{2E1F7CBB-C654-43C1-9B50-A70EC0A6307C}"
 EndProject
-Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "InProcessNonUiExample", "Modules\InProcessNonUiExample\InProcessNonUiExample.vcxproj", "{2E1F7CBB-C654-43C1-9B50-A70EC0A6307C}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ProcessUiExample", "Modules\ProcessUiExample\ProcessUiExample.vcxproj", "{D4B9E4BB-2CE7-4D15-B3D2-4D10B91A1B15}"
 EndProject
-Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "ProcessUiExample", "Modules\ProcessUiExample\ProcessUiExample.vcxproj", "{D4B9E4BB-2CE7-4D15-B3D2-4D10B91A1B15}"
-EndProject
-Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "ProcessNonUiExample", "Modules\ProcessNonUiExample\ProcessNonUiExample.vcxproj", "{B6DAAA2E-87C1-4FEF-8BB5-9FD5D5E0F2B0}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ProcessNonUiExample", "Modules\ProcessNonUiExample\ProcessNonUiExample.vcxproj", "{B6DAAA2E-87C1-4FEF-8BB5-9FD5D5E0F2B0}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -50,14 +48,6 @@ Global
 		{6BC7BC9B-2F8D-480C-B8FB-C6B08C23E027}.Release|Win32.Build.0 = Release|Win32
 		{6BC7BC9B-2F8D-480C-B8FB-C6B08C23E027}.Release|x64.ActiveCfg = Release|x64
 		{6BC7BC9B-2F8D-480C-B8FB-C6B08C23E027}.Release|x64.Build.0 = Release|x64
-		{AD166D35-ABE7-4C78-AAC4-D049E88F6F5A}.Debug|Win32.ActiveCfg = Debug|Win32
-		{AD166D35-ABE7-4C78-AAC4-D049E88F6F5A}.Debug|Win32.Build.0 = Debug|Win32
-		{AD166D35-ABE7-4C78-AAC4-D049E88F6F5A}.Debug|x64.ActiveCfg = Debug|x64
-		{AD166D35-ABE7-4C78-AAC4-D049E88F6F5A}.Debug|x64.Build.0 = Debug|x64
-		{AD166D35-ABE7-4C78-AAC4-D049E88F6F5A}.Release|Win32.ActiveCfg = Release|Win32
-		{AD166D35-ABE7-4C78-AAC4-D049E88F6F5A}.Release|Win32.Build.0 = Release|Win32
-		{AD166D35-ABE7-4C78-AAC4-D049E88F6F5A}.Release|x64.ActiveCfg = Release|x64
-		{AD166D35-ABE7-4C78-AAC4-D049E88F6F5A}.Release|x64.Build.0 = Release|x64
 		{D79E457E-8337-4A2E-9807-2D59E460A576}.Debug|Win32.ActiveCfg = Debug|Win32
 		{D79E457E-8337-4A2E-9807-2D59E460A576}.Debug|Win32.Build.0 = Debug|Win32
 		{D79E457E-8337-4A2E-9807-2D59E460A576}.Debug|x64.ActiveCfg = Debug|x64

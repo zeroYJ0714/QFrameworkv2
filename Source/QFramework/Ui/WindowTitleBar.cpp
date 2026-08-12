@@ -4,6 +4,7 @@
 #include "WindowTitleBar.h"
 
 #include <QAbstractButton>
+#include <QApplication>
 #include <QHBoxLayout>
 #include <QMenuBar>
 #include <QMouseEvent>
@@ -99,11 +100,36 @@ void WindowTitleBar::mousePressEvent(QMouseEvent* event)
 {
     if (event != nullptr && event->button() == Qt::LeftButton &&
         !isInteractiveAt(event->pos())) {
-        emit moveRequested(event->globalPos(), event->pos());
+        movePressed_ = true;
+        moveStarted_ = false;
+        pressGlobalPosition_ = event->globalPos();
+        pressTitleBarPosition_ = event->pos();
         event->accept();
         return;
     }
     QWidget::mousePressEvent(event);
+}
+
+void WindowTitleBar::mouseMoveEvent(QMouseEvent* event)
+{
+    if (event != nullptr && movePressed_ && !moveStarted_ &&
+        (event->globalPos() - pressGlobalPosition_).manhattanLength() >=
+            QApplication::startDragDistance()) {
+        moveStarted_ = true;
+        emit moveRequested(event->globalPos(), pressTitleBarPosition_);
+        event->accept();
+        return;
+    }
+    QWidget::mouseMoveEvent(event);
+}
+
+void WindowTitleBar::mouseReleaseEvent(QMouseEvent* event)
+{
+    if (event != nullptr && event->button() == Qt::LeftButton) {
+        movePressed_ = false;
+        moveStarted_ = false;
+    }
+    QWidget::mouseReleaseEvent(event);
 }
 
 // Windows 原生标题栏通常支持双击最大化/还原；无边框后由这个 Qt 事件补回。

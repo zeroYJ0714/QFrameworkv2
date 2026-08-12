@@ -1175,22 +1175,9 @@ bool MainWindow::nativeEvent(const QByteArray& eventType,
                                      GET_Y_LPARAM(nativeMessage->lParam));
             const QRect windowRect = nativeWindowRect(nativeMessage->hwnd);
 
-            // 最大化状态下 Windows 已经把窗口放到工作区，边缘不再代表缩放区域。
-            // 普通状态先判断角，再判断边，保证角落获得正确的斜向调整光标。
-            if (!isMaximized() && windowRect.isValid()) {
-                const qreal deviceScale = devicePixelRatioF() > 0.0
-                    ? devicePixelRatioF() : 1.0;
-                const int nativeBorderWidth = qMax(1, qRound(6.0 * deviceScale));
-                const long resizeResult = resizeHitTest(
-                    screenPoint, windowRect, nativeBorderWidth);
-                if (resizeResult != HTNOWHERE) {
-                    *result = resizeResult;
-                    return true;
-                }
-            }
-
-            // WM_NCHITTEST 给的是 Windows 屏幕物理像素，而 QWidget::childAt 使用 Qt
-            // 逻辑像素。先转到客户区，再按当前窗口 DPI 换算，避免 125%/150% 下错位。
+            // 自绘标题栏位于窗口客户区顶部。必须先判断它，再判断窗口边缘；否则标题栏
+            // 最上方的 6 个物理像素会先被返回为 HTTOP，Windows 会把一次普通点击当成
+            // 上边框缩放。标题栏本身仍由 Qt 处理拖动、双击最大化和按钮点击。
             POINT nativeClientPoint = {screenPoint.x(), screenPoint.y()};
             if (nativeMessage->hwnd != nullptr &&
                 ScreenToClient(nativeMessage->hwnd, &nativeClientPoint)) {
@@ -1203,13 +1190,23 @@ bool MainWindow::nativeEvent(const QByteArray& eventType,
                     const QPoint titleBarPoint = titleBar_->mapFrom(
                         this, logicalClientPoint);
                     if (titleBar_->rect().contains(titleBarPoint)) {
-                        // 整个自绘标题栏保持 Qt 客户区。菜单和按钮由各自控件处理；空白区
-                        // 由 WindowTitleBar 的 mousePressEvent 调用 QWindow::startSystemMove()。
-                        // 不再返回 HTCAPTION，避免无边框+最大化+原生子窗口组合下 Windows
-                        // 非客户区拖动链失效，同时保留 Qt 双击最大化/还原处理。
                         *result = HTCLIENT;
                         return true;
                     }
+                }
+            }
+
+            // 最大化状态下 Windows 已经把窗口放到工作区，边缘不再代表缩放区域。
+            // 普通状态先判断角，再判断边，保证角落获得正确的斜向调整光标。
+            if (!isMaximized() && windowRect.isValid()) {
+                const qreal deviceScale = devicePixelRatioF() > 0.0
+                    ? devicePixelRatioF() : 1.0;
+                const int nativeBorderWidth = qMax(1, qRound(6.0 * deviceScale));
+                const long resizeResult = resizeHitTest(
+                    screenPoint, windowRect, nativeBorderWidth);
+                if (resizeResult != HTNOWHERE) {
+                    *result = resizeResult;
+                    return true;
                 }
             }
 

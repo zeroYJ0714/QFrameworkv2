@@ -84,6 +84,8 @@ protected:
     /// @param event Qt 事件对象；仅在当前回调期间有效。
     /// @return 无。
     void mousePressEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
     /// @brief 执行 `mouseDoubleClickEvent` 所定义的类职责。
     /// @param event Qt 事件对象；仅在当前回调期间有效。
     /// @return 无。
@@ -95,6 +97,10 @@ private:
     /// @param child 传给该操作的 `child` 参数；取值应符合声明类型和函数用途。
     /// @return 条件或操作成功时返回 true，否则返回 false。
     bool isInteractiveTitleBarChild(QWidget* child) const;
+    bool movePressed_ = false;
+    bool moveStarted_ = false;
+    QPoint pressGlobalPosition_;
+    QPoint pressTitleBarPosition_;
 
     QMenuBar* menuBar_; ///< `menuBar_` 对应的对象指针；所有权和线程归属见本类文件级说明。
     QToolButton* minimizeButton_; ///< `minimizeButton_` 对应的对象指针；所有权和线程归属见本类文件级说明。

@@ -46,11 +46,17 @@
       <QFrameworkLayouts Include="$(SolutionDir)config\Layouts\*.*" />
       <QFrameworkStyles Include="$(SolutionDir)config\Styles\*.qss" />
       <QFrameworkFfmpeg Include="$(SolutionDir)ThirdParty\FFmpeg\x64\8.1\bin\*.dll" Condition="'$(Platform)'=='x64'" />
+      <QFrameworkSqlRuntimeFiles Include="$(QMake_QT_INSTALL_BINS_)\Qt5Sqld.dll" Condition="'$(Configuration)'=='Debug'" />
+      <QFrameworkSqlRuntimeFiles Include="$(QMake_QT_INSTALL_BINS_)\Qt5Sql.dll" Condition="'$(Configuration)'=='Release'" />
+      <QFrameworkSqlDriverFiles Include="$(QMake_QT_INSTALL_PLUGINS_)\sqldrivers\qsqlited.dll" Condition="'$(Configuration)'=='Debug'" />
+      <QFrameworkSqlDriverFiles Include="$(QMake_QT_INSTALL_PLUGINS_)\sqldrivers\qsqlite.dll" Condition="'$(Configuration)'=='Release'" />
     </ItemGroup>
-    <MakeDir Directories="$(OutDir)config;$(OutDir)config\Layouts;$(OutDir)config\Styles" />
+    <MakeDir Directories="$(OutDir)config;$(OutDir)config\Layouts;$(OutDir)config\Styles;$(OutDir)sqldrivers" />
     <Copy SourceFiles="@(QFrameworkIni)" DestinationFolder="$(OutDir)config" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(QFrameworkLayouts)" DestinationFolder="$(OutDir)config\Layouts" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(QFrameworkStyles)" DestinationFolder="$(OutDir)config\Styles" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(QFrameworkFfmpeg)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="'@(QFrameworkFfmpeg)'!=''" />
+    <Copy SourceFiles="@(QFrameworkSqlRuntimeFiles)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(QFrameworkSqlDriverFiles)" DestinationFolder="$(OutDir)sqldrivers" SkipUnchangedFiles="true" />
   </Target>
 </Project>

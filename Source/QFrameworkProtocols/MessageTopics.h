@@ -1,49 +1,86 @@
 #pragma once
 
-// 文件职责：集中定义 QFramework 的字符串主题常量和每个主题的 Proto 负载/路由约束。
-// 业务模块只能使用这里的主题名，不能自行拼接；ADB/SQL 请求响应使用 Msg.src/dst 定向，
-// 设备、媒体、显示和错误事件使用广播。主题策略必须和 MessageBus 的 Latest/Reliable、单条大小
-// 和容量配置一致，Msg.str 始终保存生成的原始 Protobuf 字节。
+// 本文件中每个主题只说明三项：发送模块 -> 接收模块、作用、Msg.str 对应的 Proto 结构。
 
-// QFRAMEWORK_IMAGE_RAW：负载为 ImageFrame；图像采集模块发布，处理/显示模块通过 onMessage 接收；非 ADB 主题不使用 Msg.src/dst；配置为 Latest，当前上限 16 MiB。
+// 发送：图像采集模块 -> 图像处理模块、图像显示模块。
+// 作用：传递未经算法处理的原始图像帧。
+// Proto：外层为 Msg，Msg.str 中保存 ImageFrame。
 #define QFRAMEWORK_IMAGE_RAW "QFRAMEWORK_IMAGE_RAW"
-// QFRAMEWORK_IMAGE_PROCESSED：负载为 ProcessedImage；算法模块发布，显示/存储模块通过 onMessage 接收；非 ADB 主题不使用 Msg.src/dst；未单独配置时继承 Reliable 和默认大小上限。
+// 发送：图像处理模块 -> 图像显示模块、图像存储模块。
+// 作用：传递算法处理后的图像及其来源帧序号。
+// Proto：外层为 Msg，Msg.str 中保存 ProcessedImage。
 #define QFRAMEWORK_IMAGE_PROCESSED "QFRAMEWORK_IMAGE_PROCESSED"
-// QFRAMEWORK_LOG_DISPLAY：负载为 LogDisplayMessage；业务模块发布，UI 模块通过 onMessage 接收；非 ADB 主题不使用 Msg.src/dst；未单独配置时继承 Reliable 和默认大小上限。
+// 发送：业务模块 -> 日志显示 UI 模块。
+// 作用：把结构化日志内容发送到界面显示。
+// Proto：外层为 Msg，Msg.str 中保存 LogDisplayMessage。
 #define QFRAMEWORK_LOG_DISPLAY "QFRAMEWORK_LOG_DISPLAY"
-// QFRAMEWORK_STATUS：负载为 ModuleStatus；模块/监督器发布，状态订阅模块通过 onMessage 接收；非 ADB 主题不使用 Msg.src/dst；未单独配置时继承 Reliable 和默认大小上限。
+// 发送：业务模块或进程监督模块 -> 状态显示/监控模块。
+// 作用：通知模块当前的生命周期状态和状态说明。
+// Proto：外层为 Msg，Msg.str 中保存 ModuleStatus。
 #define QFRAMEWORK_STATUS "QFRAMEWORK_STATUS"
 
-// QFRAMEWORK_SQL_REQUEST：外层 Msg.str 为 SqlRequest；调用模块发布给 SQL_InProcessNonUi；Reliable，单条上限 16 MiB。
+// 发送：ADBShow_InProcessUi、ImageShow_InProcessUi 或其他调用模块 -> SQL_InProcessNonUi。
+// 作用：请求执行 SQL 语句、查询或事务批次。
+// Proto：外层为 Msg，Msg.str 中保存 SqlRequest。
 #define QFRAMEWORK_SQL_REQUEST "QFRAMEWORK_SQL_REQUEST"
-// QFRAMEWORK_SQL_RESPONSE：外层 Msg.str 为 SqlResponse；SQL_InProcessNonUi 定向回复原请求模块；Reliable，单条上限 16 MiB。
+// 发送：SQL_InProcessNonUi -> 原 SQL 请求模块。
+// 作用：返回 SQL 执行结果、查询数据或错误信息。
+// Proto：外层为 Msg，Msg.str 中保存 SqlResponse。
 #define QFRAMEWORK_SQL_RESPONSE "QFRAMEWORK_SQL_RESPONSE"
-// QFRAMEWORK_CURRENT_DEVICE_QUERY：外层 Msg.str 为 CurrentDeviceQuery；ImageShow_InProcessUi 定向查询 ADBShow_InProcessUi；Reliable。
+// 发送：ImageShow_InProcessUi -> ADBShow_InProcessUi。
+// 作用：查询 ADBShow 当前选择的设备。
+// Proto：外层为 Msg，Msg.str 中保存 CurrentDeviceQuery。
 #define QFRAMEWORK_CURRENT_DEVICE_QUERY "QFRAMEWORK_CURRENT_DEVICE_QUERY"
-// QFRAMEWORK_CURRENT_DEVICE_RESPONSE：外层 Msg.str 为 CurrentDeviceResponse；ADBShow_InProcessUi 定向回复 ImageShow_InProcessUi；Reliable。
+// 发送：ADBShow_InProcessUi -> ImageShow_InProcessUi。
+// 作用：返回当前选择设备的 android_id。
+// Proto：外层为 Msg，Msg.str 中保存 CurrentDeviceResponse。
 #define QFRAMEWORK_CURRENT_DEVICE_RESPONSE "QFRAMEWORK_CURRENT_DEVICE_RESPONSE"
-// QFRAMEWORK_CURRENT_DEVICE_CHANGED：外层 Msg.str 为 CurrentDeviceChanged；ADBShow_InProcessUi 广播当前 android_id；Reliable。
+// 发送：ADBShow_InProcessUi -> ImageShow_InProcessUi。
+// 作用：当前设备发生切换时通知新的 android_id。
+// Proto：外层为 Msg，Msg.str 中保存 CurrentDeviceChanged。
 #define QFRAMEWORK_CURRENT_DEVICE_CHANGED "QFRAMEWORK_CURRENT_DEVICE_CHANGED"
 
-// QFRAMEWORK_ADB_REQUEST：外层 Msg.str 为 AdbRequest；调用模块发布，src=调用模块、dst=ADB_InProcessNonUi；由 ADB_InProcessNonUi::onMessage 接收后以 QueuedConnection 交给协调 Worker；Reliable。
+// 发送：ADBShow_InProcessUi、ImageShow_InProcessUi 或其他调用模块 -> ADB_InProcessNonUi。
+// 作用：请求执行设备枚举、启停、ADB 命令、媒体或控制操作。
+// Proto：外层为 Msg，Msg.str 中保存 AdbRequest。
 #define QFRAMEWORK_ADB_REQUEST "QFRAMEWORK_ADB_REQUEST"
-// QFRAMEWORK_ADB_RESPONSE：外层 Msg.str 为 AdbResponse；ADB_InProcessNonUi 发布，src=ADB_InProcessNonUi、dst=原请求模块；请求模块通过 onMessage 接收；Reliable，request_id 原样返回。
+// 发送：ADB_InProcessNonUi -> 原 ADB 请求模块。
+// 作用：确认请求是否被接受，并返回同步结果或错误。
+// Proto：外层为 Msg，Msg.str 中保存 AdbResponse。
 #define QFRAMEWORK_ADB_RESPONSE "QFRAMEWORK_ADB_RESPONSE"
-// QFRAMEWORK_ADB_DEVICE_EVENT：外层 Msg.str 为 AdbDeviceEvent；ADB_InProcessNonUi 根据 AndroidDeviceManager::devicesChanged/deviceStateChanged 信号发布，src=ADB_InProcessNonUi、dst 为空广播；Reliable。
+// 发送：ADB_InProcessNonUi -> ADBShow_InProcessUi、ImageShow_InProcessUi。
+// 作用：广播设备列表变化或单台设备状态变化。
+// Proto：外层为 Msg，Msg.str 中保存 AdbDeviceEvent。
 #define QFRAMEWORK_ADB_DEVICE_EVENT "QFRAMEWORK_ADB_DEVICE_EVENT"
-// QFRAMEWORK_ADB_COMMAND_OUTPUT：外层 Msg.str 为 AdbOutputEvent；由 adbOutputReady/adbErrorOutputReady 信号触发发布，src=ADB_InProcessNonUi、dst=命令原请求模块；订阅模块 onMessage 接收；Reliable。
+// 发送：ADB_InProcessNonUi -> 原 ADB 命令请求模块。
+// 作用：流式返回 ADB 命令的标准输出或错误输出。
+// Proto：外层为 Msg，Msg.str 中保存 AdbOutputEvent。
 #define QFRAMEWORK_ADB_COMMAND_OUTPUT "QFRAMEWORK_ADB_COMMAND_OUTPUT"
-// QFRAMEWORK_ADB_COMMAND_FINISHED：外层 Msg.str 为 AdbCommandFinishedEvent；由 adbCommandFinished 信号触发发布，src=ADB_InProcessNonUi、dst=命令原请求模块；订阅模块 onMessage 接收；Reliable，每个已接受命令只发布一次最终事件。
+// 发送：ADB_InProcessNonUi -> 原 ADB 命令请求模块，例如 ADBShow_InProcessUi。
+// 作用：通知一条异步 ADB 命令已经成功、失败、取消或超时结束。
+// Proto：外层为 Msg，Msg.str 中保存 AdbCommandFinishedEvent。
 #define QFRAMEWORK_ADB_COMMAND_FINISHED "QFRAMEWORK_ADB_COMMAND_FINISHED"
-// QFRAMEWORK_ADB_VIDEO_EVENT：外层 Msg.str 只允许 AdbVideoEvent.frame；由 videoFrameReady 信号触发发布，src=ADB_InProcessNonUi、dst 为空广播；订阅模块 onMessage 接收；Latest，单条消息上限 64 MiB，禁止发布 encoded。
+// 发送：ADB_InProcessNonUi -> ImageShow_InProcessUi。
+// 作用：传递当前设备解码后的 ARGB32 视频帧。
+// Proto：外层为 Msg，Msg.str 中保存 AdbVideoEvent，使用其中的 frame 字段。
 #define QFRAMEWORK_ADB_VIDEO_EVENT "QFRAMEWORK_ADB_VIDEO_EVENT"
-// QFRAMEWORK_ADB_AUDIO_EVENT：外层 Msg.str 只允许 AdbAudioEvent.pcm；由 audioPcmReady 信号触发发布，src=ADB_InProcessNonUi、dst 为空广播；订阅模块 onMessage 接收；Latest，禁止发布 encoded。
+// 发送：ADB_InProcessNonUi -> ImageShow_InProcessUi。
+// 作用：传递当前设备解码后的 PCM 音频数据。
+// Proto：外层为 Msg，Msg.str 中保存 AdbAudioEvent，使用其中的 pcm 字段。
 #define QFRAMEWORK_ADB_AUDIO_EVENT "QFRAMEWORK_ADB_AUDIO_EVENT"
-// QFRAMEWORK_ADB_DISPLAY_EVENT：外层 Msg.str 为 AdbDisplayEvent；由 displayInfoChanged 信号触发发布，src=ADB_InProcessNonUi、dst 为空广播；订阅模块 onMessage 接收；Reliable。
+// 发送：ADB_InProcessNonUi -> ImageShow_InProcessUi。
+// 作用：通知设备画面的宽高、旋转方向和刷新率。
+// Proto：外层为 Msg，Msg.str 中保存 AdbDisplayEvent。
 #define QFRAMEWORK_ADB_DISPLAY_EVENT "QFRAMEWORK_ADB_DISPLAY_EVENT"
-// QFRAMEWORK_ADB_MEDIA_EVENT：外层 Msg.str 为 AdbMediaEvent；由 mediaStateChanged/mediaStatisticsChanged 信号触发发布，src=ADB_InProcessNonUi、dst 为空广播；订阅模块 onMessage 接收；Reliable。
+// 发送：ADB_InProcessNonUi -> ImageShow_InProcessUi。
+// 作用：通知媒体会话状态变化或最新媒体统计数据。
+// Proto：外层为 Msg，Msg.str 中保存 AdbMediaEvent。
 #define QFRAMEWORK_ADB_MEDIA_EVENT "QFRAMEWORK_ADB_MEDIA_EVENT"
-// QFRAMEWORK_ADB_CLIPBOARD_EVENT：外层 Msg.str 为 AdbClipboardEvent；由 clipboardReceived 信号触发发布，src=ADB_InProcessNonUi、dst 为空广播；订阅模块 onMessage 接收；Reliable。
+// 发送：ADB_InProcessNonUi -> 订阅设备剪贴板事件的模块。
+// 作用：通知设备剪贴板中的最新文本。
+// Proto：外层为 Msg，Msg.str 中保存 AdbClipboardEvent。
 #define QFRAMEWORK_ADB_CLIPBOARD_EVENT "QFRAMEWORK_ADB_CLIPBOARD_EVENT"
-// QFRAMEWORK_ADB_ERROR_EVENT：外层 Msg.str 为 AdbErrorEvent；由 errorOccurred 信号或适配层错误路径触发发布，src=ADB_InProcessNonUi、dst 为空广播；订阅模块 onMessage 接收；Reliable。
+// 发送：ADB_InProcessNonUi -> ADBShow_InProcessUi、ImageShow_InProcessUi。
+// 作用：广播设备、ADB、媒体或控制流程中的结构化错误。
+// Proto：外层为 Msg，Msg.str 中保存 AdbErrorEvent。
 #define QFRAMEWORK_ADB_ERROR_EVENT "QFRAMEWORK_ADB_ERROR_EVENT"

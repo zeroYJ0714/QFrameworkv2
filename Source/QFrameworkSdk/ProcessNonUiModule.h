@@ -14,12 +14,12 @@ class QFRAMEWORK_EXPORT ProcessNonUiModule : public QObject, public ModuleEndpoi
     Q_OBJECT
 
 public:
-    /// @brief 创建子进程无界面模块基类；参数：parent 通常为空，由运行时统一销毁；返回值：无。
-    /// @param parent Qt 父对象或父控件；用于建立所有权关系，允许为空。
-    /// @return 无。
+    /// @brief 创建子进程无界面模块基类，只初始化 QObject；本基类不创建线程，由运行时的事件循环驱动。
+    /// @param parent Qt 父对象，通常为空；模块对象由 ProcessRuntime 统一销毁。
+    /// @return 无（构造函数不返回值）。
     explicit ProcessNonUiModule(QObject* parent = nullptr);
-    /// @brief 完整析构派生模块和 QObject 子对象；参数：无；返回值：无。
-    /// @return 无。
+    /// @brief 虚析构，退出时只释放 QObject 资源；Socket 与共享内存由 ProcessRuntime 收尾。
+    /// @return 无（析构函数不返回值）。
     ~ProcessNonUiModule() override;
 };
 }

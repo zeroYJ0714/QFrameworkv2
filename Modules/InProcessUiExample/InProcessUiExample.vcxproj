@@ -131,6 +131,7 @@
   </ItemGroup>
   <ItemGroup>
     <QtMoc Include="InProcessUiExample.h" />
+    <None Include="InProcessUiExample.json" />
     <ClCompile Include="InProcessUiExample.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

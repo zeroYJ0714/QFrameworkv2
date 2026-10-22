@@ -22,8 +22,6 @@ using MessagePayload = QSharedPointer<const QByteArray>;
 /// @return 非空 MessagePayload；其最后一个引用释放时自动销毁 QByteArray。
 inline MessagePayload makeMessagePayload(const QByteArray& data)
 {
-    /// @brief 执行 `MessagePayload` 所定义的类职责。
-    /// @return 返回声明类型的结果值。
     return MessagePayload(new QByteArray(data));
 }
 
@@ -32,8 +30,6 @@ inline MessagePayload makeMessagePayload(const QByteArray& data)
 /// @return 拥有原缓冲区的非空 MessagePayload。
 inline MessagePayload makeMessagePayload(QByteArray&& data)
 {
-    /// @brief 执行 `MessagePayload` 所定义的类职责。
-    /// @return 返回声明类型的结果值。
     return MessagePayload(new QByteArray(qMove(data)));
 }
 }

@@ -24,20 +24,20 @@ enum class FrameResult
 };
 
 // 把一个 JSON 对象编码成可直接写入 QLocalSocket 的完整帧。
-/// @brief 执行 `encodeFrame` 所定义的类职责。
-/// @param object 用于反查所属记录的 QObject 指针。
-/// @return 返回对应 Qt 值或容器的安全副本。
+/// @brief 把 JSON 对象编码成 4 字节大端长度前缀加紧凑 JSON 的完整帧。
+/// @param object 待发送的 IPC 控制消息对象。
+/// @return 可直接写入 QLocalSocket 的完整帧字节。
 QFRAMEWORK_EXPORT QByteArray encodeFrame(const QJsonObject& object);
 // 从累计缓冲区最多取出一帧；成功后会移除已消费字节。
-/// @brief 执行 `takeFrame` 所定义的类职责。
-/// @param buffer 传给该操作的 `buffer` 参数；取值应符合声明类型和函数用途。
-/// @param object 用于反查所属记录的 QObject 指针。
-/// @param maxFrameBytes 传给该操作的 `maxFrameBytes` 参数；取值应符合声明类型和函数用途。
-/// @param errorMessage 可选错误说明输出参数。
-/// @return 返回声明类型的结果值。
+/// @brief 从累计接收缓冲区中最多取出一帧，成功时消费掉已解析的字节。
+/// @param buffer 累计接收缓冲区；解析成功后在原地移除已消费部分。
+/// @param object 输出参数，解析成功时写入取出的 JSON 对象。
+/// @param maxFrameBytes payload 长度上限，超过该值即视为不可信帧。
+/// @param errorMessage 可选输出参数，失败时写入中文失败原因。
+/// @return 帧状态：Incomplete 表示继续等待，Ready 表示取出成功，Invalid 表示必须断开连接。
 QFRAMEWORK_EXPORT FrameResult takeFrame(QByteArray* buffer,
                                         QJsonObject* object,
                                         int maxFrameBytes,
-                                        QString* errorMessage = nullptr); ///< `errorMessage` 对应的对象指针；所有权和线程归属见本类文件级说明。
+                                        QString* errorMessage = nullptr);
 }
 }

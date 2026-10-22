@@ -30,14 +30,17 @@ namespace
 struct LogRecord
 {
     // 生产线程只创建这份值对象并放入队列；实际 QFile 始终由 Worker 线程独占。
-    QDateTime timestamp;
-    LogLevel level;
-    QString moduleId;
-    quintptr threadId;
-    QString text;
+    QDateTime timestamp; ///< 记录产生时间，决定文件名日期并写入每行前缀。
+    LogLevel level; ///< 该条记录的严重级别。
+    QString moduleId; ///< 记录来源模块 ID，为空时按 Unknown 输出。
+    quintptr threadId; ///< 调用线程 ID，用于区分多线程日志来源。
+    QString text; ///< 原始消息文本，写入前会折叠换行。
 };
 
 // 将枚举转换成日志文件中的稳定大写名称；未知值使用 UNKNOWN 便于诊断。
+/// @brief 把日志级别转换为文件中的稳定大写名称。
+/// @param level 待转换的日志级别。
+/// @return DEBUG/INFO/WARNING/ERROR 之一，未知值返回 UNKNOWN。
 QString levelName(LogLevel level)
 {
     // 文件格式使用稳定的大写文本，便于人工检索和脚本解析。
@@ -59,6 +62,11 @@ class Logger::Worker : public QThread
 {
 public:
     // directory/maxFileBytes 决定输出和滚动，flushIntervalMs 决定普通批次期限。
+    /// @brief 构造写盘线程，保存目录、滚动上限和刷新周期。
+    /// @param directory 日志输出目录，线程独占其下的 QFile。
+    /// @param maxFileBytes 单个日志文件的字节上限，超过后滚动。
+    /// @param flushIntervalMs 普通批次的 flush 周期，非法值兜底为 1 ms。
+    /// @return 无（构造函数不返回值）。
     Worker(const QString& directory, qint64 maxFileBytes, int flushIntervalMs)
         : directory_(directory),
           maxFileBytes_(maxFileBytes),
@@ -74,6 +82,9 @@ public:
     }
 
     // 非阻塞地接收一条记录；停止已经开始时丢弃后来者，避免无限延长退出。
+    /// @brief 把一条记录放入受锁保护的队列并唤醒写盘线程。
+    /// @param record 已由调用线程采集好时间和线程 ID 的记录副本。
+    /// @return 无；线程已进入停止状态时静默丢弃。
     void enqueue(const LogRecord& record)
     {
         QMutexLocker locker(&mutex_);
@@ -86,15 +97,17 @@ public:
     }
 
     // 请求并等待“调用前记录已写入且 QFile 已 flush”，最多等待 5 秒。
+    /// @brief 等待调用前提交的记录全部写入并 flush，最长 5 秒。
+    /// @return 无；超时后返回，文件可能仍有未落盘内容。
     void flushQueue()
     {
         // serial 是“刷新请求的版本号”。调用者记下 target 后等待 Worker 把
         // 至少这个版本的队列写完并 flush；比单纯等待 queue_ 为空更可靠，
         // 因为 Worker 可能正在写一批已经从 queue_ 取走的记录。
-        QElapsedTimer timer;
+        QElapsedTimer timer; ///< 本地计时器，用于实现 5 秒硬超时。
         timer.start();
         QMutexLocker locker(&mutex_);
-        const quint64 target = ++flushRequestSerial_;
+        const quint64 target = ++flushRequestSerial_; ///< 本次刷新请求的版本号。
         available_.wakeOne();
         while ((!queue_.isEmpty() || writing_ || flushedSerial_ < target) &&
                timer.elapsed() < 5000) {
@@ -106,6 +119,8 @@ public:
 
     // 唤醒 Worker 写完尾部队列并等待最多 5 秒。超时只把所有权交给 finished
     // 自清理，绝不强制终止可能仍持有 QFile/互斥锁的线程。
+    /// @brief 请求线程停止并等待其写完尾部队列，最长 5 秒。
+    /// @return 线程在 5 秒内自然结束返回 true，超时返回 false。
     bool stopAndWait()
     {
         {
@@ -122,27 +137,29 @@ public:
 
 protected:
     // 主循环按批次搬走队列、写记录，并在周期/显式请求/停止边界统一刷新一次。
+    /// @brief 写盘主循环：成批搬走队列、写记录，并在周期/请求/停止边界 flush。
+    /// @return 无；收到停止且队列排空后退出。
     void run() override
     {
-        QElapsedTimer flushTimer;
+        QElapsedTimer flushTimer; ///< 控制普通 flush 周期的计时器。
         flushTimer.start();
         for (;;) {
-            QQueue<LogRecord> batch;
-            quint64 requestedSerial = 0;
-            bool stopAfterBatch = false;
+            QQueue<LogRecord> batch; ///< 本批从共享队列搬走的记录，锁外写入文件。
+            quint64 requestedSerial = 0; ///< 本批开始时看到的刷新请求版本号。
+            bool stopAfterBatch = false; ///< 本批处理完后是否退出循环。
             {
                 QMutexLocker locker(&mutex_);
                 // 没有新记录时，等待到下一次刷新期限或新日志到来。普通日志
                 // 因此会按间隔成批处理，而不是每条都调用 QFile::flush()。
                 if (queue_.isEmpty() && !stopping_ &&
                     flushedSerial_ >= flushRequestSerial_) {
-                    const qint64 elapsed = flushTimer.elapsed();
+                    const qint64 elapsed = flushTimer.elapsed(); ///< 距上次 flush 已过去的毫秒数。
                     const int waitMs = elapsed >= flushIntervalMs_
                         ? 1
-                        : qMax(1, flushIntervalMs_ - static_cast<int>(elapsed));
+                        : qMax(1, flushIntervalMs_ - static_cast<int>(elapsed)); ///< 本次条件变量等待时长。
                     available_.wait(&mutex_, static_cast<unsigned long>(waitMs));
                 }
-                if (!queue_.isEmpty()) {
+                if (!queue_.isEmpty()) { ///< 有积压记录：整体搬到本地批次后再释放锁。
                     // 先把当前队列整体搬到本地 batch，再释放 mutex；生产者可
                     // 继续入队，Worker 同时写 batch，两个阶段互不阻塞。
                     batch = queue_;
@@ -153,11 +170,11 @@ protected:
                 stopAfterBatch = stopping_ && batch.isEmpty() && queue_.isEmpty();
             }
 
-            for (const LogRecord& record : batch)
+            for (const LogRecord& record : batch) ///< record：当前待写入文件的记录。
                 writeRecord(record);
 
-            const bool due = flushTimer.elapsed() >= flushIntervalMs_;
-            if (requestedSerial > flushedSerial_ || due || stopAfterBatch) {
+            const bool due = flushTimer.elapsed() >= flushIntervalMs_; ///< 是否到达普通刷新周期。
+            if (requestedSerial > flushedSerial_ || due || stopAfterBatch) { ///< 有显式请求、到期或即将停止：本批统一 flush。
                 // 一个批次只 flush 一次。显式请求、到期、滚动/停止都会走到
                 // 这里，因此这些路径不必等待下一个普通间隔。
                 flushFile();
@@ -192,10 +209,13 @@ protected:
 
 private:
     // 生成单行 UTF-8 文本；不在这里访问 QFile，便于保持职责单一。
+    /// @brief 把一条记录格式化成单行 UTF-8 文本。
+    /// @param record 待格式化的记录。
+    /// @return 以换行结尾的单行字节序列。
     QByteArray formattedRecord(const LogRecord& record) const
     {
         // 把换行折叠成空格，保证一条 LogRecord 始终对应日志文件一行。
-        QString text = record.text;
+        QString text = record.text; ///< 消息文本副本，换行折叠后写入行尾。
         text.replace(QLatin1Char('\r'), QLatin1Char(' '));
         text.replace(QLatin1Char('\n'), QLatin1Char(' '));
         const QString line = QStringLiteral("%1 [%2] [%3] [thread:%4] %5\n")
@@ -203,11 +223,15 @@ private:
                  levelName(record.level),
                  record.moduleId.isEmpty() ? QStringLiteral("Unknown") : record.moduleId,
                  QString::number(record.threadId),
-                 text);
+                 text); ///< 组装好的完整日志行。
         return line.toUtf8();
     }
 
     // 根据日期和滚动序号生成当前日志路径。
+    /// @brief 按日期和滚动序号拼出当前日志文件路径。
+    /// @param date 日志所属日期。
+    /// @param index 当天的滚动序号。
+    /// @return 形如 QFramework_日期_三位序号.log 的完整路径。
     QString filePath(const QDate& date, int index) const
     {
         // 文件名同时包含日期和三位序号，按日期/大小滚动时可自然排序。
@@ -218,12 +242,15 @@ private:
     }
 
     // 确保对应日期文件已打开；换日时先刷新并关闭旧句柄。
+    /// @brief 确保指定日期的日志文件已打开，必要时切换并滚动序号。
+    /// @param date 要写入的目标日期。
+    /// @return 文件已成功打开返回 true，打开失败返回 false。
     bool openFile(const QDate& date)
     {
         if (file_.isOpen() && date == fileDate_)
             return true;
 
-        if (file_.isOpen()) {
+        if (file_.isOpen()) { ///< 日期变化或需切换文件：先冲刷关闭旧句柄。
             // 换日或切换文件前立即刷新旧文件，避免尾部记录留在旧句柄缓冲区。
             flushFile();
             file_.close();
@@ -241,12 +268,15 @@ private:
     }
 
     // 写入一条已格式化记录，并在越过大小阈值前滚动文件。
+    /// @brief 写入一条记录，并在越过大小阈值前先滚动到新文件。
+    /// @param record 待写入的记录。
+    /// @return 无；文件无法打开时静默丢弃该条。
     void writeRecord(const LogRecord& record)
     {
-        const QByteArray bytes = formattedRecord(record);
+        const QByteArray bytes = formattedRecord(record); ///< 已格式化的单行字节序列。
         if (!openFile(record.timestamp.date()))
             return;
-        if (file_.size() > 0 && file_.size() + bytes.size() > maxFileBytes_) {
+        if (file_.size() > 0 && file_.size() + bytes.size() > maxFileBytes_) { ///< 追加后会超限：先滚动文件。
             // 按大小滚动是立即刷新边界：先落盘旧文件，再打开新文件写当前行。
             flushFile();
             file_.close();
@@ -259,6 +289,8 @@ private:
     }
 
     // 立即刷新当前打开文件；未打开时是安全空操作。
+    /// @brief 立即冲刷当前打开的日志文件。
+    /// @return 无；文件未打开时安全忽略。
     void flushFile()
     {
         // QFile::flush() 只在 Worker 线程调用，避免多个线程同时操作同一个句柄。
@@ -267,26 +299,26 @@ private:
     }
 
     // 前三个字段是构造后的只读配置；其余字段构成线程同步和文件写入状态。
-    QString directory_;
-    qint64 maxFileBytes_;
-    int flushIntervalMs_;
-    QMutex mutex_;
-    QWaitCondition available_;
-    QWaitCondition drained_;
-    QQueue<LogRecord> queue_;
-    bool stopping_;
-    bool writing_;
-    QFile file_;
-    QDate fileDate_;
-    int fileIndex_;
-    quint64 flushRequestSerial_;
-    quint64 flushedSerial_;
+    QString directory_; ///< 日志输出目录，构造后不再变化。
+    qint64 maxFileBytes_; ///< 单文件字节上限，构造后不再变化。
+    int flushIntervalMs_; ///< 普通批次刷新周期，已保证不小于 1 ms。
+    QMutex mutex_; ///< 保护队列、统计与写盘状态标志。
+    QWaitCondition available_; ///< 有新记录或状态变化时唤醒 run()。
+    QWaitCondition drained_; ///< 队列排空且已 flush 时唤醒 flush() 调用者。
+    QQueue<LogRecord> queue_; ///< 待写入记录队列，受 mutex_ 保护。
+    bool stopping_; ///< 是否已请求停止，停止后不再接受新记录。
+    bool writing_; ///< 当前是否正在锁外写入一批记录。
+    QFile file_; ///< 当前打开的日志文件，仅由 Worker 线程操作。
+    QDate fileDate_; ///< 当前文件对应的日期，用于检测换日。
+    int fileIndex_; ///< 当前文件当天的滚动序号。
+    quint64 flushRequestSerial_; ///< 已收到的刷新请求版本号。
+    quint64 flushedSerial_; ///< 已真正 flush 到的请求版本号。
 };
 
 // 使用函数内静态对象实现进程内单例，首次调用时由 C++ 线程安全初始化。
 Logger& Logger::instance()
 {
-    static Logger logger;
+    static Logger logger; ///< 进程内唯一实例，由 C++ 保证线程安全初始化。
     return logger;
 }
 
@@ -299,6 +331,8 @@ Logger::Logger()
 }
 
 // 析构先恢复 Qt 处理器再停止 Worker，防止退出日志继续进入已销毁线程。
+/// @brief 析构时先恢复 Qt 消息处理器，再停止写盘线程。
+/// @return 无（析构函数不返回值）。
 Logger::~Logger()
 {
     uninstallQtMessageHandler();
@@ -324,12 +358,12 @@ bool Logger::start(const QString& directory,
     QMutexLocker locker(&mutex_);
     if (worker_ != nullptr)
         return true;
-    if (directory.isEmpty() || maxFileBytes <= 0) {
+    if (directory.isEmpty() || maxFileBytes <= 0) { ///< 目录为空或上限非正：拒绝启动。
         if (errorMessage != nullptr)
             *errorMessage = QString::fromUtf8(u8"日志目录或最大文件大小无效");
         return false;
     }
-    if (!QDir().mkpath(directory)) {
+    if (!QDir().mkpath(directory)) { ///< 目录无法创建：拒绝启动并上报路径。
         if (errorMessage != nullptr)
             *errorMessage = QString::fromUtf8(u8"无法创建日志目录：%1").arg(directory);
         return false;
@@ -344,19 +378,19 @@ bool Logger::start(const QString& directory,
 // 从共享指针中摘除 Worker 后再等待，保证并发 log() 不会访问正在析构的对象。
 void Logger::stop()
 {
-    Worker* worker = nullptr;
+    Worker* worker = nullptr; ///< 被摘除的写盘线程，锁外独占操作。
     {
         QMutexLocker locker(&mutex_);
         worker = worker_;
         worker_ = nullptr;
     }
-    if (worker != nullptr) {
+    if (worker != nullptr) { ///< 存在运行中的 Worker：等待其写完尾部队列。
         // worker_ 先置空后，新的 log() 会安全丢弃，而当前 stop 仍可独占旧 Worker。
         // 先从共享指针中摘除 Worker，阻止新的 log() 把记录交给正在停止的线程，
         // 再等待其写尾。超时后 Worker 仍独占自己的 QFile 和队列，未来自然结束时
         // 在创建线程通过 deleteLater 回收；Logger::stop() 本身仍在 5 秒内返回。
         const QMetaObject::Connection finishedCleanup = QObject::connect(
-            worker, &QThread::finished, worker, &QObject::deleteLater);
+            worker, &QThread::finished, worker, &QObject::deleteLater); ///< 超时分支的自回收连接。
         if (worker->stopAndWait()) {
             QObject::disconnect(finishedCleanup);
             delete worker;
@@ -383,7 +417,7 @@ bool Logger::isRunning() const
 // 在调用线程采集时间和线程 ID 后入队，文件格式化与 I/O 留给 Worker。
 void Logger::log(LogLevel level, const QString& moduleId, const QString& text)
 {
-    LogRecord record;
+    LogRecord record; ///< 待入队的记录，字段全部按值复制。
     record.timestamp = QDateTime::currentDateTime();
     record.level = level;
     record.moduleId = moduleId;
@@ -426,7 +460,7 @@ void Logger::qtMessageHandler(QtMsgType type,
 {
     // Qt Fatal 也先进入统一日志，再显式 flush，避免随后 abort 丢失最后一行。
     Q_UNUSED(context)
-    LogLevel level = LogLevel::Debug;
+    LogLevel level = LogLevel::Debug; ///< 映射后的日志级别，默认取 Debug。
     switch (type) {
     case QtDebugMsg: level = LogLevel::Debug; break;
     case QtInfoMsg: level = LogLevel::Info; break;
@@ -435,7 +469,7 @@ void Logger::qtMessageHandler(QtMsgType type,
     case QtFatalMsg: level = LogLevel::Error; break;
     }
     Logger::instance().log(level, QStringLiteral("Unknown"), message);
-    if (type == QtFatalMsg)
+    if (type == QtFatalMsg) ///< Fatal：写入后立即刷新，避免随后的 abort 丢日志。
         // Fatal 通常会马上终止进程，不能等待 100 ms 的普通刷新周期。
         Logger::instance().flush();
 }

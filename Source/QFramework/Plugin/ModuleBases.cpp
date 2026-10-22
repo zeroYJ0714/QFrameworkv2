@@ -19,6 +19,8 @@ InProcessNonUiModule::InProcessNonUiModule(QObject* parent)
 }
 
 // 让插件管理器可以通过基类指针安全销毁主进程非 UI 模块。
+/// @brief 虚析构，保证通过基类指针删除派生模块时正确析构。
+/// @return 无（析构函数不返回值）。
 InProcessNonUiModule::~InProcessNonUiModule() = default;
 
 // QWidget 版本把父对象交给 Qt，控件树会随模块一起释放。
@@ -28,6 +30,8 @@ InProcessUiModule::InProcessUiModule(QWidget* parent)
 }
 
 // 虚析构保证 DLL 卸载前完整析构派生 UI 模块。
+/// @brief 虚析构，保证卸载 DLL 前完整析构派生 UI 模块。
+/// @return 无（析构函数不返回值）。
 InProcessUiModule::~InProcessUiModule() = default;
 
 // 子进程非 UI 基类不创建线程；ProcessRuntime 在同一个 Qt 事件循环中驱动它。
@@ -37,6 +41,8 @@ ProcessNonUiModule::ProcessNonUiModule(QObject* parent)
 }
 
 // 退出时只释放 QObject 资源，Socket/共享内存由 ProcessRuntime 收尾。
+/// @brief 虚析构，退出时只释放 QObject 资源。
+/// @return 无（析构函数不返回值）。
 ProcessNonUiModule::~ProcessNonUiModule() = default;
 
 // 子进程 UI 基类只负责 QWidget 初始化，窗口句柄上报属于 ProcessRuntime。
@@ -46,5 +52,7 @@ ProcessUiModule::ProcessUiModule(QWidget* parent)
 }
 
 // 父进程只借用原生句柄，真正的 QWidget 生命周期仍在此进程结束。
+/// @brief 虚析构，窗口生命周期始终在本子进程内结束。
+/// @return 无（析构函数不返回值）。
 ProcessUiModule::~ProcessUiModule() = default;
 }

@@ -24,20 +24,20 @@ namespace qframework
 {
 namespace
 {
-QMutex failFastMutex;
-ProcessFailFast::Handler failFastHandler = nullptr;
+QMutex failFastMutex; ///< 保护 failFastHandler 的互斥锁，供测试替换与崩溃路径读取。
+ProcessFailFast::Handler failFastHandler = nullptr; ///< 可被测试替换的 fail-fast 处理器；为空时直接调用 qFatal。
 }
 
 bool ProcessFailFast::requestForHungModules(const QStringList& moduleIds)
 {
-    QStringList uniqueIds = moduleIds;
+    QStringList uniqueIds = moduleIds; ///< 去重后的模块 ID 列表，用于生成可读原因。
     uniqueIds.removeDuplicates();
     if (uniqueIds.isEmpty())
         return false;
     const QString reason = QString::fromUtf8(
         u8"应用退出时主进程模块消息回调未结束，无法安全卸载 DLL：%1")
-        .arg(uniqueIds.join(QStringLiteral(", ")));
-    Handler handler = nullptr;
+        .arg(uniqueIds.join(QStringLiteral(", "))); ///< 面向用户的终止原因说明。
+    Handler handler = nullptr; ///< 锁内取得的处理器副本，锁外再调用以免自锁。
     {
         QMutexLocker locker(&failFastMutex);
         handler = failFastHandler;
@@ -72,6 +72,8 @@ FrameworkRuntime::FrameworkRuntime(QApplication* application)
 {
 }
 
+/// @brief 析构时执行一次幂等的 shutdown，保证异常早退也能回收资源。
+/// @return 无（析构函数不返回值）。
 FrameworkRuntime::~FrameworkRuntime()
 {
     // shutdown 是幂等的，因此正常退出和异常早退都可以安全调用。
@@ -83,7 +85,7 @@ bool FrameworkRuntime::initialize(const QString& configFilePath,
                                   QString* errorMessage)
 {
     // 禁止重复初始化，也不允许在没有 QApplication 的情况下创建 UI。
-    if (initialized_ || application_ == nullptr) {
+    if (initialized_ || application_ == nullptr) { ///< 重复初始化或缺少 QApplication：直接失败。
         if (errorMessage != nullptr) {
             *errorMessage = initialized_
                 ? QString::fromUtf8(u8"框架已经初始化")
@@ -92,7 +94,7 @@ bool FrameworkRuntime::initialize(const QString& configFilePath,
         return false;
     }
 
-    QString error;
+    QString error; ///< 承接各初始化步骤的失败原因。
     if (!config_.load(configFilePath, &error)) {
         if (errorMessage != nullptr)
             *errorMessage = error;
@@ -129,7 +131,7 @@ bool FrameworkRuntime::initialize(const QString& configFilePath,
         processSupervisor_,
         &ProcessSupervisor::startupBatchFinished,
         processSupervisor_,
-        [this](const QStringList& errors) {
+        [this](const QStringList& errors) { ///< 子进程启动批次完成回调：先收警告再放行消息投递。
             appendStartupWarnings(errors);
             if (messageBus_ != nullptr)
                 messageBus_->setDeliveryEnabled(true);
@@ -137,14 +139,14 @@ bool FrameworkRuntime::initialize(const QString& configFilePath,
         });
     // 样式更新由主进程广播给已连接的 UI 子进程。
 
-    const QString styleFilePath = config_.style().file;
+    const QString styleFilePath = config_.style().file; ///< 全局 QSS 样式表路径，允许为空表示不加载。
     if (!styleFilePath.isEmpty() &&
-        !styleManager_->loadStyleSheet(styleFilePath, &error)) {
+        !styleManager_->loadStyleSheet(styleFilePath, &error)) { ///< 样式加载失败只记为启动警告，不阻断启动。
         appendStartupWarnings(
             QStringList() << QString::fromUtf8(u8"启动 QSS 加载失败：%1").arg(error));
     }
 
-    QStringList moduleErrors;
+    QStringList moduleErrors; ///< 承接插件加载/启动阶段的模块级错误。
     // 先启动主进程插件并挂接其 QWidget，再启动子进程模块。
     pluginManager_->loadAndStart(config_.modules(), &moduleErrors, false);
     appendStartupWarnings(moduleErrors);
@@ -180,7 +182,7 @@ void FrameworkRuntime::shutdown()
         return;
     shutdownComplete_ = true;
 
-    MessageBusStopReport stopReport;
+    MessageBusStopReport stopReport; ///< 全局队列停止结果，用于识别超时模块。
     // 只在这里执行一次全局队列停止；PluginManager 和 MessageBus 析构不重复预算。
     if (messageBus_ != nullptr) {
         messageBus_->beginShutdown();
@@ -191,13 +193,13 @@ void FrameworkRuntime::shutdown()
         processSupervisor_->shutdown();
     if (mainWindow_ != nullptr)
         mainWindow_->releaseInProcessUiModules();
-    QStringList quarantinedPluginIds;
+    QStringList quarantinedPluginIds; ///< PluginManager 判定需隔离保留的模块 ID。
     if (pluginManager_ != nullptr) {
         quarantinedPluginIds = pluginManager_->shutdown(
             stopReport.timedOutModuleIds);
     }
 
-    QStringList unsafeModuleIds = quarantinedPluginIds;
+    QStringList unsafeModuleIds = quarantinedPluginIds; ///< 合并后的不安全模块 ID，决定是否保留 MessageBus。
     if (messageBus_ != nullptr)
         unsafeModuleIds.append(messageBus_->quarantinedModuleIds());
     unsafeModuleIds.removeDuplicates();
@@ -211,7 +213,7 @@ void FrameworkRuntime::shutdown()
     pluginManager_ = nullptr;
     delete styleManager_;
     styleManager_ = nullptr;
-    if (unsafeModuleIds.isEmpty()) {
+    if (unsafeModuleIds.isEmpty()) { ///< 无隔离模块：可以安全销毁消息总线。
         delete messageBus_;
         messageBus_ = nullptr;
     } else {
@@ -219,7 +221,7 @@ void FrameworkRuntime::shutdown()
         messageBus_ = nullptr;
     }
 
-    if (loggerStarted_) {
+    if (loggerStarted_) { ///< 日志已启动：先恢复 Qt 处理器再冲刷并停止 Worker。
         Logger::instance().uninstallQtMessageHandler();
         // 先显式刷新，再 stop；即使最后一批日志还没到 100 ms 周期，也不会丢。
         Logger::instance().flush();
@@ -240,7 +242,7 @@ MainWindow* FrameworkRuntime::mainWindow() const
 void FrameworkRuntime::appendStartupWarnings(const QStringList& warnings)
 {
     // 同一条警告既保留在日志中，也留给 show() 向用户集中展示。
-    for (const QString& warning : warnings) {
+    for (const QString& warning : warnings) { ///< warning：当前待过滤的单条警告文本。
         if (warning.isEmpty())
             continue;
         if (startupWarnings_.contains(warning))
@@ -255,10 +257,10 @@ void FrameworkRuntime::appendStartupWarnings(const QStringList& warnings)
 void FrameworkRuntime::showPendingStartupWarnings()
 {
     if (mainWindow_ == nullptr || !mainWindow_->isVisible() ||
-        shownStartupWarningCount_ >= startupWarnings_.size()) {
+        shownStartupWarningCount_ >= startupWarnings_.size()) { ///< 窗口不可见或已全部展示过：无需弹窗。
         return;
     }
-    const QStringList pending = startupWarnings_.mid(shownStartupWarningCount_);
+    const QStringList pending = startupWarnings_.mid(shownStartupWarningCount_); ///< 本次尚未展示的警告子列表。
     shownStartupWarningCount_ = startupWarnings_.size();
     QMessageBox::warning(mainWindow_,
                          QString::fromUtf8(u8"框架启动警告"),

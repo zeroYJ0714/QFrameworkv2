@@ -17,23 +17,21 @@ class QFRAMEWORK_EXPORT ManagedDockWidget : public QDockWidget
     Q_OBJECT
 
 public:
-    // mainWindow 同时作为 QObject 父对象和 QDockWidget 宿主。
-    /// @brief 创建 ManagedDockWidget 对象并初始化其基础状态。
-    /// @param title 界面显示标题。
-    /// @param mainWindow 主窗口借用指针，同时作为 Dock 的 Qt 父对象。
+    /// @brief 创建可停靠面板，统一设成可移动、可关闭并允许四个停靠区域；关闭只代表隐藏，不销毁模块对象。
+    /// @param title 面板标题，显示在标题栏和标签页上。
+    /// @param mainWindow 宿主主窗口，同时作为本 Dock 的 Qt 父对象，由它负责本对象的生命周期。
     /// @return 无（构造函数不返回值）。
     explicit ManagedDockWidget(const QString& title,
                                QMainWindow* mainWindow);
 
 signals:
-    // 只表示用户按下 Dock 关闭按钮；标签切换不会发出该信号。
-    /// @brief 关闭 `closeRequested` 对应的框架操作。
+    /// @brief 用户按下 Dock 关闭按钮时发射，请求主窗口裁决是否隐藏；标签切换不会发射。
     /// @return 无。
     void closeRequested();
 
 protected:
-    /// @brief 关闭 `closeEvent` 对应的框架操作。
-    /// @param event Qt 事件对象；仅在当前回调期间有效。
+    /// @brief 覆写关闭事件：先 ignore 并发射 closeRequested 交给主窗口裁决，仅在主窗口已把本 Dock 隐藏后才 accept。
+    /// @param event Qt 关闭事件对象，只在本次回调期间有效，不允许为空。
     /// @return 无。
     void closeEvent(QCloseEvent* event) override;
 };

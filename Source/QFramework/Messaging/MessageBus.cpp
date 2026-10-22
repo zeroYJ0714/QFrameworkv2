@@ -32,9 +32,9 @@ struct QueuedMessage
 {
     // 发送者 ID 随主题一起传给订阅模块；payload 由所有订阅队列共享，
     // 队列覆盖、拒绝、停止清空和回调结束都会通过引用计数自动释放所有权。
-    QString topic;
-    QString senderModuleId;
-    MessagePayload payload;
+    QString topic; ///< 消息主题，用于订阅匹配与容量统计。
+    QString senderModuleId; ///< 发布者模块 ID，供订阅方区分来源。
+    MessagePayload payload; ///< 共享不可变载荷，多个订阅队列共用同一份数据。
 };
 
 // 一个模块对应一个消费者线程和一条有界输入队列。
@@ -43,6 +43,11 @@ class ModuleQueue : public QThread
 {
 public:
     // paused=true 用于启动阶段：允许先排队，但要等所有模块注册后再消费。
+    /// @brief 为一个模块创建专属消费者队列。
+    /// @param moduleId 队列所属模块 ID，用于日志标识。
+    /// @param endpoint 模块端点借用指针，回调时调用其 onMessage。
+    /// @param paused 是否先暂停消费，启动阶段传 true。
+    /// @return 无（构造函数不返回值）。
     ModuleQueue(const QString& moduleId, ModuleEndpoint* endpoint, bool paused)
         : moduleId_(moduleId),
           endpoint_(endpoint),
@@ -55,27 +60,31 @@ public:
     // 按主题容量入队：Reliable 满时拒绝，Latest 满时删除同主题最旧等待项。
     // 注意容量按 topic 分别计算，不是整个模块所有主题共用一个数字；因此视频 Latest
     // 不会占掉 SQL Reliable 的槽位。payload 是共享不可变值，覆盖/清空后自动释放。
+    /// @brief 按主题容量策略入队一条消息，必要时拒绝或淘汰旧项。
+    /// @param message 待投递的消息值对象。
+    /// @param config 该主题生效的容量与策略配置。
+    /// @return 消息被接受返回 true；Reliable 队列已满或入口已关闭返回 false。
     bool enqueue(const QueuedMessage& message, const TopicConfig& config)
     {
         // 生产者可能来自任意线程，但这里始终只复制不可变 Qt 值并在短锁内修改队列；
         // 真正的 ModuleEndpoint::onMessage 在 run() 的锁外执行。
         QMutexLocker locker(&mutex_);
         // 生产者只在锁内修改队列和统计，消费者取出副本后才调用业务回调。
-        if (!accepting_) {
+        if (!accepting_) { ///< 入口已关闭：拒绝并计入 rejected。
             ++stats_.rejected;
             return false;
         }
 
-        int topicCount = 0;
-        int oldestTopicIndex = -1;
-        for (int i = 0; i < queue_.size(); ++i) {
+        int topicCount = 0; ///< 队列中与当前消息同主题的待处理条数。
+        int oldestTopicIndex = -1; ///< 同主题中最旧一条的下标，-1 表示不存在。
+        for (int i = 0; i < queue_.size(); ++i) { ///< i：遍历队列以统计同主题条数。
             if (queue_.at(i).topic == message.topic) {
                 if (oldestTopicIndex < 0)
                     oldestTopicIndex = i;
                 ++topicCount;
             }
         }
-        if (topicCount >= config.queueCapacity) {
+        if (topicCount >= config.queueCapacity) { ///< 同主题容量已满：按策略拒绝或淘汰。
             if (config.policy == QueuePolicy::Reliable) {
                 // Reliable 满时保留旧消息并拒绝当前消息。
                 ++stats_.rejected;
@@ -94,6 +103,9 @@ public:
     }
 
     // 暂停/恢复消费者，不改变已经排队的消息。
+    /// @brief 暂停或恢复消费，已排队消息保持不动。
+    /// @param paused true 表示暂停消费，false 表示恢复并唤醒线程。
+    /// @return 无。
     void setPaused(bool paused)
     {
         QMutexLocker locker(&mutex_);
@@ -104,6 +116,9 @@ public:
     }
 
     // 切断生产入口并唤醒线程；调用方可选择立即丢弃或尽量排空等待项。
+    /// @brief 关闭入队入口并唤醒消费者，可选择立即丢弃待处理消息。
+    /// @param discardPending 为 true 时清空尚未消费的等待项。
+    /// @return 无。
     void beginStop(bool discardPending)
     {
         QMutexLocker locker(&mutex_);
@@ -111,7 +126,7 @@ public:
         accepting_ = false;
         paused_ = false;
         stopping_ = true;
-        if (discardPending) {
+        if (discardPending) { ///< 需要立即丢弃：清空队列并把条数计入 dropped。
             stats_.dropped += static_cast<quint64>(queue_.size());
             queue_.clear();
         }
@@ -120,6 +135,9 @@ public:
 
     // 只做一次有界等待；超时表示回调仍在执行，调用方不得删除本 QThread，也不能
     // 为了“快点退出”调用 terminate。调用方应把该 Registration 留在 quarantine。
+    /// @brief 在有界时间内等待消费者线程结束。
+    /// @param timeoutMs 最长等待毫秒数，非正数表示不等待直接判定。
+    /// @return 线程已停止返回 Stopped，超时返回 TimedOut。
     ModuleQueueStopResult finishStop(int timeoutMs)
     {
         if (isFinished() ||
@@ -138,6 +156,8 @@ public:
     }
 
     // 返回统计快照，避免调用方持有队列内部锁。
+    /// @brief 返回当前队列统计快照。
+    /// @return delivered/rejected/dropped 计数的值副本。
     ModuleQueueStats stats() const
     {
         QMutexLocker locker(&mutex_);
@@ -146,13 +166,15 @@ public:
 
 protected:
     // 串行取消息并在锁外调用模块回调，停止且队列清空后退出。
+    /// @brief 消费者主循环：串行取消息并在锁外调用模块 onMessage。
+    /// @return 无；停止且队列清空后退出。
     void run() override
     {
         // 每个模块独占一个 QThread，消息按入队顺序逐条消费；业务回调异常会被捕获，
         // 不会让总线线程直接崩溃，也不会阻止后续模块消息。
         // 一个 ModuleQueue 一个线程，保证同一模块的 onMessage 串行且顺序稳定。
         for (;;) {
-            QueuedMessage message;
+            QueuedMessage message; ///< 本轮取出的消息副本，锁外交给业务回调。
             {
                 QMutexLocker locker(&mutex_);
                 // 条件变量同时等待“有消息、解除暂停或停止”；100 ms 是漏唤醒时的
@@ -190,15 +212,15 @@ protected:
 
 private:
     // endpoint_ 是借用指针，生命周期由 Registration 和注销顺序保证。
-    QString moduleId_;
-    ModuleEndpoint* endpoint_;
-    mutable QMutex mutex_;
-    QWaitCondition available_;
-    QQueue<QueuedMessage> queue_;
-    bool accepting_;
-    bool paused_;
-    bool stopping_;
-    ModuleQueueStats stats_;
+    QString moduleId_; ///< 队列所属模块 ID，仅用于日志与诊断。
+    ModuleEndpoint* endpoint_; ///< 模块端点借用指针，不拥有其生命周期。
+    mutable QMutex mutex_; ///< 保护队列、统计与状态标志。
+    QWaitCondition available_; ///< 有新消息或暂停/停止状态变化时唤醒消费者。
+    QQueue<QueuedMessage> queue_; ///< 待消费消息队列，受 mutex_ 保护。
+    bool accepting_; ///< 是否仍接受新消息，停止后置为 false。
+    bool paused_; ///< 是否暂停消费，启动阶段为 true。
+    bool stopping_; ///< 是否已请求停止，队列清空后退出 run()。
+    ModuleQueueStats stats_; ///< 投递/拒绝/丢弃计数，锁内更新。
 };
 }
 
@@ -206,12 +228,12 @@ struct MessageBus::Registration
 {
     // Registration 是总线对一个模块的所有权记录；endpoint 由外部创建，
     // queue 和本结构由 MessageBus 创建并在 unregister 时释放。
-    ModuleEndpoint* endpoint = nullptr;
-    ModuleQueue* queue = nullptr;
-    QSet<QString> publishedTopics;
-    QSet<QString> subscribedTopics;
-    bool publishingEnabled = false;
-    bool quarantined = false;
+    ModuleEndpoint* endpoint = nullptr; ///< 模块端点借用指针，由插件/运行时拥有。
+    ModuleQueue* queue = nullptr; ///< 本模块专属消费者线程，由 Registration 拥有。
+    QSet<QString> publishedTopics; ///< 注册时冻结的可发布主题集合。
+    QSet<QString> subscribedTopics; ///< 注册时冻结的订阅主题集合。
+    bool publishingEnabled = false; ///< 当前是否允许该模块发布消息。
+    bool quarantined = false; ///< 停止超时需保留，禁止立即删除其线程与端点。
 };
 
 // 保存配置快照；初始允许注册/发布，但消息投递保持暂停直到框架统一放行。
@@ -223,13 +245,15 @@ MessageBus::MessageBus(const MessageBusConfig& config)
 {
 }
 
+/// @brief 析构兜底：停止全部队列并回收未超时的模块注册。
+/// @return 无（析构函数不返回值）。
 MessageBus::~MessageBus()
 {
     // 正常 FrameworkRuntime 会在析构前完成唯一一次停止；这里仅做兜底。
     beginShutdown();
-    const MessageBusStopReport report = stopQueues(config_.shutdownDrainTimeoutMs);
-    const QStringList ids = moduleIds();
-    for (const QString& id : ids) {
+    const MessageBusStopReport report = stopQueues(config_.shutdownDrainTimeoutMs); ///< 兜底停止结果，用于排除超时模块。
+    const QStringList ids = moduleIds(); ///< 当前仍注册的模块 ID 快照。
+    for (const QString& id : ids) { ///< id：逐个回收未超时的模块注册。
         if (!report.timedOutModuleIds.contains(id))
             unregisterModule(id, false);
     }
@@ -243,18 +267,18 @@ bool MessageBus::registerModule(const QString& moduleId,
     // 注册一次性冻结模块的发布/订阅主题，并创建专属队列线程；deliveryEnabled_ 为 false
     // 时线程先暂停消费，等框架把所有模块注册完再统一放行。
     // 主题声明在注册时冻结，后续 publish 不再接受动态新增主题。
-    if (moduleId.trimmed().isEmpty() || endpoint == nullptr) {
+    if (moduleId.trimmed().isEmpty() || endpoint == nullptr) { ///< 模块 ID 为空或端点为空：拒绝注册。
         if (errorMessage != nullptr)
             *errorMessage = QString::fromUtf8(u8"模块 ID 或端点为空");
         return false;
     }
 
-    const QStringList publishedList = endpoint->publishedTopics();
-    const QStringList subscribedList = endpoint->subscribedTopics();
-    const QSet<QString> published(publishedList.cbegin(), publishedList.cend());
-    const QSet<QString> subscribed(subscribedList.cbegin(), subscribedList.cend());
+    const QStringList publishedList = endpoint->publishedTopics(); ///< 端点声明的发布主题原始列表。
+    const QStringList subscribedList = endpoint->subscribedTopics(); ///< 端点声明的订阅主题原始列表。
+    const QSet<QString> published(publishedList.cbegin(), publishedList.cend()); ///< 去重后的发布主题集合。
+    const QSet<QString> subscribed(subscribedList.cbegin(), subscribedList.cend()); ///< 去重后的订阅主题集合。
     if (published.contains(QString()) || subscribed.contains(QString()) ||
-        published.size() != publishedList.size() || subscribed.size() != subscribedList.size()) {
+        published.size() != publishedList.size() || subscribed.size() != subscribedList.size()) { ///< 存在空主题或重复声明：拒绝注册。
         if (errorMessage != nullptr)
             *errorMessage = QString::fromUtf8(u8"模块 %1 的主题声明为空或重复")
                 .arg(moduleId);
@@ -262,18 +286,18 @@ bool MessageBus::registerModule(const QString& moduleId,
     }
 
     QMutexLocker locker(&mutex_);
-    if (!accepting_) {
+    if (!accepting_) { ///< 总线正在停止：拒绝新模块注册。
         if (errorMessage != nullptr)
             *errorMessage = QString::fromUtf8(u8"消息总线正在停止，拒绝新模块注册");
         return false;
     }
-    if (modules_.contains(moduleId)) {
+    if (modules_.contains(moduleId)) { ///< 模块 ID 已存在：拒绝重复注册。
         if (errorMessage != nullptr)
             *errorMessage = QString::fromUtf8(u8"模块 ID 重复：%1").arg(moduleId);
         return false;
     }
 
-    Registration* registration = new Registration;
+    Registration* registration = new Registration; ///< 本模块的所有权记录，后续由总线管理。
     registration->endpoint = endpoint;
     registration->publishedTopics = published;
     registration->subscribedTopics = subscribed;
@@ -289,7 +313,7 @@ bool MessageBus::registerModule(const QString& moduleId,
 bool MessageBus::setModuleRunning(const QString& moduleId, bool running)
 {
     QMutexLocker locker(&mutex_);
-    Registration* registration = modules_.value(moduleId, nullptr);
+    Registration* registration = modules_.value(moduleId, nullptr); ///< 目标模块的注册记录。
     if (registration == nullptr)
         return false;
     // running 由生命周期协调器设置；关闭中的总线即使收到 true 也拒绝发布。
@@ -302,7 +326,7 @@ bool MessageBus::setModuleRunning(const QString& moduleId, bool running)
 bool MessageBus::beginModuleStop(const QString& moduleId, bool discardPendingMessages)
 {
     QMutexLocker locker(&mutex_);
-    Registration* registration = modules_.value(moduleId, nullptr);
+    Registration* registration = modules_.value(moduleId, nullptr); ///< 目标模块的注册记录。
     if (registration == nullptr)
         return false;
     registration->publishingEnabled = false;
@@ -317,7 +341,7 @@ void MessageBus::setDeliveryEnabled(bool enabled)
     QMutexLocker locker(&mutex_);
     // 只改变消费暂停标记，不清空队列；启动阶段积累的消息仍可按顺序处理。
     deliveryEnabled_ = enabled;
-    for (Registration* registration : modules_)
+    for (Registration* registration : modules_) ///< registration：逐个同步暂停状态。
         registration->queue->setPaused(!enabled);
 }
 
@@ -328,7 +352,7 @@ void MessageBus::beginShutdown()
     // 关闭先切断生产入口，再解除暂停，让已有消息有机会在预算内排空。
     accepting_ = false;
     deliveryEnabled_ = true;
-    for (Registration* registration : modules_) {
+    for (Registration* registration : modules_) { ///< registration：逐个关闭入口并解除暂停。
         registration->publishingEnabled = false;
         registration->endpoint->setRunning(false);
         registration->queue->setPaused(false);
@@ -340,32 +364,32 @@ MessageBusStopReport MessageBus::stopQueues(int drainTimeoutMs)
 {
     // 用一份总 deadline 分配给所有模块，先停止生产再尽量排空可靠消息；某一模块超时
     // 会进入 quarantine，调用方不能删除仍可能执行 onMessage 的线程对象。
-    QVector<QPair<QString, ModuleQueue*>> queues;
+    QVector<QPair<QString, ModuleQueue*>> queues; ///< 模块 ID 与其队列的配对快照，锁外逐个等待。
     {
         QMutexLocker locker(&mutex_);
-        for (Registration* registration : modules_) {
+        for (Registration* registration : modules_) { ///< registration：先统一关闭入队入口。
             if (!stopQueuesRequested_)
                 registration->queue->beginStop(false);
         }
         for (QHash<QString, Registration*>::const_iterator iterator = modules_.constBegin();
-             iterator != modules_.constEnd(); ++iterator) {
+             iterator != modules_.constEnd(); ++iterator) { ///< iterator：遍历注册表收集队列快照。
             queues.append(qMakePair(iterator.key(), iterator.value()->queue));
         }
         stopQueuesRequested_ = true;
     }
 
-    MessageBusStopReport report;
-    QDeadlineTimer deadline(qMax(1, drainTimeoutMs));
-    for (const QPair<QString, ModuleQueue*>& item : queues) {
-        const int remaining = static_cast<int>(qMax<qint64>(0, deadline.remainingTime()));
-        const ModuleQueueStopResult result = item.second->finishStop(remaining);
+    MessageBusStopReport report; ///< 停止结果，逐模块累加已停止/超时 ID。
+    QDeadlineTimer deadline(qMax(1, drainTimeoutMs)); ///< 所有模块共享的总超时截止时间。
+    for (const QPair<QString, ModuleQueue*>& item : queues) { ///< item：当前等待的模块与其队列。
+        const int remaining = static_cast<int>(qMax<qint64>(0, deadline.remainingTime())); ///< 该模块可用的剩余毫秒数。
+        const ModuleQueueStopResult result = item.second->finishStop(remaining); ///< 该模块的停止结果。
         if (result == ModuleQueueStopResult::Stopped)
             report.stoppedModuleIds.append(item.first);
         else
             report.timedOutModuleIds.append(item.first);
 
         QMutexLocker locker(&mutex_);
-        Registration* registration = modules_.value(item.first, nullptr);
+        Registration* registration = modules_.value(item.first, nullptr); ///< 该模块的注册记录，用于写入隔离标记。
         if (registration != nullptr)
             registration->quarantined = result == ModuleQueueStopResult::TimedOut;
     }
@@ -375,7 +399,7 @@ MessageBusStopReport MessageBus::stopQueues(int drainTimeoutMs)
 // 从路由表移除模块、停止专属线程、解绑宿主并释放 Registration。
 bool MessageBus::unregisterModule(const QString& moduleId, bool drainPendingMessages)
 {
-    Registration* registration = nullptr;
+    Registration* registration = nullptr; ///< 目标模块的注册记录。
     {
         QMutexLocker locker(&mutex_);
         registration = modules_.value(moduleId, nullptr);
@@ -386,10 +410,10 @@ bool MessageBus::unregisterModule(const QString& moduleId, bool drainPendingMess
     // 先关闭入口，但只有线程确定停止后才从注册表摘除并删除对象。
     registration->publishingEnabled = false;
     registration->endpoint->setRunning(false);
-    if (registration->queue->isRunning()) {
+    if (registration->queue->isRunning()) { ///< 线程仍在运行：先有界等待其停止。
         registration->queue->beginStop(!drainPendingMessages);
         if (registration->queue->finishStop(config_.shutdownDrainTimeoutMs) ==
-            ModuleQueueStopResult::TimedOut) {
+            ModuleQueueStopResult::TimedOut) { ///< 超时：标记隔离并保留对象，避免访问失效线程。
             QMutexLocker locker(&mutex_);
             registration->quarantined = true;
             return false;
@@ -418,23 +442,23 @@ QStringList MessageBus::moduleIds() const
 ModuleQueueStats MessageBus::queueStats(const QString& moduleId) const
 {
     QMutexLocker locker(&mutex_);
-    Registration* registration = modules_.value(moduleId, nullptr);
+    Registration* registration = modules_.value(moduleId, nullptr); ///< 目标模块的注册记录。
     return registration == nullptr ? ModuleQueueStats() : registration->queue->stats();
 }
 
 bool MessageBus::isModuleQueueStopped(const QString& moduleId) const
 {
     QMutexLocker locker(&mutex_);
-    Registration* registration = modules_.value(moduleId, nullptr);
+    Registration* registration = modules_.value(moduleId, nullptr); ///< 目标模块的注册记录。
     return registration == nullptr || !registration->queue->isRunning();
 }
 
 QStringList MessageBus::quarantinedModuleIds() const
 {
-    QStringList result;
+    QStringList result; ///< 隔离模块 ID 收集结果。
     QMutexLocker locker(&mutex_);
     for (QHash<QString, Registration*>::const_iterator iterator = modules_.constBegin();
-         iterator != modules_.constEnd(); ++iterator) {
+         iterator != modules_.constEnd(); ++iterator) { ///< iterator：遍历注册表筛选隔离项。
         if (iterator.value()->quarantined && iterator.value()->queue->isRunning())
             result.append(iterator.key());
     }
@@ -459,35 +483,35 @@ bool MessageBus::publishSharedFromModule(const QString& moduleId,
     // 某个订阅者满了只影响返回值，不回滚已经成功进入其他队列的副本。
     QMutexLocker locker(&mutex_);
     // 下面所有校验在同一把总线锁内完成，保证注册/关闭不会与广播交错。
-    Registration* sender = modules_.value(moduleId, nullptr);
-    if (!accepting_ || sender == nullptr || !sender->publishingEnabled) {
+    Registration* sender = modules_.value(moduleId, nullptr); ///< 发布者的注册记录。
+    if (!accepting_ || sender == nullptr || !sender->publishingEnabled) { ///< 总线停止或发布者无权限：拒绝发布。
         logRejected(moduleId, QString::fromUtf8(u8"模块未运行或消息总线正在停止"));
         return false;
     }
-    if (!sender->publishedTopics.contains(topic)) {
+    if (!sender->publishedTopics.contains(topic)) { ///< 主题未在注册时声明：拒绝发布。
         logRejected(moduleId, QString::fromUtf8(u8"未声明发布主题：%1").arg(topic));
         return false;
     }
 
-    if (payload.isNull()) {
+    if (payload.isNull()) { ///< 共享载荷为空：拒绝发布。
         logRejected(moduleId, QString::fromUtf8(u8"共享消息载荷为空"));
         return false;
     }
 
-    const TopicConfig effective = topicConfig(topic);
-    if (payload->size() > effective.maxMessageBytes) {
+    const TopicConfig effective = topicConfig(topic); ///< 该主题实际生效的容量与策略。
+    if (payload->size() > effective.maxMessageBytes) { ///< 载荷超过主题上限：拒绝发布。
         logRejected(moduleId, QString::fromUtf8(u8"消息超过大小上限：%1").arg(topic));
         return false;
     }
 
-    QueuedMessage message;
+    QueuedMessage message; ///< 要投递到各订阅队列的消息值对象。
     message.topic = topic;
     message.senderModuleId = moduleId;
     message.payload = payload;
-    bool accepted = true;
+    bool accepted = true; ///< 是否所有订阅者都接受，任一拒绝即置 false。
     // 每个订阅者独立入队；只要有一个订阅者拒绝，返回值就是 false，
     // 但其他订阅者已经成功接收的消息不会回滚。
-    for (Registration* recipient : modules_) {
+    for (Registration* recipient : modules_) { ///< recipient：逐个筛选并投递的候选订阅者。
         if (!recipient->subscribedTopics.contains(topic))
             continue;
         if (!recipient->queue->enqueue(message, effective))
@@ -512,7 +536,7 @@ TopicConfig MessageBus::topicConfig(const QString& topic) const
     // 主题没有专用配置时复制全局默认值，调用方随后可安全调整本地副本。
     if (config_.topics.contains(topic))
         return config_.topics.value(topic);
-    TopicConfig result;
+    TopicConfig result; ///< 由全局默认值组合出的完整主题配置。
     result.queueCapacity = config_.defaultQueueCapacity;
     result.maxMessageBytes = config_.maxMessageBytes;
     result.policy = config_.defaultPolicy;
@@ -525,16 +549,16 @@ void MessageBus::logRejected(const QString& moduleId, const QString& reason) con
     // 日志限频只针对 Warning 文本，不改变真正的 rejected 统计，也不改变 Reliable
     // 拒绝或 Latest 覆盖。窗口内首条立即记录，重复项只累计次数，下一条日志再附带
     // “此前 N 次相同拒绝已限频”，帮助初学者看出错误是否持续发生。
-    constexpr qint64 kLogIntervalMs = 1000;
-    const QString key = moduleId + QChar(0x1f) + reason;
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    RejectionLogState& state = rejectionLogs_[key];
+    constexpr qint64 kLogIntervalMs = 1000; ///< 同一拒绝原因的最小记录间隔。
+    const QString key = moduleId + QChar(0x1f) + reason; ///< 模块 ID 与原因的限频键。
+    const qint64 now = QDateTime::currentMSecsSinceEpoch(); ///< 当前时间戳，用于判断限频窗口。
+    RejectionLogState& state = rejectionLogs_[key]; ///< 该限频键对应的累计状态。
     if (state.lastLoggedUtcMs > 0
-        && now - state.lastLoggedUtcMs < kLogIntervalMs) {
+        && now - state.lastLoggedUtcMs < kLogIntervalMs) { ///< 仍在限频窗口内：只累计抑制次数。
         ++state.suppressed;
         return;
     }
-    QString text = reason;
+    QString text = reason; ///< 实际写入日志的文本，必要时附带被限频次数。
     if (state.suppressed > 0) {
         text += QString::fromUtf8(u8"（此前 %1 次相同拒绝已限频）")
                     .arg(state.suppressed);

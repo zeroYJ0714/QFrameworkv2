@@ -17,11 +17,11 @@ namespace qframework
 {
 namespace
 {
-const qint64 kMaximumStyleSheetBytes = 16 * 1024 * 1024;
-const int kDockSeparatorHitExtent = 5;
-const int kDockSeparatorVisibleExtent = 1;
+const qint64 kMaximumStyleSheetBytes = 16 * 1024 * 1024; ///< QSS 文件大小上限，防止误把超大文件当样式表读入内存。
+const int kDockSeparatorHitExtent = 5; ///< Dock 分隔条的鼠标命中宽度，沿用 Qt 默认值以保证好抓取。
+const int kDockSeparatorVisibleExtent = 1; ///< 分隔条实际绘制出来的可见线宽，只占命中区中间 1 像素。
 const char* kDockSeparatorStyleInstalledProperty =
-    "_qframeworkDockSeparatorStyleInstalled";
+    "_qframeworkDockSeparatorStyleInstalled"; ///< 标记代理样式是否已安装的 QApplication 动态属性名。
 
 // 代理样式放在 QApplication 的基础样式上，而不是放在 MainWindow::setStyle() 上。
 // Qt 5.15 对“控件自定义 QStyle + QSS”支持不完整，后者会导致 qproperty-* 不生效；
@@ -30,11 +30,19 @@ const char* kDockSeparatorStyleInstalledProperty =
 class DockSeparatorStyle final : public QProxyStyle
 {
 public:
+    /// @brief 以已有 Qt 样式为基准构造代理样式。
+    /// @param baseStyle 被包裹的原始 Qt 样式，所有权交给本代理。
+    /// @return 无（构造函数不返回值）。
     explicit DockSeparatorStyle(QStyle* baseStyle)
         : QProxyStyle(baseStyle)
     {
     }
 
+    /// @brief 覆写分隔条命中宽度，其余度量沿用被包裹的原始样式。
+    /// @param metric 被查询的样式度量项。
+    /// @param option 当前绘制选项，可为空。
+    /// @param widget 目标控件，可为空。
+    /// @return Dock 分隔条度量返回加大后的命中宽度，其余返回原始样式的值。
     int pixelMetric(PixelMetric metric,
                     const QStyleOption* option,
                     const QWidget* widget) const override
@@ -44,6 +52,12 @@ public:
         return QProxyStyle::pixelMetric(metric, option, widget);
     }
 
+    /// @brief 只重绘 Dock 分隔条，把它从 5 像素命中区收缩为 1 像素细线。
+    /// @param element 待绘制的图元类型，非分隔条时直接转发给原始样式。
+    /// @param option 绘制选项，提供命中矩形、状态和调色板。
+    /// @param painter 绘制目标画笔。
+    /// @param widget 目标控件，用于读取 QSS 写入的颜色属性。
+    /// @return 无。
     void drawPrimitive(PrimitiveElement element,
                        const QStyleOption* option,
                        QPainter* painter,
@@ -58,7 +72,7 @@ public:
         // QMainWindow 传入的是完整 5px 命中矩形。宽大于高表示上下 Dock 之间的
         // 横线，高大于宽表示左右 Dock 之间的竖线；这样不依赖 Qt 内部较反直觉的
         // State_Horizontal 标记含义，也能同时覆盖上下和左右两种布局。
-        QRect visibleRect = option->rect;
+        QRect visibleRect = option->rect; ///< 由命中矩形收缩得到的实际绘制矩形。
         if (visibleRect.width() >= visibleRect.height()) {
             visibleRect.setTop(
                 visibleRect.center().y() - (kDockSeparatorVisibleExtent - 1) / 2);
@@ -73,15 +87,15 @@ public:
         // 就使用调色板保证默认主题仍然可见。
         const char* colorProperty = option->state.testFlag(State_MouseOver)
             ? "dockSeparatorHoverColor"
-            : "dockSeparatorColor";
+            : "dockSeparatorColor"; ///< 按是否悬停选择要读取的颜色属性名。
         const QColor propertyColor = widget != nullptr
             ? widget->property(colorProperty).value<QColor>()
-            : QColor();
+            : QColor(); ///< QSS 通过属性写入的颜色，未设置时无效。
         const QColor color = propertyColor.isValid()
             ? propertyColor
             : option->palette.color(option->state.testFlag(State_MouseOver)
                                         ? QPalette::Highlight
-                                        : QPalette::Mid);
+                                        : QPalette::Mid); ///< 最终绘制颜色：优先取 QSS 属性，否则回退到调色板。
 
         // fillRect 不启用抗锯齿，不会把 1px 颜色扩散到相邻像素；命中区其余位置
         // 保持透明，由 QMainWindow 自己的背景正常显示。
@@ -91,6 +105,9 @@ public:
 
 // 在应用生命周期内只安装一次。QApplication::setStyle 会接管新样式对象的所有权，
 // QProxyStyle 同时接管原来的 Qt 样式，应用退出时由 Qt 按父子关系完整释放。
+/// @brief 幂等地为 QApplication 安装一次 Dock 分隔条代理样式。
+/// @param application 目标应用对象，为空时直接返回。
+/// @return 无；已安装过时不再重复安装。
 void ensureDockSeparatorStyle(QApplication* application)
 {
     if (application == nullptr ||
@@ -98,7 +115,7 @@ void ensureDockSeparatorStyle(QApplication* application)
         return;
     }
 
-    QStyle* currentStyle = application->style();
+    QStyle* currentStyle = application->style(); ///< 当前生效的 Qt 基础样式，将被代理包裹。
     if (currentStyle == nullptr)
         return;
     application->setStyle(new DockSeparatorStyle(currentStyle));
@@ -106,6 +123,10 @@ void ensureDockSeparatorStyle(QApplication* application)
 }
 
 // 统一写入可选错误输出，避免每个校验分支重复判断 nullptr。
+/// @brief 统一写入可选错误输出，调用方传空指针时安全忽略。
+/// @param errorMessage 可选输出参数，为空时丢弃消息。
+/// @param message 要写入的中文失败原因。
+/// @return 无。
 void setError(QString* errorMessage, const QString& message)
 {
     // errorMessage 是可选输出参数，调用方不需要错误文本时允许传 nullptr。
@@ -125,11 +146,11 @@ bool StyleManager::loadStyleSheet(const QString& filePath,
                                   QString* errorMessage)
 {
     // 临时变量接收文件内容，只有全部成功才写入 current* 字段。
-    QString styleSheet;
+    QString styleSheet; ///< 本次读出的样式文本，校验通过后才提交为当前样式。
     if (!readStyleSheet(filePath, &styleSheet, errorMessage))
         return false;
 
-    QApplication* application = qobject_cast<QApplication*>(QCoreApplication::instance());
+    QApplication* application = qobject_cast<QApplication*>(QCoreApplication::instance()); ///< 当前进程的应用对象，用于应用全局样式。
     if (application == nullptr) {
         setError(errorMessage, QString::fromUtf8(u8"当前进程没有 QApplication"));
         return false;
@@ -183,7 +204,7 @@ bool StyleManager::readStyleSheet(const QString& filePath,
         return false;
     }
 
-    QFile file(filePath);
+    QFile file(filePath); ///< 待读取的 QSS 文件句柄。
     if (!file.open(QIODevice::ReadOnly)) {
         setError(errorMessage,
                  QString::fromUtf8(u8"无法读取 QSS 文件：%1").arg(file.errorString()));
@@ -194,11 +215,11 @@ bool StyleManager::readStyleSheet(const QString& filePath,
         return false;
     }
 
-    const QByteArray data = file.readAll();
+    const QByteArray data = file.readAll(); ///< 文件原始字节，稍后按 UTF-8 解码。
     // ConverterState 能区分“替换了非法字符”和真正的合法 UTF-8。
-    QTextCodec* codec = QTextCodec::codecForName("UTF-8");
-    QTextCodec::ConverterState state;
-    const QString decoded = codec->toUnicode(data.constData(), data.size(), &state);
+    QTextCodec* codec = QTextCodec::codecForName("UTF-8"); ///< 固定使用 UTF-8 解码器，不依赖系统区域设置。
+    QTextCodec::ConverterState state; ///< 记录解码过程中的非法字符数量。
+    const QString decoded = codec->toUnicode(data.constData(), data.size(), &state); ///< 解码后的 QSS 文本。
     if (state.invalidChars > 0) {
         setError(errorMessage, QString::fromUtf8(u8"QSS 文件不是有效的 UTF-8"));
         return false;
@@ -219,19 +240,19 @@ bool StyleManager::isStructurallyValid(const QString& styleSheet) const
     // 它不是完整 QSS 解析器，但能在 QApplication 应用前拦截常见截断文件。
     enum class ScanState
     {
-        Normal,
-        SingleQuoted,
-        DoubleQuoted,
-        Comment
+        Normal, ///< 普通状态，引号、注释和大括号都按语法含义处理。
+        SingleQuoted, ///< 位于单引号字符串内部。
+        DoubleQuoted, ///< 位于双引号字符串内部。
+        Comment ///< 位于 /* */ 注释内部。
     };
 
-    ScanState state = ScanState::Normal;
-    int braceDepth = 0;
-    bool escaped = false;
-    for (int index = 0; index < styleSheet.size(); ++index) {
-        const QChar character = styleSheet.at(index);
+    ScanState state = ScanState::Normal; ///< 当前扫描状态，从普通状态开始。
+    int braceDepth = 0; ///< 尚未配对的左大括号数量。
+    bool escaped = false; ///< 前一字符是否为字符串内的反斜杠转义。
+    for (int index = 0; index < styleSheet.size(); ++index) { ///< 逐字符扫描的下标。
+        const QChar character = styleSheet.at(index); ///< 当前正在检查的字符。
         const QChar next = index + 1 < styleSheet.size()
-            ? styleSheet.at(index + 1) : QChar();
+            ? styleSheet.at(index + 1) : QChar(); ///< 下一个字符，用于识别 /* 与 */。
 
         if (state == ScanState::Comment) {
             // 注释内部的大括号和引号不参与结构计数。

@@ -26,158 +26,145 @@ namespace qframework
 {
 enum class ModuleQueueStopResult
 {
-    Stopped,
-    TimedOut
+    Stopped, ///< 投递线程已在预算内结束，Registration 可以安全回收。
+    TimedOut ///< 等待超时，线程可能仍在执行 onMessage，只能标记隔离保留。
 };
 
 struct MessageBusStopReport
 {
-    QStringList stoppedModuleIds; ///< 保存 `stoppedModuleIds` 相关值的 Qt 容器。
-    QStringList timedOutModuleIds; ///< 保存 `timedOutModuleIds` 相关值的 Qt 容器。
+    QStringList stoppedModuleIds; ///< 已在停止预算内结束投递线程的模块 ID。
+    QStringList timedOutModuleIds; ///< 等待超时、可能仍在执行 onMessage 的模块 ID；这类模块必须隔离保留。
 
+    /// @brief 判断是否所有模块队列都已在预算内停止。
+    /// @return 无超时模块返回 true；timedOutModuleIds 非空返回 false。
     bool allStopped() const { return timedOutModuleIds.isEmpty(); }
+    /// @brief 布尔上下文判断，等价于 allStopped()。
+    /// @return 无超时模块返回 true，可直接用于 if (!report) 这类判断。
     explicit operator bool() const { return allStopped(); }
 };
 
 struct ModuleQueueStats
 {
-    // delivered 是已调用 onMessage 的数量；dropped 是 Latest/停止丢弃数量；
-    // rejected 是 Reliable 满、停止或非法请求拒绝数量。
-    quint64 delivered = 0; ///< `delivered` 对应的数值配置、计数或时间状态。
-    quint64 dropped = 0; ///< `dropped` 对应的数值配置、计数或时间状态。
-    quint64 rejected = 0; ///< `rejected` 对应的数值配置、计数或时间状态。
+    quint64 delivered = 0; ///< 已完成 onMessage 调用的消息条数，回调抛异常也计入。
+    quint64 dropped = 0; ///< 被 Latest 淘汰的同主题最旧等待项，以及停止时清空队列丢弃的条数。
+    quint64 rejected = 0; ///< 未被队列接受的消息条数：Reliable 已满或入队入口已关闭时递增。
 };
 
 class QFRAMEWORK_EXPORT MessageBus : public ModuleHost
 {
 public:
-    // config 按值保存，保证总线运行期间配置快照稳定。
-    /// @brief 创建 MessageBus 对象并初始化其基础状态。
-    /// @param config 运行配置值。
+    /// @brief 创建消息总线：保存配置快照，此时允许注册模块，但消息投递保持暂停。
+    /// @param config 消息总线配置快照，按值保存、运行期不再变化，提供默认容量、单条消息上限与停止预算。
     /// @return 无（构造函数不返回值）。
     explicit MessageBus(const MessageBusConfig& config);
-    /// @brief 销毁 MessageBus 对象并释放其拥有的资源。
-    /// @return 无（析构函数不返回值）。
+    /// @brief 析构兜底：先 beginShutdown()，再在配置预算内停止全部队列，只回收未超时的模块注册。
+    /// @return 无（析构函数不返回值）；停止超时的模块连同其投递线程故意不释放，避免仍在执行的 onMessage 访问已销毁对象。
     ~MessageBus() override;
 
-    // 注册主题声明并启动模块专属队列；重复 ID 或空主题会失败。
-    /// @brief 注册 `registerModule` 对应的框架操作。
-    /// @param moduleId 稳定模块 ID。
-    /// @param endpoint 传给该操作的 `endpoint` 参数；取值应符合声明类型和函数用途。
-    /// @param errorMessage 可选错误说明输出参数。
-    /// @return 条件或操作成功时返回 true，否则返回 false。
+    /// @brief 注册模块：冻结其发布/订阅主题声明，创建专属投递线程并把端点绑定到本总线。
+    /// @param moduleId 模块唯一 ID，去掉首尾空白后不能为空，也不能与已注册模块重复。
+    /// @param endpoint 模块端点借用指针，不能为空；总线只调用其主题声明与回调接口，不拥有它。
+    /// @param errorMessage 可选的失败原因输出参数，可为空；仅在返回 false 时写入。
+    /// @return 注册成功返回 true；ID 为空、端点为 nullptr、主题声明含空项或重复、总线正在停止、ID 已存在时返回 false。
     bool registerModule(const QString& moduleId,
                         ModuleEndpoint* endpoint,
-                        QString* errorMessage = nullptr); ///< `errorMessage` 对应的对象指针；所有权和线程归属见本类文件级说明。
-    // 设置 publish 是否可用，不等于是否已经收到消息。
-    /// @brief 设置 `setModuleRunning` 对应的框架操作。
-    /// @param moduleId 稳定模块 ID。
-    /// @param running 目标运行状态。
-    /// @return 条件或操作成功时返回 true，否则返回 false。
+                        QString* errorMessage = nullptr);
+    /// @brief 开关模块的发布门禁并同步给端点；它只决定能否 publish，不代表模块已启动或已收到消息。
+    /// @param moduleId 目标模块 ID。
+    /// @param running true 表示允许发布，false 表示立即禁止；总线正在停止时传 true 也会降级为禁止。
+    /// @return 模块已注册返回 true；模块不存在返回 false。
     bool setModuleRunning(const QString& moduleId, bool running);
-    // 立即关闭单个模块的发布和接收入口；线程回收留给后续有界停止流程。
-    /// @brief 开始 `beginModuleStop` 对应的框架操作。
-    /// @param moduleId 稳定模块 ID。
-    /// @param discardPendingMessages 传给该操作的 `discardPendingMessages` 参数；取值应符合声明类型和函数用途。
-    /// @return 条件或操作成功时返回 true，否则返回 false。
+    /// @brief 立即关闭单个模块的发布与接收入口；不等待其投递线程结束，线程回收留给后续有界停止流程。
+    /// @param moduleId 目标模块 ID。
+    /// @param discardPendingMessages true 表示清空尚未消费的等待项并计入 dropped，false 表示继续排空已有消息。
+    /// @return 模块已注册返回 true；模块不存在返回 false。
     bool beginModuleStop(const QString& moduleId, bool discardPendingMessages);
-    // 启动阶段先暂停队列，所有模块注册完成后一次性开启投递。
-    /// @brief 设置 `setDeliveryEnabled` 对应的框架操作。
-    /// @param enabled 目标启用状态。
-    /// @return 无。
+    /// @brief 统一放行或暂停所有模块的消息消费，不清空已排队消息；启动阶段用它把投递推迟到全部模块注册完成之后。
+    /// @param enabled true 表示放行消费，false 表示暂停消费。
+    /// @return 无；已排队的消息按原顺序保留。
     void setDeliveryEnabled(bool enabled);
-    // 关闭发布入口并唤醒所有暂停队列。
-    /// @brief 开始 `beginShutdown` 对应的框架操作。
-    /// @return 无。
+    /// @brief 全局关闭发布入口并解除消费暂停，让已排队消息有机会在停止预算内排空。
+    /// @return 无；不等待任何线程结束，随后应调用 stopQueues()。
     void beginShutdown();
-    // 在一个总预算内停止全部队列，并区分已停止与仍在回调中的模块。
-    /// @brief 停止 `stopQueues` 对应的框架操作。
-    /// @param drainTimeoutMs 停止队列的总排空预算，单位毫秒。
-    /// @return 返回声明类型的结果值。
+    /// @brief 用一份共享的 deadline 停止全部模块队列，并区分已停止与仍在回调中的模块。
+    /// @param drainTimeoutMs 所有队列共享的总排空预算，单位毫秒；非正值按 1 毫秒处理。
+    /// @return 停止报告：stoppedModuleIds 为已结束的模块，timedOutModuleIds 为仍可能回调、必须隔离保留的模块。
     MessageBusStopReport stopQueues(int drainTimeoutMs);
-    // 移除一个模块；drainPendingMessages 决定停止前是否保留待处理消息。
-    /// @brief 注销 `unregisterModule` 对应的框架操作。
-    /// @param moduleId 稳定模块 ID。
-    /// @param drainPendingMessages 传给该操作的 `drainPendingMessages` 参数；取值应符合声明类型和函数用途。
-    /// @return 条件或操作成功时返回 true，否则返回 false。
+    /// @brief 注销模块：关闭入口、有界等待投递线程结束，然后解绑端点并释放注册记录与其队列。
+    /// @param moduleId 目标模块 ID。
+    /// @param drainPendingMessages true 表示先尽量排空待处理消息再停止，false 表示立即丢弃等待项。
+    /// @return 注销成功返回 true；模块不存在、或线程在配置预算内未停（已标记隔离保留）返回 false。
     bool unregisterModule(const QString& moduleId, bool drainPendingMessages);
 
     // 以下查询只返回快照，不把内部锁或队列所有权交给调用方。
-    /// @brief 执行 `moduleIds` 所定义的类职责。
-    /// @return 返回对应 Qt 值或容器的安全副本。
+    /// @brief 取当前已注册模块 ID 的快照。
+    /// @return 模块 ID 列表，顺序由 QHash 决定，不代表配置或启动顺序。
     QStringList moduleIds() const;
-    /// @brief 排队 `queueStats` 对应的框架操作。
-    /// @param moduleId 稳定模块 ID。
-    /// @return 返回声明类型的结果值。
+    /// @brief 查询指定模块队列的投递计数快照。
+    /// @param moduleId 目标模块 ID。
+    /// @return delivered/dropped/rejected 的值副本；模块不存在时返回全零默认值。
     ModuleQueueStats queueStats(const QString& moduleId) const;
-    /// @brief 检查 `isModuleQueueStopped` 对应的框架操作。
-    /// @param moduleId 稳定模块 ID。
-    /// @return 条件或操作成功时返回 true，否则返回 false。
+    /// @brief 判断指定模块的投递线程是否已经结束。
+    /// @param moduleId 目标模块 ID。
+    /// @return 线程已结束、或模块从未注册（已注销）返回 true，线程仍在运行时返回 false。
     bool isModuleQueueStopped(const QString& moduleId) const;
-    /// @brief 执行 `quarantinedModuleIds` 所定义的类职责。
-    /// @return 返回对应 Qt 值或容器的安全副本。
+    /// @brief 列出停止超时、仍需隔离保留的模块 ID。
+    /// @return 已标记隔离且投递线程仍在运行的模块 ID 列表；可安全回收的模块不会出现。
     QStringList quarantinedModuleIds() const;
 
-    // ModuleEndpoint::publish 的宿主实现：校验发布权限和大小后，
-    // 把同一消息复制到所有订阅者各自的有界队列。
-    /// @brief 发布 `publishFromModule` 对应的框架操作。
-    /// @param moduleId 稳定模块 ID。
-    /// @param topic 消息主题名称。
-    /// @param data 原始字节数据，可包含 NUL。
-    /// @return 条件或操作成功时返回 true，否则返回 false。
+    /// @brief 实现 ModuleEndpoint::publish：把字节数组复制成共享载荷，再走 publishSharedFromModule 的校验与路由。
+    /// @param moduleId 发布者模块 ID，必须已注册且当前允许发布。
+    /// @param topic 目标主题，必须是该模块注册时声明过的发布主题。
+    /// @param data 消息字节内容，可包含 NUL；空数组也会被复制成合法的零字节载荷。
+    /// @return true 只表示所有订阅队列都收下了这条消息，不代表订阅方业务处理成功；发布资格、主题或大小不合法、任一订阅队列拒绝时返回 false。
     bool publishFromModule(const QString& moduleId,
                            const QString& topic,
-                           const QByteArray& data) override; ///< 保存 `override` 对应的对象状态或配置值。
-    // ModuleEndpoint::publishShared 的主进程宿主实现；校验完成后把同一个
-    // MessagePayload 引用放入所有订阅者队列，不复制 QByteArray 对象。
-    /// @brief 发布 `publishSharedFromModule` 对应的框架操作。
-    /// @param moduleId 稳定模块 ID。
-    /// @param topic 消息主题名称。
-    /// @param payload 不可变或独立拥有的消息载荷。
-    /// @return 条件或操作成功时返回 true，否则返回 false。
+                           const QByteArray& data) override;
+    /// @brief 实现 ModuleEndpoint::publishShared：在总线锁内校验发布资格后，把同一份共享载荷放入所有订阅者队列，不复制 QByteArray。
+    /// @param moduleId 发布者模块 ID，必须已注册且当前允许发布。
+    /// @param topic 目标主题，必须是该模块注册时声明过的发布主题。
+    /// @param payload 共享不可变载荷，按引用入队；空载荷（isNull）会被拒绝。
+    /// @return 全部订阅者都接受返回 true；总线正在停止、发布者无权、主题未声明、载荷为空、超过该主题字节上限或任一订阅队列拒绝时返回 false，其他订阅者已入队的副本不回滚。
     bool publishSharedFromModule(const QString& moduleId,
                                  const QString& topic,
-                                 const MessagePayload& payload) override; ///< 保存 `override` 对应的对象状态或配置值。
-    // ModuleEndpoint 的日志宿主实现，转交单例 Logger。
-    /// @brief 记录 `logFromModule` 对应的框架操作。
+                                 const MessagePayload& payload) override;
+    /// @brief 实现 ModuleEndpoint::log：把模块日志直接交给单例 Logger，不经过消息主题，避免形成递归消息链。
     /// @param level 日志严重级别。
-    /// @param moduleId 稳定模块 ID。
-    /// @param text 待显示、发送或记录的文本。
-    /// @return 无。
+    /// @param moduleId 产生日志的模块 ID，作为日志来源标识。
+    /// @param text 日志正文。
+    /// @return 无；日志进入 Logger 的异步队列，本函数不等待落盘。
     void logFromModule(LogLevel level,
                        const QString& moduleId,
-                       const QString& text) override; ///< 保存 `override` 对应的对象状态或配置值。
+                       const QString& text) override;
 
 private:
+    // Registration 的完整定义在 MessageBus.cpp：它记录总线对单个模块的端点、队列与主题声明。
     struct Registration;
     struct RejectionLogState
     {
         // 所有字段只在 MessageBus::mutex_ 保护下访问；重复拒绝只累计，不创建
         // 新线程或等待磁盘，下一次允许记录时把 suppressed 合并到一条摘要日志。
-        qint64 lastLoggedUtcMs = 0; ///< `lastLoggedUtcMs` 对应的数值配置、计数或时间状态。
-        quint64 suppressed = 0; ///< `suppressed` 对应的数值配置、计数或时间状态。
+        qint64 lastLoggedUtcMs = 0; ///< 上次真正写出日志的 UTC 毫秒时间戳，0 表示尚未记录过。
+        quint64 suppressed = 0; ///< 上次记录之后被限频抑制掉的同类拒绝次数，随摘要日志清零。
     };
-
-    /// @brief 执行 `topicConfig` 所定义的类职责。
-    /// @param topic 消息主题名称。
-    /// @return 返回声明类型的结果值。
+    /// @brief 取指定主题生效的队列规则；主题没有专用配置时用全局默认值补齐。
+    /// @param topic 目标主题名，可以是未单独配置过的主题。
+    /// @return 完整可用的 TopicConfig（容量、单条字节上限、策略），调用方拿到的是可安全修改的副本。
     TopicConfig topicConfig(const QString& topic) const;
-    // 调用方已持有 mutex_；日志本身仍走 Logger 的异步队列，避免每次拒绝同步写盘。
-    /// @brief 记录 `logRejected` 对应的框架操作。
-    /// @param moduleId 稳定模块 ID。
-    /// @param reason 操作原因。
-    /// @return 无。
+    /// @brief 记录一次发布拒绝，并对同一「模块 + 原因」限频：调用方必须已持有 mutex_，本函数只操作 rejectionLogs_。
+    /// @param moduleId 触发拒绝的模块 ID，同时作为日志来源。
+    /// @param reason 拒绝原因文本，同时参与限频键的构造。
+    /// @return 无；处于 1 秒限频窗口内只累计 suppressed，不写日志，下一次记录时附带被抑制的次数。
     void logRejected(const QString& moduleId, const QString& reason) const;
 
-    // mutex_ 保护模块注册表和 accepting/deliveryEnabled 状态。
-    MessageBusConfig config_; ///< 当前对象持有的配置副本。
-    mutable QMutex mutex_; ///< 保护同一注释分组内共享状态的互斥量。
-    QHash<QString, Registration*> modules_; ///< `modules_` 对应的对象指针；所有权和线程归属见本类文件级说明。
-    // key 是“模块 + 原因”的稳定组合；1 秒窗口内不重复输出 Warning，但 rejected
-    // 统计仍由 ModuleQueue 每次拒绝递增，可靠/最新消息策略完全不受影响。
-    mutable QHash<QString, RejectionLogState> rejectionLogs_; ///< 保存 `rejectionLogs` 相关值的 Qt 容器。
-    bool accepting_; ///< `accepting_` 对应的布尔状态标志。
-    bool deliveryEnabled_; ///< `deliveryEnabled_` 对应的布尔状态标志。
-    bool stopQueuesRequested_; ///< `stopQueuesRequested_` 对应的布尔状态标志。
+    MessageBusConfig config_; ///< 构造时按值保存的配置快照，运行期只读，提供默认容量、单条消息上限与停止预算。
+    mutable QMutex mutex_; ///< 总线级互斥量，保护 modules_、rejectionLogs_ 和下面三个状态标志。
+    QHash<QString, Registration*> modules_; ///< 模块 ID 到注册记录的映射；Registration 及其投递线程由本类创建并释放。
+    // 限频只影响 Warning 文本：rejected 统计仍由 ModuleQueue 每次拒绝递增，
+    // Reliable 拒绝与 Latest 淘汰行为完全不受影响。
+    mutable QHash<QString, RejectionLogState> rejectionLogs_; ///< 限频键（模块 ID + 0x1f + 原因）到抑制状态的映射，总线生命周期内只增不删。
+    bool accepting_; ///< 是否仍接受注册与发布；beginShutdown() 置 false 后不再复位。
+    bool deliveryEnabled_; ///< 是否放行消费；构造时为 false，全部模块注册完成后由 setDeliveryEnabled(true) 打开。
+    bool stopQueuesRequested_; ///< stopQueues() 是否已向各队列下发过停止请求，保证重复调用不重复 beginStop。
 };
 }

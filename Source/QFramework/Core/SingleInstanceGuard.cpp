@@ -1,6 +1,5 @@
-// 文件职责：用 QLocalServer/QLocalSocket 实现单实例门禁和重复启动通知。
-// 所有 socket 只在创建该对象的 GUI/主线程使用；server 由本对象拥有，重复实例只发送
-// 一次唤醒消息后退出。析构时关闭监听并释放本地 IPC 名称，不强杀其他进程。
+// 文件职责：用程序目录哈希命名 Windows 互斥量，检查同目录是否已有实例。
+// 此实现没有 Socket 唤醒消息；析构仅关闭本进程持有的互斥量句柄。
 #include "SingleInstanceGuard.h"
 
 #include <QCryptographicHash>
@@ -22,6 +21,8 @@ SingleInstanceGuard::SingleInstanceGuard()
 }
 
 // 释放本实例持有的命名互斥量句柄；Windows 内核对象会在最后句柄关闭后消失。
+/// @brief 析构时关闭本进程持有的命名互斥量句柄。
+/// @return 无（析构函数不返回值）。
 SingleInstanceGuard::~SingleInstanceGuard()
 {
 #ifdef Q_OS_WIN
@@ -40,28 +41,28 @@ SingleInstanceResult SingleInstanceGuard::acquire(
     if (mutexHandle_ != nullptr)
         return SingleInstanceResult::Acquired;
 
-    QDir directory(executableDirectory);
+    QDir directory(executableDirectory); ///< 待规范化的程序目录。
     // canonicalPath 能消除符号链接；路径不存在时退回 absolutePath。
-    QString identity = directory.canonicalPath();
+    QString identity = directory.canonicalPath(); ///< 目录身份字符串，优先取消除符号链接后的规范路径。
     if (identity.isEmpty())
         identity = directory.absolutePath();
     identity = QDir::fromNativeSeparators(QDir::cleanPath(identity)).toLower();
-    if (identity.isEmpty()) {
+    if (identity.isEmpty()) { ///< 目录无法解析：上报错误而不是退化成全局单实例。
         if (errorMessage != nullptr)
             *errorMessage = QString::fromUtf8(u8"无法确定程序目录");
         return SingleInstanceResult::Error;
     }
 
     const QByteArray digest = QCryptographicHash::hash(
-        identity.toUtf8(), QCryptographicHash::Sha256).toHex();
+        identity.toUtf8(), QCryptographicHash::Sha256).toHex(); ///< 目录身份的 SHA-256 十六进制摘要，作为互斥量名后缀。
     const QString mutexName = QStringLiteral("Local\\QFrameworkApp_%1")
-        .arg(QString::fromLatin1(digest));
+        .arg(QString::fromLatin1(digest)); ///< 当前登录会话内唯一的命名互斥量名称。
 
 #ifdef Q_OS_WIN
     // Local\\ 作用域限制在当前登录会话，不与其他 Windows 会话互相阻塞。
     SetLastError(ERROR_SUCCESS);
     HANDLE handle = CreateMutexW(
-        nullptr, FALSE, reinterpret_cast<LPCWSTR>(mutexName.utf16()));
+        nullptr, FALSE, reinterpret_cast<LPCWSTR>(mutexName.utf16())); ///< 新建或打开的命名互斥量句柄。
     if (handle == nullptr) {
         if (errorMessage != nullptr) {
             *errorMessage = QString::fromUtf8(u8"无法创建单实例互斥量，Win32 错误 %1")

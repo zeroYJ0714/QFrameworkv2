@@ -8,8 +8,7 @@
 #include <QVariant>
 #include <QVBoxLayout>
 
-#include "Generated/log_messages.pb.h"
-#include "Generated/status_messages.pb.h"
+#include "Generated/master_message.pb.h"
 #include "MessageTopics.h"
 
 namespace

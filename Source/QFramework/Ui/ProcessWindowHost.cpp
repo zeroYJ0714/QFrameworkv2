@@ -39,6 +39,8 @@ ProcessWindowHost::ProcessWindowHost(QWidget* parent)
 }
 
 // 析构前解除外部窗口容器，避免 Qt 在宿主销毁后保留悬空 HWND。
+/// @brief 析构前解除外部窗口容器，避免宿主销毁后残留悬空 HWND。
+/// @return 无（析构函数不返回值）。
 ProcessWindowHost::~ProcessWindowHost()
 {
     // 统一走 clear，避免容器和 foreignWindow_ 所有权处理分叉。
@@ -163,12 +165,12 @@ void ProcessWindowHost::flushClientSizeNotification()
     if (windowContainer_ == nullptr)
         return;
     windowContainer_->setGeometry(rect());
-    const QSize clientSize = rect().size();
+    const QSize clientSize = rect().size(); ///< 当前宿主客户区尺寸，用于通知子进程调整自身窗口。
     if (clientSize.width() > 0 && clientSize.height() > 0)
         emit clientSizeChanged(clientSize);
 }
 
-// 从布局移除并销毁容器；容器拥有的 QWindow 随之失效，指针必须清零。
+// 先解除原生父子关系，避免同步等待子进程退出时互等窗口消息。
 void ProcessWindowHost::clearEmbeddedWindow()
 {
     if (windowContainer_ == nullptr) {
@@ -176,14 +178,17 @@ void ProcessWindowHost::clearEmbeddedWindow()
         return;
     }
 
-    // 先隐藏并从布局移除，再延迟销毁。旧进程的 HWND 可能仍在处理原生
-    // resize/paint 事件，同步 delete 会让 Qt 容器在重启边界访问失效句柄。
-    QWidget* retiredContainer = windowContainer_;
+    // 旧 HWND 可能仍在处理 resize/paint；保留延迟回收以避免重启边界访问失效句柄。
+    QWidget* retiredContainer = windowContainer_; ///< 待退役的旧容器，延后销毁避免访问失效句柄。
     windowContainer_ = nullptr;
     stackedLayout_->removeWidget(retiredContainer);
     retiredContainer->hide();
+    if (foreignWindow_ != nullptr) {
+        foreignWindow_->setParent(nullptr);
+        // 只转交对象所有权；主事件循环结束后也能随旧容器回收，不恢复原生嵌入。
+        foreignWindow_->QObject::setParent(retiredContainer);
+    }
     retiredContainer->deleteLater();
-    // createWindowContainer 持有 QWindow，容器析构后该指针不再有效。
     foreignWindow_ = nullptr;
 }
 }

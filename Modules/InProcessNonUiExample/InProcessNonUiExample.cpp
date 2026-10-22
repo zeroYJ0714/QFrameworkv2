@@ -3,8 +3,7 @@
 #include <QDateTime>
 #include <QThread>
 
-#include "Generated/log_messages.pb.h"
-#include "Generated/status_messages.pb.h"
+#include "Generated/master_message.pb.h"
 #include "MessageTopics.h"
 
 // 本文件演示最小的“状态消息 -> 日志显示消息”转换流程：

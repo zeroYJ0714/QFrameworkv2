@@ -10,6 +10,15 @@ class BaselineTest : public QObject
     Q_OBJECT
 
 private slots:
+    void messageBusRejectionLogIsRateLimited();
+    void messageBusSharedPayloadIsReused();
+    void optionalUiPluginDoesNotBlockStartup();
+    void processPrepareExitAndCancellation();
+    void processPrepareTimeoutPreservesProcess();
+    void processStopPreparationCrashDoesNotRestart();
+    void processShutdownDeliversStopWithoutEventLoop_data();
+    void processShutdownDeliversStopWithoutEventLoop();
+    void processUiStopRestartAndCrashReleaseWindow();
     // 检查 Qt、框架和 Protobuf 版本基线。
     void qtAndFrameworkVersions();
     // 检查绑定前、运行中和停止后的模块发布门禁。

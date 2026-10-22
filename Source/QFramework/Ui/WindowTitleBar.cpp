@@ -34,8 +34,8 @@ WindowTitleBar::WindowTitleBar(QWidget* parent)
     menuBar_->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
 
     const QList<QToolButton*> windowButtons =
-        QList<QToolButton*>() << minimizeButton_ << maximizeButton_ << closeButton_;
-    for (QToolButton* button : windowButtons) {
+        QList<QToolButton*>() << minimizeButton_ << maximizeButton_ << closeButton_; ///< 三个窗口按钮，用于统一设置公共外观。
+    for (QToolButton* button : windowButtons) { ///< 当前被设置外观的窗口按钮。
         button->setAutoRaise(true);
         button->setFocusPolicy(Qt::StrongFocus);
         button->setToolButtonStyle(Qt::ToolButtonIconOnly);
@@ -52,7 +52,7 @@ WindowTitleBar::WindowTitleBar(QWidget* parent)
     maximizeButton_->setToolTip(QString::fromUtf8(u8"最大化"));
     closeButton_->setToolTip(QString::fromUtf8(u8"关闭"));
 
-    QHBoxLayout* layout = new QHBoxLayout(this);
+    QHBoxLayout* layout = new QHBoxLayout(this); ///< 标题栏水平布局：菜单靠左，按钮靠右。
     // 右侧保留 6 个逻辑像素空白，对应 nativeEvent() 的最小缩放命中区，
     // 避免关闭按钮最右侧几像素同时被 Windows 误判为 HTRIGHT。
     layout->setContentsMargins(8, 0, 6, 0);
@@ -66,15 +66,15 @@ WindowTitleBar::WindowTitleBar(QWidget* parent)
     connect(minimizeButton_,
             &QToolButton::clicked,
             this,
-            &WindowTitleBar::onMinimizeButtonClicked);
+            &WindowTitleBar::minimizeRequested);
     connect(maximizeButton_,
             &QToolButton::clicked,
             this,
-            &WindowTitleBar::onMaximizeButtonClicked);
+            &WindowTitleBar::maximizeRestoreRequested);
     connect(closeButton_,
             &QToolButton::clicked,
             this,
-            &WindowTitleBar::onCloseButtonClicked);
+            &WindowTitleBar::closeRequested);
 
     updateWindowControlState(false);
 }
@@ -84,9 +84,7 @@ QMenuBar* WindowTitleBar::menuBar() const
     return menuBar_;
 }
 
-// WM_NCHITTEST 会先把屏幕坐标换成标题栏客户区坐标，再调用此函数。
-// 只有菜单和按钮需要保留 HTCLIENT；品牌文字等不可点击区域仍按“空白”处理，
-// 让用户可以从视觉上连续的标题栏区域拖动窗口。
+// 菜单和按钮保留自己的鼠标操作，其他区域允许拖动标题栏。
 bool WindowTitleBar::isInteractiveAt(const QPoint& titleBarPoint) const
 {
     if (!rect().contains(titleBarPoint))
@@ -155,20 +153,20 @@ void WindowTitleBar::updateWindowControlState(bool maximized)
     closeButton_->setIcon(style()->standardIcon(QStyle::SP_TitleBarCloseButton));
     const QStyle::StandardPixmap pixmap = maximized
         ? QStyle::SP_TitleBarNormalButton
-        : QStyle::SP_TitleBarMaxButton;
+        : QStyle::SP_TitleBarMaxButton; ///< 最大化按钮要使用的标准图标枚举。
     const QString accessibleName = maximized
         ? QString::fromUtf8(u8"还原")
-        : QString::fromUtf8(u8"最大化");
+        : QString::fromUtf8(u8"最大化"); ///< 最大化按钮对应的提示与无障碍名称。
     maximizeButton_->setIcon(style()->standardIcon(pixmap));
     maximizeButton_->setToolTip(accessibleName);
     maximizeButton_->setAccessibleName(accessibleName);
 }
 
 // 判断点击控件是否真的会处理鼠标。QMenuBar 和 QAbstractButton 的子控件返回
-// true，普通 QLabel/标题栏本身返回 false，后者会被 MainWindow 交给 HTCAPTION。
+// true，普通 QLabel/标题栏本身返回 false，允许启动系统拖动。
 bool WindowTitleBar::isInteractiveTitleBarChild(QWidget* child) const
 {
-    QWidget* current = child;
+    QWidget* current = child; ///< 沿父链向上遍历的游标，从命中控件开始。
     while (current != nullptr && current != this) {
         if (qobject_cast<QMenuBar*>(current) != nullptr ||
             qobject_cast<QAbstractButton*>(current) != nullptr) {
@@ -179,18 +177,6 @@ bool WindowTitleBar::isInteractiveTitleBarChild(QWidget* child) const
     return false;
 }
 
-void WindowTitleBar::onMinimizeButtonClicked()
-{
-    emit minimizeRequested();
-}
 
-void WindowTitleBar::onMaximizeButtonClicked()
-{
-    emit maximizeRestoreRequested();
-}
 
-void WindowTitleBar::onCloseButtonClicked()
-{
-    emit closeRequested();
-}
 }

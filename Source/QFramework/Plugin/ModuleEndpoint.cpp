@@ -20,6 +20,8 @@ ModuleEndpoint::ModuleEndpoint()
 }
 
 // 本类只借用 ModuleHost，不负责 delete；具体 QObject/QWidget 由四种模块基类管理。
+/// @brief 虚析构；宿主指针为借用，本类不负责释放。
+/// @return 无（析构函数不返回值）。
 ModuleEndpoint::~ModuleEndpoint() = default;
 
 // 在锁内复制 ID，避免停止/解绑同时修改字符串时发生数据竞争。
@@ -51,6 +53,10 @@ bool ModuleEndpoint::onStart()
 void ModuleEndpoint::onStop()
 {
 }
+
+void ModuleEndpoint::beginPrepareForExit() {}
+bool ModuleEndpoint::isReadyForExit() const { return true; }
+void ModuleEndpoint::cancelPrepareForExit() {}
 
 // 普通模块没有界面草稿，因此默认不阻止 Dock 隐藏或应用退出。
 // 该回调只由 MainWindow 的 GUI 线程调用，基类不增加跨线程状态。
@@ -86,8 +92,8 @@ bool ModuleEndpoint::publishShared(const QString& topic, const MessagePayload& p
     if (payload.isNull())
         return false;
 
-    ModuleHost* host = nullptr;
-    QString id;
+    ModuleHost* host = nullptr; ///< 锁内复制的宿主借用指针，锁外使用。
+    QString id; ///< 锁内复制的模块 ID，与宿主一起传给发布接口。
     {
         QMutexLocker locker(&mutex_);
         // 只在锁内读取状态，离开临界区后再调用宿主，避免宿主回调反向加锁。
@@ -154,8 +160,8 @@ void ModuleEndpoint::setRunning(bool running)
 // 将日志转发给宿主；未绑定期间安静忽略，避免模块构造/析构日志访问空指针。
 void ModuleEndpoint::log(LogLevel level, const QString& text)
 {
-    ModuleHost* host = nullptr;
-    QString id;
+    ModuleHost* host = nullptr; ///< 锁内复制的宿主借用指针，锁外使用。
+    QString id; ///< 锁内复制的模块 ID，与级别一起转发。
     {
         QMutexLocker locker(&mutex_);
         // 复制宿主和模块 ID 后立即释放锁，再进入 Logger，避免日志路径自锁。

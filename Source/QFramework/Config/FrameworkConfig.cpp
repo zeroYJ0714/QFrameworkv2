@@ -16,11 +16,15 @@ namespace
 {
 // 把 QSettings 的任意 QVariant 转成正整数。
 // value 缺失、不是整数或小于等于 0 时使用调用方给出的安全默认值。
+/// @brief 把配置值转成正整数，非法值回退到调用方给定的默认值。
+/// @param value QSettings 读出的原始值。
+/// @param defaultValue 值非法时使用的安全默认值。
+/// @return 大于 0 的整数值，或 defaultValue。
 int positiveValue(const QVariant& value, int defaultValue)
 {
     // 所有容量和超时都必须为正数；缺失、格式错误、0 和负数使用默认值。
-    bool ok = false;
-    const int result = value.toInt(&ok);
+    bool ok = false; ///< 承接 QVariant 到 int 的转换是否成功。
+    const int result = value.toInt(&ok); ///< 转换后的整数值，仅在 ok 为真时有意义。
     return ok && result > 0 ? result : defaultValue;
 }
 }
@@ -30,8 +34,8 @@ int positiveValue(const QVariant& value, int defaultValue)
 bool FrameworkConfig::load(const QString& iniFilePath, QString* errorMessage)
 {
     // 先验证真实文件，避免 QSettings 对不存在路径静默创建空配置的行为。
-    const QFileInfo fileInfo(iniFilePath);
-    if (!fileInfo.exists() || !fileInfo.isFile()) {
+    const QFileInfo fileInfo(iniFilePath); ///< 配置文件信息，用于校验存在性并取绝对路径。
+    if (!fileInfo.exists() || !fileInfo.isFile()) { ///< 文件不存在：直接报错，不创建空配置。
         if (errorMessage != nullptr)
             *errorMessage = QString::fromUtf8(u8"配置文件不存在：%1").arg(iniFilePath);
         return false;
@@ -39,30 +43,29 @@ bool FrameworkConfig::load(const QString& iniFilePath, QString* errorMessage)
 
     // QSettings 只负责读取 INI；FrameworkConfig 把结果复制到内存结构后，
     // 运行期间不会反向写回配置文件。
-    QSettings settings(fileInfo.absoluteFilePath(), QSettings::IniFormat);
+    QSettings settings(fileInfo.absoluteFilePath(), QSettings::IniFormat); ///< 只读的 INI 读取器。
     settings.setIniCodec("UTF-8");
-    if (settings.status() != QSettings::NoError) {
+    if (settings.status() != QSettings::NoError) { ///< 读取器状态异常：上报无法读取。
         if (errorMessage != nullptr)
             *errorMessage = QString::fromUtf8(u8"无法读取配置文件：%1").arg(iniFilePath);
         return false;
     }
 
-    iniFilePath_ = fileInfo.absoluteFilePath();
     configDirectory_ = fileInfo.absoluteDir().absolutePath();
     modules_.clear();
 
     settings.beginGroup(QStringLiteral("Modules"));
-    const QStringList moduleIds = settings.value(QStringLiteral("Names")).toStringList();
+    const QStringList moduleIds = settings.value(QStringLiteral("Names")).toStringList(); ///< 唯一加载清单中声明的模块 ID。
     settings.endGroup();
 
     // Names 是唯一加载清单；没有列出的 Module.* 分组不会被自动发现。
-    for (const QString& rawId : moduleIds) {
-        const QString moduleId = rawId.trimmed();
+    for (const QString& rawId : moduleIds) { ///< rawId：清单中的原始模块 ID 文本。
+        const QString moduleId = rawId.trimmed(); ///< 去除首尾空白后的模块 ID。
         if (moduleId.isEmpty())
             continue;
 
         settings.beginGroup(QStringLiteral("Module.%1").arg(moduleId));
-        ModuleConfig module;
+        ModuleConfig module; ///< 当前模块的配置，逐字段填充后追加到 modules_。
         module.id = moduleId;
         module.enabled = settings.value(QStringLiteral("Enabled"), true).toBool();
         module.displayName = settings.value(QStringLiteral("DisplayName"), moduleId).toString();
@@ -72,16 +75,16 @@ bool FrameworkConfig::load(const QString& iniFilePath, QString* errorMessage)
             settings.value(QStringLiteral("DebuggerWaitTimeoutMs")), 30000);
 
         // 先结束分组再做错误返回，保持 QSettings 的分组栈成对。
-        const QString typeValue = settings.value(QStringLiteral("Type")).toString();
+        const QString typeValue = settings.value(QStringLiteral("Type")).toString(); ///< 模块类型文本，用于解析 ModuleType。
         settings.endGroup();
-        if (!parseModuleType(typeValue, &module.type)) {
+        if (!parseModuleType(typeValue, &module.type)) { ///< 类型文本无法识别：整体加载失败。
             if (errorMessage != nullptr) {
                 *errorMessage = QString::fromUtf8(u8"模块 %1 的 Type 无效：%2")
                     .arg(moduleId, typeValue);
             }
             return false;
         }
-        if (module.filePath.isEmpty()) {
+        if (module.filePath.isEmpty()) { ///< 缺少必需的文件路径：整体加载失败。
             if (errorMessage != nullptr)
                 *errorMessage = QString::fromUtf8(u8"模块 %1 缺少 FilePath").arg(moduleId);
             return false;
@@ -100,24 +103,24 @@ bool FrameworkConfig::load(const QString& iniFilePath, QString* errorMessage)
     messageBus_.shutdownDrainTimeoutMs = positiveValue(
         settings.value(QStringLiteral("ShutdownDrainTimeoutMs")), 3000);
     const QString defaultPolicy = settings.value(
-        QStringLiteral("DefaultPolicy"), QStringLiteral("Reliable")).toString();
+        QStringLiteral("DefaultPolicy"), QStringLiteral("Reliable")).toString(); ///< 全局默认队列策略文本。
     settings.endGroup();
-    if (!parseQueuePolicy(defaultPolicy, &messageBus_.defaultPolicy)) {
+    if (!parseQueuePolicy(defaultPolicy, &messageBus_.defaultPolicy)) { ///< 默认策略文本无效：整体加载失败。
         if (errorMessage != nullptr)
             *errorMessage = QString::fromUtf8(u8"MessageBus/DefaultPolicy 无效：%1").arg(defaultPolicy);
         return false;
     }
 
     messageBus_.topics.clear();
-    const QStringList groups = settings.childGroups();
+    const QStringList groups = settings.childGroups(); ///< 所有顶层分组名，用于筛选 Topic. 前缀项。
     // childGroups 返回所有顶层分组，只处理 Topic. 前缀。
-    for (const QString& group : groups) {
+    for (const QString& group : groups) { ///< group：当前待判断的顶层分组名。
         if (!group.startsWith(QStringLiteral("Topic.")))
             continue;
 
-        const QString topic = group.mid(6);
+        const QString topic = group.mid(6); ///< 去掉 "Topic." 前缀后的主题名。
         settings.beginGroup(group);
-        TopicConfig topicConfig;
+        TopicConfig topicConfig; ///< 当前主题的容量与策略配置。
         topicConfig.queueCapacity = positiveValue(
             settings.value(QStringLiteral("QueueCapacity")),
             messageBus_.defaultQueueCapacity);
@@ -125,9 +128,9 @@ bool FrameworkConfig::load(const QString& iniFilePath, QString* errorMessage)
             settings.value(QStringLiteral("MaxMessageBytes")),
             messageBus_.maxMessageBytes);
         const QString policy = settings.value(
-            QStringLiteral("Policy"), defaultPolicy).toString();
+            QStringLiteral("Policy"), defaultPolicy).toString(); ///< 当前主题的策略文本。
         settings.endGroup();
-        if (!parseQueuePolicy(policy, &topicConfig.policy)) {
+        if (!parseQueuePolicy(policy, &topicConfig.policy)) { ///< 主题策略文本无效：整体加载失败。
             if (errorMessage != nullptr)
                 *errorMessage = QString::fromUtf8(u8"主题 %1 的 Policy 无效：%2").arg(topic, policy);
             return false;
@@ -149,14 +152,14 @@ bool FrameworkConfig::load(const QString& iniFilePath, QString* errorMessage)
     layout_.presets.clear();
     // 布局编号由配置维护者保证从 1 连续递增；遇到第一个缺失分组即结束读取。
     // File 允许为空或指向暂时不存在的文件，MainWindow 会保留菜单项并显示校验原因。
-    const QStringList topLevelGroups = settings.childGroups();
-    for (int index = 1; ; ++index) {
-        const QString groupName = QStringLiteral("Layout.%1").arg(index);
+    const QStringList topLevelGroups = settings.childGroups(); ///< 顶层分组快照，用于判断 Layout.n 是否存在。
+    for (int index = 1; ; ++index) { ///< index：从 1 递增的布局编号。
+        const QString groupName = QStringLiteral("Layout.%1").arg(index); ///< 当前布局分组名。
         if (!topLevelGroups.contains(groupName))
             break;
 
         settings.beginGroup(groupName);
-        LayoutPresetConfig preset;
+        LayoutPresetConfig preset; ///< 当前布局预设配置。
         preset.index = index;
         preset.name = settings.value(QStringLiteral("Name")).toString().trimmed();
         preset.filePath = resolvePath(
@@ -182,11 +185,6 @@ bool FrameworkConfig::load(const QString& iniFilePath, QString* errorMessage)
     return true;
 }
 
-// 以下 getter 都返回值对象而不是可写引用，保证配置快照不会被外部偷偷修改。
-// iniFilePath 是实际加载文件的绝对路径。
-QString FrameworkConfig::iniFilePath() const { return iniFilePath_; }
-// configDirectory 是解析其他相对路径的基准目录。
-QString FrameworkConfig::configDirectory() const { return configDirectory_; }
 // modules 保留 [Modules]/Names 中声明的顺序。
 QVector<ModuleConfig> FrameworkConfig::modules() const { return modules_; }
 // 三类配置 getter 返回各自完整结构副本。
@@ -202,7 +200,7 @@ QString FrameworkConfig::resolvePath(const QString& path) const
     // 空路径代表“未配置可选文件”，不是当前目录。
     if (path.trimmed().isEmpty())
         return QString();
-    const QFileInfo fileInfo(path);
+    const QFileInfo fileInfo(path); ///< 待判断相对/绝对并规范化的路径信息。
     if (fileInfo.isAbsolute())
         return QDir::cleanPath(fileInfo.absoluteFilePath());
     return QDir::cleanPath(QDir(configDirectory_).absoluteFilePath(path));

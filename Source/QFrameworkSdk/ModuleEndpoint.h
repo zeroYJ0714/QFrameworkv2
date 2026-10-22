@@ -35,15 +35,15 @@ enum class ModuleCloseReason
 class QFRAMEWORK_EXPORT ModuleHost
 {
 public:
-    /// @brief 通过接口指针安全销毁具体宿主；参数：无；返回值：无。
-    /// @return 无。
+    /// @brief 通过接口指针安全销毁具体宿主实现。
+    /// @return 无（析构函数不返回值）。
     virtual ~ModuleHost() = default;
 
     // 框架收到模块的 publish 请求后实现此函数。返回值表示框架是否接受
     // 当前请求；子进程运行时的返回值只代表本地发送队列是否收下。
-    /// @brief 接收模块普通字节发布；参数：moduleId、topic、data；返回值：宿主接受返回 true。
+    /// @brief 接收模块提交的普通字节发布；纯虚函数，由宿主实现完成投递。
     /// @param moduleId 稳定模块 ID。
-    /// @param topic 消息主题名称。
+    /// @param topic 消息主题名称，必须是模块声明过的发布主题。
     /// @param data 原始字节数据，可包含 NUL。
     /// @return 宿主接受并进入发布流程返回 true，否则返回 false。
     virtual bool publishFromModule(const QString& moduleId,
@@ -51,18 +51,18 @@ public:
                                    const QByteArray& data) = 0;
     // 共享发布入口只借用 payload 引用并复制智能指针；实现方不得修改其 QByteArray。
     // 空智能指针表示调用错误，合法的零字节消息必须使用非空 QByteArray 对象。
-    /// @brief 接收模块不可变共享载荷发布；参数：moduleId、topic、payload；返回值：宿主接受返回 true。
+    /// @brief 接收模块提交的不可变共享载荷发布；纯虚函数，由宿主实现完成投递。
     /// @param moduleId 稳定模块 ID。
-    /// @param topic 消息主题名称。
-    /// @param payload 不可变或独立拥有的消息载荷。
+    /// @param topic 消息主题名称，必须是模块声明过的发布主题。
+    /// @param payload 不可变共享载荷；空智能指针表示调用错误。
     /// @return 宿主接受并进入发布流程返回 true，否则返回 false。
     virtual bool publishSharedFromModule(const QString& moduleId,
                                          const QString& topic,
                                          const MessagePayload& payload) = 0;
-    /// @brief 把模块日志交给集中 Logger；参数：level、moduleId、text；返回值：无。
+    /// @brief 把模块日志交给集中 Logger；纯虚函数，由宿主实现决定落地方式。
     /// @param level 日志严重级别。
     /// @param moduleId 稳定模块 ID。
-    /// @param text 待显示、发送或记录的文本。
+    /// @param text 日志正文。
     /// @return 无。
     virtual void logFromModule(LogLevel level,
                                const QString& moduleId,
@@ -75,91 +75,101 @@ public:
 class QFRAMEWORK_EXPORT ModuleEndpoint
 {
 public:
-    /// @brief 创建尚未绑定宿主的端点；参数：无；返回值：无。
-    /// @return 无。
+    /// @brief 创建尚未绑定宿主、也未进入运行态的端点。
+    /// @return 无（构造函数不返回值）。
     ModuleEndpoint();
-    /// @brief 虚析构端点；参数：无；返回值：无。
-    /// @return 无。
+    /// @brief 虚析构端点；宿主指针只是借用，本类不负责释放。
+    /// @return 无（析构函数不返回值）。
     virtual ~ModuleEndpoint();
 
-    /// @brief 读取框架绑定的稳定模块 ID；参数：无；返回值：ID 副本，未绑定时为空。
+    /// @brief 返回框架绑定的稳定模块 ID，可在任意线程安全调用。
     /// @return ID 副本；未绑定宿主时为空字符串。
     QString moduleId() const;
-    /// @brief 声明允许发布的主题；参数：无；返回值：主题列表，默认空。
-    /// @return 主题列表，默认为空列表。
+    /// @brief 声明模块会发布的主题，框架注册时读取一次并冻结成发布白名单。
+    /// @return 主题列表，默认为空列表；派生模块应按实际 publish() 调用覆盖，声明空字符串或重复主题会导致注册失败。
     virtual QStringList publishedTopics() const;
-    /// @brief 声明订阅主题；参数：无；返回值：主题列表，默认空。
-    /// @return 主题列表，默认为空列表。
+    /// @brief 声明模块要订阅的主题，框架注册时据此建立本模块的投递关系。
+    /// @return 主题列表，默认为空列表；派生模块应按实际订阅覆盖，声明空字符串或重复主题会导致注册失败。
     virtual QStringList subscribedTopics() const;
-    /// @brief 模块启动回调；参数：无；返回值：启动成功返回 true。
-    /// @return 启动成功返回 true，失败返回 false。
+    /// @brief 模块启动钩子；调用期间发布权限已经打开，模块可以直接 publish()。
+    /// @return 默认返回 true；覆盖后返回 false 或抛异常都会撤销发布权限并补调一次 onStop()。
     virtual bool onStart();
-    /// @brief 模块停止回调；参数：无；返回值：无。
-    /// @return 无。
+    /// @brief 模块停止钩子，在消息队列停止之后、总线注销之前调用，用于释放业务资源。
+    /// @return 无；基类默认不做任何事，抛出的异常由调用方捕获并记入日志。
     virtual void onStop();
+    // GUI 线程在总线仍运行时发起业务收尾。默认无工作；onStop 仅回收资源。
+    /// @brief 要求模块在总线仍可用时完成业务收尾，由 GUI 线程在退出流程开始时调用。
+    /// @return 无；基类默认不做任何工作，有异步收尾的模块应在此启动收尾并让 isReadyForExit() 反映进度。
+    virtual void beginPrepareForExit();
+    /// @brief 查询退出收尾是否已经完成，宿主在关闭流程中反复轮询直到就绪。
+    /// @return 基类默认返回 true；收尾未完成的模块返回 false 以推迟本次退出。
+    virtual bool isReadyForExit() const;
+    /// @brief 取消本次退出收尾，把模块恢复到可继续运行的状态。
+    /// @return 无；基类默认不做任何工作，用户取消关闭时会与 beginPrepareForExit() 成对出现。
+    virtual void cancelPrepareForExit();
     // GUI 线程在可能丢失界面草稿前调用。默认允许关闭；有未保存内容的
     // UI 模块可以同步显示确认框，并用有界 Qt 事件循环等待一次保存结果。
-    /// @brief 询问 UI 模块是否允许隐藏/退出；参数：reason；返回值：允许返回 true。
-    /// @param reason 操作原因或关闭原因。
-    /// @return 允许关闭返回 true，需要保留界面返回 false。
+    /// @brief 询问模块是否允许本次关闭，是界面草稿被丢弃前的最后一道门禁。
+    /// @param reason 关闭意图：隐藏单个 Dock 还是退出整个应用。
+    /// @return 允许关闭返回 true；返回 false 时调用方必须放弃本次关闭，Dock 或应用保持打开。
     virtual bool canClose(ModuleCloseReason reason);
     // 异步消息回调。输入 data 是本次消息的副本，模块不拥有传输层资源。
-    /// @brief 异步消息回调；参数：topic、senderModuleId、data；返回值：无。
+    /// @brief 异步投递一条已订阅主题的消息，同一模块的回调由专属队列线程串行执行。
     /// @param topic 消息主题名称。
-    /// @param senderModuleId 发送消息的模块 ID。
+    /// @param senderModuleId 发布方模块的稳定 ID，用于区分同主题的多个来源。
     /// @param data 原始字节数据，可包含 NUL。
-    /// @return 无。
+    /// @return 无；基类默认丢弃全部消息，需要处理消息的模块应覆盖。
     virtual void onMessage(const QString& topic,
                            const QString& senderModuleId,
                            const QByteArray& data);
 
-    /// @brief 发布普通 QByteArray；参数：topic、data；返回值：宿主接受返回 true。
-    /// @param topic 消息主题名称。
+    /// @brief 发布普通 QByteArray 消息，内部包装成不可变共享载荷后交给宿主。
+    /// @param topic 消息主题名称，必须是 publishedTopics() 声明过的主题。
     /// @param data 原始字节数据，可包含 NUL。
-    /// @return 宿主接受并进入发布流程返回 true，否则返回 false。
+    /// @return 宿主接受并进入发布流程返回 true；未绑定宿主、未进入运行态或宿主拒绝时返回 false，本层不缓存消息。
     bool publish(const QString& topic, const QByteArray& data);
     // 发布调用方已经持有的不可变载荷。同进程多个订阅队列共享同一个
     // QByteArray 对象；跨进程宿主仍会在 QSharedMemory 边界复制字节。
-    /// @brief 发布不可变共享载荷；参数：topic、payload；返回值：宿主接受返回 true。
-    /// @param topic 消息主题名称。
-    /// @param payload 不可变或独立拥有的消息载荷。
-    /// @return 宿主接受并进入发布流程返回 true，否则返回 false。
+    /// @brief 发布调用方已持有的不可变共享载荷，同进程订阅方共享同一份字节。
+    /// @param topic 消息主题名称，必须是 publishedTopics() 声明过的主题。
+    /// @param payload 不可变共享载荷；空智能指针会被直接拒绝。
+    /// @return 宿主接受并进入发布流程返回 true；载荷为空、未绑定宿主或未进入运行态时返回 false。
     bool publishShared(const QString& topic, const MessagePayload& payload);
-    /// @brief 查询停止是否已请求；参数：无；返回值：未运行/停止中返回 true。
-    /// @return 已请求停止或尚未运行返回 true，否则返回 false。
+    /// @brief 查询框架是否已请求停止本模块，供长耗时的 onMessage 自查并及时返回。
+    /// @return 尚未进入运行态或已请求停止时返回 true，运行期间返回 false。
     bool isStopRequested() const;
-    /// @brief 记录 Debug 日志；参数：text；返回值：无。
-    /// @param text 待显示、发送或记录的文本。
+    /// @brief 以 Debug 级别记录一条日志，未绑定宿主时静默丢弃。
+    /// @param text 日志正文。
     /// @return 无。
     void logDebug(const QString& text);
-    /// @brief 记录 Info 日志；参数：text；返回值：无。
-    /// @param text 待显示、发送或记录的文本。
+    /// @brief 以 Info 级别记录一条日志，未绑定宿主时静默丢弃。
+    /// @param text 日志正文。
     /// @return 无。
     void logInfo(const QString& text);
-    /// @brief 记录 Warning 日志；参数：text；返回值：无。
-    /// @param text 待显示、发送或记录的文本。
+    /// @brief 以 Warning 级别记录一条日志，未绑定宿主时静默丢弃。
+    /// @param text 日志正文。
     /// @return 无。
     void logWarning(const QString& text);
-    /// @brief 记录 Error 日志；参数：text；返回值：无。
-    /// @param text 待显示、发送或记录的文本。
+    /// @brief 以 Error 级别记录一条日志，未绑定宿主时静默丢弃。
+    /// @param text 日志正文。
     /// @return 无。
     void logError(const QString& text);
 
-    /// @brief 由框架绑定 ID 和借用宿主；参数：moduleId、host；返回值：无。
-    /// @param moduleId 稳定模块 ID。
-    /// @param host 框架宿主的借用指针。
-    /// @return 无。
+    /// @brief 由框架在注册时写入模块 ID 与宿主，注销时用空值解绑。
+    /// @param moduleId 模块 ID；解绑时传空字符串。
+    /// @param host 框架宿主的借用指针，本类不拥有；解绑时传 nullptr。
+    /// @return 无；解绑后 publish/publishShared/log* 立即转为静默失败。
     void bindHost(const QString& moduleId, ModuleHost* host);
-    /// @brief 由框架设置发布门禁；参数：running；返回值：无。
-    /// @param running 目标运行状态。
-    /// @return 无。
+    /// @brief 由框架切换发布门禁，决定 publish/publishShared 是否放行。
+    /// @param running true 表示进入运行态并放行发布，false 表示停止接受新消息。
+    /// @return 无；总线正在停止时即使传入 true 也不会放行。
     void setRunning(bool running);
 
 private:
-    /// @brief 日志快捷函数公共出口；参数：level、text；返回值：无。
+    /// @brief 四个日志快捷函数的公共出口，复制宿主与模块 ID 后在锁外转发。
     /// @param level 日志严重级别。
-    /// @param text 待显示、发送或记录的文本。
-    /// @return 无。
+    /// @param text 日志正文。
+    /// @return 无；未绑定宿主时静默忽略。
     void log(LogLevel level, const QString& text);
 
     QString moduleId_; ///< 框架绑定的稳定 ID，由 mutex_ 保护。

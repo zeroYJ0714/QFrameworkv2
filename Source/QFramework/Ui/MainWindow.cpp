@@ -48,12 +48,18 @@ namespace qframework
 namespace
 {
 // UI 与进程类型判断集中在此，菜单、Dock 和重启按钮共用同一规则。
+/// @brief 判断模块类型是否拥有菜单项和 Dock。
+/// @param type 待判断的模块类型。
+/// @return 属于两种 UI 类型时返回 true，否则返回 false。
 bool isUiType(ModuleType type)
 {
     // 两种 UI 模块都会拥有菜单项和 Dock。
     return type == ModuleType::InProcessUi || type == ModuleType::ProcessUi;
 }
 
+/// @brief 判断模块类型是否支持“重新启动”操作。
+/// @param type 待判断的模块类型。
+/// @return 属于两种子进程类型时返回 true，否则返回 false。
 bool isProcessType(ModuleType type)
 {
     // 只有子进程类型能响应“重新启动”操作。
@@ -61,12 +67,17 @@ bool isProcessType(ModuleType type)
 }
 
 // 从系统主题取图标，找不到时使用 Qt 标准图标作为跨机器回退。
+/// @brief 优先取系统主题图标，取不到时回退到 Qt 标准图标。
+/// @param widget 用于取得当前样式和标准图标的控件。
+/// @param themeName 主题图标名。
+/// @param fallback 主题图标缺失时使用的 Qt 标准图标枚举。
+/// @return 一定非空的图标。
 QIcon themedIcon(QWidget* widget,
                  const QString& themeName,
                  QStyle::StandardPixmap fallback)
 {
     // 优先使用系统主题图标，找不到时回退 Qt 标准图标，保证按钮始终可见。
-    QIcon icon = QIcon::fromTheme(themeName);
+    QIcon icon = QIcon::fromTheme(themeName); ///< 候选图标，取不到时会被标准图标覆盖。
     if (icon.isNull())
         icon = widget->style()->standardIcon(fallback);
     return icon;
@@ -75,9 +86,12 @@ QIcon themedIcon(QWidget* widget,
 #ifdef Q_OS_WIN
 // 以 Windows 屏幕像素构造窗口矩形。WM_NCHITTEST 的坐标也是屏幕坐标，先统一成
 // QRect 后再做边角判断，比直接在 LPARAM 上做位运算更容易审查和维护。
+/// @brief 把 Win32 窗口句柄的屏幕矩形转换为 QRect。
+/// @param windowHandle 目标原生窗口句柄。
+/// @return 屏幕坐标下的窗口矩形；句柄无效时返回空矩形。
 QRect nativeWindowRect(HWND windowHandle)
 {
-    RECT nativeRect = {};
+    RECT nativeRect = {}; ///< 承接 GetWindowRect 输出的原生矩形。
     if (windowHandle == nullptr || !GetWindowRect(windowHandle, &nativeRect))
         return QRect();
     return QRect(QPoint(nativeRect.left, nativeRect.top),
@@ -87,6 +101,11 @@ QRect nativeWindowRect(HWND windowHandle)
 
 // 返回八方向缩放命中值。角必须先于边返回，否则左上角会被误判成单独的上边或左边。
 // Windows 收到这些 HT* 值后会接管鼠标缩放，不需要 Qt 自己循环 move() 窗口。
+/// @brief 判断屏幕坐标是否落在窗口边框上，并返回对应的缩放命中值。
+/// @param screenPoint 屏幕坐标下的鼠标位置。
+/// @param nativeRect 窗口的屏幕矩形。
+/// @param nativeBorderWidth 可缩放的边框宽度，单位为像素。
+/// @return HT* 缩放命中值；不在边框上时返回 HTNOWHERE。
 long resizeHitTest(const QPoint& screenPoint,
                    const QRect& nativeRect,
                    int nativeBorderWidth)
@@ -95,13 +114,13 @@ long resizeHitTest(const QPoint& screenPoint,
         return HTNOWHERE;
 
     const bool onLeft = screenPoint.x() >= nativeRect.left() &&
-                        screenPoint.x() < nativeRect.left() + nativeBorderWidth;
+                        screenPoint.x() < nativeRect.left() + nativeBorderWidth; ///< 是否命中左边框。
     const bool onRight = screenPoint.x() <= nativeRect.right() &&
-                         screenPoint.x() >= nativeRect.right() - nativeBorderWidth + 1;
+                         screenPoint.x() >= nativeRect.right() - nativeBorderWidth + 1; ///< 是否命中右边框。
     const bool onTop = screenPoint.y() >= nativeRect.top() &&
-                       screenPoint.y() < nativeRect.top() + nativeBorderWidth;
+                       screenPoint.y() < nativeRect.top() + nativeBorderWidth; ///< 是否命中上边框。
     const bool onBottom = screenPoint.y() <= nativeRect.bottom() &&
-                          screenPoint.y() >= nativeRect.bottom() - nativeBorderWidth + 1;
+                          screenPoint.y() >= nativeRect.bottom() - nativeBorderWidth + 1; ///< 是否命中下边框。
 
     if (onTop && onLeft)
         return HTTOPLEFT;
@@ -176,7 +195,7 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
     connect(titleBar_,
             &WindowTitleBar::minimizeRequested,
             this,
-            &MainWindow::minimizeWindow);
+            &MainWindow::showMinimized);
     connect(titleBar_,
             &WindowTitleBar::maximizeRestoreRequested,
             this,
@@ -184,7 +203,7 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
     connect(titleBar_,
             &WindowTitleBar::closeRequested,
             this,
-            &MainWindow::closeWindow);
+            &MainWindow::close);
     setDockNestingEnabled(true);
     // ProcessWindowHost 内部承载跨进程原生 HWND。QMainWindow 默认会为 Dock 重排启动
     // AnimatedDocks，在 HWND 连续改变父级和尺寸的过程中，Qt 可能暂时保留 pluggingWidget
@@ -195,7 +214,7 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
     setTabPosition(Qt::AllDockWidgetAreas, QTabWidget::North);
     resize(1200, 760);
 
-    for (const ModuleConfig& module : modules_) {
+    for (const ModuleConfig& module : modules_) { ///< 当前建入快照的模块配置。
         modulesById_.insert(module.id, module);
         moduleStates_.insert(
             module.id,
@@ -244,10 +263,17 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
                 &ProcessSupervisor::restartFinished,
                 this,
                 &MainWindow::onRestartFinished);
+        connect(processSupervisor_, &ProcessSupervisor::stopFinished, this,
+                [this](const QString& id, bool success, const QString& detail) {
+            if (!success) reportStateFailure(
+                QString::fromUtf8(u8"模块 %1 停止失败").arg(displayName(id)), detail);
+        });
     }
 }
 
 // 子控件和借用管理器均由 Qt/FrameworkRuntime 按父子及依赖顺序回收。
+/// @brief 析构主窗口，子控件和借用管理器由 Qt 与运行时按父子关系回收。
+/// @return 无（析构函数不返回值）。
 MainWindow::~MainWindow() = default;
 
 QColor MainWindow::dockSeparatorColor() const
@@ -283,15 +309,15 @@ void MainWindow::attachInProcessUiModules()
     // QPluginLoader 拥有模块对象；Dock 只是临时成为 QWidget 父容器。
     if (pluginManager_ == nullptr)
         return;
-    for (const ModuleConfig& module : modules_) {
+    for (const ModuleConfig& module : modules_) { ///< 当前正在挂载界面的模块配置。
         if (!module.enabled || module.type != ModuleType::InProcessUi)
             continue;
-        InProcessUiModule* widget = pluginManager_->uiModule(module.id);
-        ManagedDockWidget* dockWidget = moduleDocks_.value(module.id, nullptr);
+        InProcessUiModule* widget = pluginManager_->uiModule(module.id); ///< 插件提供的界面控件，未加载时为空。
+        ManagedDockWidget* dockWidget = moduleDocks_.value(module.id, nullptr); ///< 该模块对应的 Dock。
         if (widget == nullptr || dockWidget == nullptr)
             continue;
 
-        QWidget* previousWidget = dockWidget->widget();
+        QWidget* previousWidget = dockWidget->widget(); ///< Dock 原占位页，替换后延迟销毁。
         // 替换加载占位符，旧占位符延迟删除以尊重当前事件循环。
         dockWidget->setWidget(widget);
         if (previousWidget != nullptr && previousWidget != widget)
@@ -306,17 +332,17 @@ void MainWindow::releaseInProcessUiModules()
     // DLL 卸载前必须把插件 QWidget 从 Dock 取出并清除 Qt parent。
     if (pluginManager_ == nullptr)
         return;
-    for (const ModuleConfig& module : modules_) {
+    for (const ModuleConfig& module : modules_) { ///< 当前正在释放界面的模块配置。
         if (module.type != ModuleType::InProcessUi)
             continue;
         setUiAvailable(module.id, false);
-        InProcessUiModule* widget = pluginManager_->uiModule(module.id);
-        ManagedDockWidget* dockWidget = moduleDocks_.value(module.id, nullptr);
+        InProcessUiModule* widget = pluginManager_->uiModule(module.id); ///< 插件提供的界面控件。
+        ManagedDockWidget* dockWidget = moduleDocks_.value(module.id, nullptr); ///< 该模块对应的 Dock。
         if (widget == nullptr || dockWidget == nullptr || dockWidget->widget() != widget)
             continue;
 
         QLabel* placeholder = new QLabel(
-            placeholderText(module.id, QString::fromUtf8(u8"模块已停止")), dockWidget);
+            placeholderText(module.id, QString::fromUtf8(u8"模块已停止")), dockWidget); ///< 替换用的停止占位页。
         placeholder->setAlignment(Qt::AlignCenter);
         placeholder->setWordWrap(true);
         widget->hide();
@@ -331,8 +357,8 @@ bool MainWindow::loadLayoutFile(const QString& filePath,
                                 QStringList* unavailableModuleIds,
                                 bool activateLayout)
 {
-    QHash<QString, bool> loadedRequestedVisibility;
-    bool legacyVisibilitySemantics = false;
+    QHash<QString, bool> loadedRequestedVisibility; ///< 文件中记录的模块显示意图。
+    bool legacyVisibilitySemantics = false; ///< 文件是否使用旧的可见性语义。
     const bool loaded = layoutManager_->loadLayout(
         filePath,
         &loadedRequestedVisibility,
@@ -341,13 +367,13 @@ bool MainWindow::loadLayoutFile(const QString& filePath,
         &legacyVisibilitySemantics,
         activateLayout
             ? LayoutActivation::Activate
-            : LayoutActivation::KeepCurrent);
+            : LayoutActivation::KeepCurrent); ///< Qt 布局与元数据是否全部恢复成功。
     if (!loaded)
         return false;
 
     // 只有 geometry/state 和全部元数据都恢复成功，才整体替换显示意图。
     for (QHash<QString, ManagedDockWidget*>::const_iterator iterator =
-             moduleDocks_.constBegin(); iterator != moduleDocks_.constEnd(); ++iterator) {
+             moduleDocks_.constBegin(); iterator != moduleDocks_.constEnd(); ++iterator) { ///< 遍历已登记 Dock 的迭代器。
         requestedDockVisibility_.insert(
             iterator.key(), loadedRequestedVisibility.value(iterator.key(), false));
         syncModuleAction(iterator.key());
@@ -378,12 +404,12 @@ void MainWindow::setLayoutPresets(const QVector<LayoutPresetConfig>& presets)
     }
 
     layoutMenu_->setToolTipsVisible(true);
-    for (const LayoutPresetConfig& preset : layoutPresets_) {
+    for (const LayoutPresetConfig& preset : layoutPresets_) { ///< 当前正在建菜单项的预设配置。
         QAction* action = new QAction(
             preset.name.isEmpty()
                 ? QString::fromUtf8(u8"布局%1").arg(preset.index)
                 : preset.name,
-            layoutMenu_);
+            layoutMenu_); ///< 该预设对应的可勾选菜单项。
         action->setCheckable(true);
         action->setProperty("layoutIndex", preset.index);
         layoutPresetGroup_->addAction(action);
@@ -394,9 +420,9 @@ void MainWindow::setLayoutPresets(const QVector<LayoutPresetConfig>& presets)
                 this,
                 &MainWindow::onLayoutPresetTriggered);
 
-        QString validationError;
+        QString validationError; ///< 校验该预设文件失败时的原因。
         const bool valid = layoutManager_->validateLayoutFile(
-            preset.filePath, &validationError);
+            preset.filePath, &validationError); ///< 预设文件是否通过校验。
         action->setEnabled(valid);
         if (!valid) {
             action->setToolTip(validationError);
@@ -421,7 +447,7 @@ bool MainWindow::loadInitialLayoutPreset()
 // 查找配置快照中的稳定编号，避免用菜单文字反向匹配重复 Name。
 const LayoutPresetConfig* MainWindow::layoutPreset(int index) const
 {
-    for (const LayoutPresetConfig& preset : layoutPresets_) {
+    for (const LayoutPresetConfig& preset : layoutPresets_) { ///< 当前比对的预设配置。
         if (preset.index == index)
             return &preset;
     }
@@ -431,7 +457,7 @@ const LayoutPresetConfig* MainWindow::layoutPreset(int index) const
 // 删除旧 QAction 后再注入新快照，保证重复调用不会产生两套菜单项。
 void MainWindow::clearLayoutPresetActions()
 {
-    for (QAction* action : layoutPresetActions_) {
+    for (QAction* action : layoutPresetActions_) { ///< 当前要删除的预设菜单项。
         if (layoutPresetGroup_ != nullptr)
             layoutPresetGroup_->removeAction(action);
         delete action;
@@ -444,8 +470,8 @@ bool MainWindow::activateLayoutPreset(int index,
                                       bool startup,
                                       QString* errorMessage)
 {
-    const LayoutPresetConfig* preset = layoutPreset(index);
-    QAction* action = layoutPresetActions_.value(index, nullptr);
+    const LayoutPresetConfig* preset = layoutPreset(index); ///< 命中的预设配置。
+    QAction* action = layoutPresetActions_.value(index, nullptr); ///< 该预设对应的菜单项。
     if (preset == nullptr || action == nullptr || !action->isEnabled()) {
         if (errorMessage != nullptr)
             *errorMessage = action != nullptr
@@ -454,10 +480,10 @@ bool MainWindow::activateLayoutPreset(int index,
         return false;
     }
 
-    const int previousIndex = activeLayoutIndex_;
-    QAction* previousAction = layoutPresetActions_.value(previousIndex, nullptr);
-    QString error;
-    QStringList unavailableModules;
+    const int previousIndex = activeLayoutIndex_; ///< 加载前的活动布局编号，用于失败时恢复勾选。
+    QAction* previousAction = layoutPresetActions_.value(previousIndex, nullptr); ///< 加载前勾选的菜单项。
+    QString error; ///< 承接布局加载失败原因。
+    QStringList unavailableModules; ///< 布局中记录但当前不可用的模块 ID。
     if (!loadLayoutFile(preset->filePath,
                         &error,
                         &unavailableModules,
@@ -471,7 +497,7 @@ bool MainWindow::activateLayoutPreset(int index,
                 QString::fromUtf8(u8"启动布局预设 %1 加载失败：%2")
                     .arg(action->text(), error));
         } else {
-            const QSignalBlocker blocker(layoutPresetGroup_);
+            const QSignalBlocker blocker(layoutPresetGroup_); ///< 恢复勾选时不触发再次加载。
             if (previousAction != nullptr)
                 previousAction->setChecked(true);
             else
@@ -485,7 +511,7 @@ bool MainWindow::activateLayoutPreset(int index,
 
     activeLayoutIndex_ = index;
     {
-        const QSignalBlocker blocker(layoutPresetGroup_);
+        const QSignalBlocker blocker(layoutPresetGroup_); ///< 设置勾选时抑制重复触发。
         action->setChecked(true);
     }
     if (saveLayoutAction_ != nullptr)
@@ -522,7 +548,7 @@ void MainWindow::showModuleManager()
 void MainWindow::onModuleActionTriggered(bool checked)
 {
     // 每个 QAction 的动态属性保存 moduleId，避免为每个模块创建专用槽。
-    QAction* action = qobject_cast<QAction*>(sender());
+    QAction* action = qobject_cast<QAction*>(sender()); ///< 触发本次槽函数的菜单项。
     if (action != nullptr) {
         setRequestedDockVisible(action->property("moduleId").toString(),
                                 checked,
@@ -533,7 +559,7 @@ void MainWindow::onModuleActionTriggered(bool checked)
 // 只有 Dock 关闭按钮才撤销显示意图；标签切换不会经过这里。
 void MainWindow::onDockCloseRequested()
 {
-    ManagedDockWidget* dockWidget = qobject_cast<ManagedDockWidget*>(sender());
+    ManagedDockWidget* dockWidget = qobject_cast<ManagedDockWidget*>(sender()); ///< 发出关闭请求的 Dock。
     if (dockWidget == nullptr)
         return;
     setRequestedDockVisible(dockWidget->property("moduleId").toString(),
@@ -553,7 +579,7 @@ void MainWindow::onRestartModuleRequested(const QString& moduleId)
     // 这里只提交状态转换；QProcess/Socket 信号在后续事件循环中完成重启。
     if (processSupervisor_ == nullptr)
         return;
-    QString error;
+    QString error; ///< 承接重启请求失败原因。
     if (!processSupervisor_->requestRestart(moduleId, &error))
         reportStateFailure(QString::fromUtf8(u8"子进程重启请求失败"), error);
 }
@@ -583,10 +609,11 @@ void MainWindow::onModuleStateChanged(const QString& moduleId,
     moduleStates_.insert(moduleId, state);
     moduleManagerDialog_->setModuleState(moduleId, state, detail);
 
-    ProcessWindowHost* host = processHosts_.value(moduleId, nullptr);
+    ProcessWindowHost* host = processHosts_.value(moduleId, nullptr); ///< 该模块的子进程窗口宿主，主进程模块没有。
     if (host != nullptr &&
         (state == QStringLiteral("Starting") ||
          state == QStringLiteral("Restarting") ||
+         state == QStringLiteral("Stopping") ||
          state == QStringLiteral("Failed") ||
          state == QStringLiteral("Stopped"))) {
         setUiAvailable(moduleId, false);
@@ -608,10 +635,10 @@ void MainWindow::onModuleFault(const QString& moduleId, const QString& detail)
 void MainWindow::onWindowHandleReady(const QString& moduleId, quintptr windowId)
 {
     // 先包装 HWND，再把 ready 状态交给统一显示入口；明确隐藏时不补发 showWindow。
-    ProcessWindowHost* host = processHosts_.value(moduleId, nullptr);
+    ProcessWindowHost* host = processHosts_.value(moduleId, nullptr); ///< 该模块的子进程窗口宿主。
     if (host == nullptr)
         return;
-    QString error;
+    QString error; ///< 承接窗口包装失败原因。
     if (!host->attachWindow(windowId, &error)) {
         reportStateFailure(QString::fromUtf8(u8"子进程窗口嵌入失败"), error);
         return;
@@ -623,8 +650,8 @@ void MainWindow::onWindowHandleReady(const QString& moduleId, quintptr windowId)
 void MainWindow::onProcessWindowSizeChanged(const QString& moduleId,
                                             const QSize& size)
 {
-    ProcessWindowHost* host = processHosts_.value(moduleId, nullptr);
-    ManagedDockWidget* dockWidget = moduleDocks_.value(moduleId, nullptr);
+    ProcessWindowHost* host = processHosts_.value(moduleId, nullptr); ///< 该模块的子进程窗口宿主。
+    ManagedDockWidget* dockWidget = moduleDocks_.value(moduleId, nullptr); ///< 该模块对应的 Dock。
     if (host == nullptr || dockWidget == nullptr || processSupervisor_ == nullptr ||
         !host->hasEmbeddedWindow() ||
         !requestedDockVisibility_.value(moduleId, false) ||
@@ -637,7 +664,7 @@ void MainWindow::onProcessWindowSizeChanged(const QString& moduleId,
     // 这里不能再检查 dockWidget->isVisible()：QMainWindow 调整 Dock 标签/分隔区域时
     // 会让 Dock 短暂不可见，但用户菜单仍是勾选状态。requestedDockVisibility_ 才是
     // “用户明确要求显示”的稳定依据；真正取消勾选时它为 false，上面的条件仍会拦截。
-    QString error;
+    QString error; ///< 承接尺寸同步失败原因。
     if (!processSupervisor_->resizeWindow(moduleId,
                                           size.width(),
                                           size.height(),
@@ -653,7 +680,7 @@ void MainWindow::onProcessWindowSizeChanged(const QString& moduleId,
 void MainWindow::onLayoutPresetTriggered(bool checked)
 {
     Q_UNUSED(checked);
-    QAction* action = qobject_cast<QAction*>(sender());
+    QAction* action = qobject_cast<QAction*>(sender()); ///< 触发本次槽函数的预设菜单项。
     if (action == nullptr)
         return;
     activateLayoutPreset(action->property("layoutIndex").toInt(), false, nullptr);
@@ -669,12 +696,12 @@ void MainWindow::loadLayoutFromDialog()
         QString(),
         QString::fromUtf8(u8"QFramework 布局 (*.qflayout)"),
         nullptr,
-        QFileDialog::DontUseNativeDialog);
+        QFileDialog::DontUseNativeDialog); ///< 用户选中的布局文件路径。
     if (filePath.isEmpty())
         return;
 
-    QString error;
-    QStringList unavailable;
+    QString error; ///< 承接布局加载失败原因。
+    QStringList unavailable; ///< 布局中记录但当前不可用的模块 ID。
     if (!loadLayoutFile(filePath, &error, &unavailable, false)) {
         reportStateFailure(QString::fromUtf8(u8"布局加载失败"), error);
         return;
@@ -691,13 +718,13 @@ void MainWindow::loadLayoutFromDialog()
 // 保存到当前选中的 INI 预设；没有活动预设时按钮本身保持置灰。
 void MainWindow::saveCurrentLayout()
 {
-    const LayoutPresetConfig* preset = layoutPreset(activeLayoutIndex_);
+    const LayoutPresetConfig* preset = layoutPreset(activeLayoutIndex_); ///< 当前活动预设配置。
     if (preset == nullptr || preset->filePath.isEmpty()) {
         if (saveLayoutAction_ != nullptr)
             saveLayoutAction_->setEnabled(false);
         return;
     }
-    QString error;
+    QString error; ///< 承接布局保存失败原因。
     if (!layoutManager_->saveLayout(preset->filePath,
                                     requestedDockVisibility_,
                                     &error,
@@ -715,21 +742,21 @@ void MainWindow::saveLayoutAs()
 {
     // “另存为”无论当前是否已经加载布局都必须显示路径选择框；当前文件路径只作为
     // 初始建议位置，用户确认的新路径会在保存成功后成为后续“保存当前”的目标。
-    const LayoutPresetConfig* preset = layoutPreset(activeLayoutIndex_);
-    const QString suggestedPath = preset != nullptr ? preset->filePath : QString();
+    const LayoutPresetConfig* preset = layoutPreset(activeLayoutIndex_); ///< 当前活动预设，用于给出建议路径。
+    const QString suggestedPath = preset != nullptr ? preset->filePath : QString(); ///< 保存对话框的初始建议路径。
     QString filePath = QFileDialog::getSaveFileName(
         this,
         QString::fromUtf8(u8"布局另存为"),
         suggestedPath,
         QString::fromUtf8(u8"QFramework 布局 (*.qflayout)"),
         nullptr,
-        QFileDialog::DontUseNativeDialog);
+        QFileDialog::DontUseNativeDialog); ///< 用户确认的目标路径。
     if (filePath.isEmpty())
         return;
     if (!filePath.endsWith(QStringLiteral(".qflayout"), Qt::CaseInsensitive))
         filePath.append(QStringLiteral(".qflayout"));
 
-    QString error;
+    QString error; ///< 承接布局保存失败原因。
     if (!layoutManager_->saveLayout(filePath,
                                     requestedDockVisibility_,
                                     &error,
@@ -752,11 +779,11 @@ void MainWindow::selectStyleSheet()
         QString(),
         QString::fromUtf8(u8"Qt 样式表 (*.qss)"),
         nullptr,
-        QFileDialog::DontUseNativeDialog);
+        QFileDialog::DontUseNativeDialog); ///< 用户选中的 QSS 文件路径。
     if (filePath.isEmpty())
         return;
 
-    QString error;
+    QString error; ///< 承接样式加载失败原因。
     if (!styleManager_->loadStyleSheet(filePath, &error)) {
         reportStateFailure(QString::fromUtf8(u8"QSS 加载失败"), error);
         return;
@@ -770,7 +797,7 @@ void MainWindow::reloadStyleSheet()
     // 重读最近一次成功文件，适合开发时修改样式后快速验证。
     if (styleManager_ == nullptr)
         return;
-    QString error;
+    QString error; ///< 承接样式重载失败原因。
     if (!styleManager_->reloadStyleSheet(&error)) {
         reportStateFailure(QString::fromUtf8(u8"QSS 重新加载失败"), error);
         return;
@@ -778,12 +805,6 @@ void MainWindow::reloadStyleSheet()
     statusBar()->showMessage(QString::fromUtf8(u8"当前 QSS 已重新加载"), 4000);
 }
 
-// 标题栏只发出请求，真正的窗口状态变化集中在 MainWindow，避免子控件知道模块或
-// 进程实现，也避免绕过 Qt 的 WindowStateChange、closeEvent 和退出清理流程。
-void MainWindow::minimizeWindow()
-{
-    showMinimized();
-}
 
 // 普通状态进入最大化，最大化状态恢复普通窗口。Windows 收到标题栏拖动时也可能
 // 自动完成“最大化 -> 普通”转换，changeEvent() 会随后更新按钮视觉状态。
@@ -795,19 +816,13 @@ void MainWindow::toggleMaximizedState()
         showMaximized();
 }
 
-// close() 会进入现有 QWidget/QMainWindow closeEvent 链路，而不是直接调用 qApp->quit。
-// 这样 FrameworkRuntime 仍能按原顺序停止模块、进程和消息总线。
-void MainWindow::closeWindow()
-{
-    close();
-}
 
 // 创建文件、模块和样式菜单，并把动作连接到本类槽函数。
 void MainWindow::createActions()
 {
     // 菜单按文件、模块、样式三组构造；模块菜单可提前记录晚到窗口的显示意图。
     // 复用原有 QAction 和槽，只更换菜单栏宿主，避免出现两套功能不一致的菜单。
-    QMenuBar* titleMenuBar = titleBar_->menuBar();
+    QMenuBar* titleMenuBar = titleBar_->menuBar(); ///< 标题栏内嵌的菜单栏，作为全部菜单的宿主。
     layoutMenu_ = titleMenuBar->addMenu(QString::fromUtf8(u8"布局(&L)"));
     layoutMenu_->setToolTipsVisible(true);
     layoutPresetGroup_ = new QActionGroup(layoutMenu_);
@@ -815,29 +830,29 @@ void MainWindow::createActions()
     layoutPresetSeparator_ = layoutMenu_->addSeparator();
     QAction* loadLayoutAction = layoutMenu_->addAction(
         themedIcon(this, QStringLiteral("document-open"), QStyle::SP_DialogOpenButton),
-        QString::fromUtf8(u8"加载布局..."));
+        QString::fromUtf8(u8"加载布局...")); ///< “加载布局”菜单项。
     saveLayoutAction_ = layoutMenu_->addAction(
         themedIcon(this, QStringLiteral("document-save"), QStyle::SP_DialogSaveButton),
         QString::fromUtf8(u8"保存当前布局"));
     saveLayoutAction_->setEnabled(false);
-    QAction* saveAsAction = layoutMenu_->addAction(QString::fromUtf8(u8"布局另存为..."));
+    QAction* saveAsAction = layoutMenu_->addAction(QString::fromUtf8(u8"布局另存为...")); ///< “布局另存为”菜单项。
     connect(loadLayoutAction, &QAction::triggered, this, &MainWindow::loadLayoutFromDialog);
     connect(saveLayoutAction_, &QAction::triggered, this, &MainWindow::saveCurrentLayout);
     connect(saveAsAction, &QAction::triggered, this, &MainWindow::saveLayoutAs);
 
-    QMenu* moduleMenu = titleMenuBar->addMenu(QString::fromUtf8(u8"模块(&M)"));
+    QMenu* moduleMenu = titleMenuBar->addMenu(QString::fromUtf8(u8"模块(&M)")); ///< 模块菜单，含模块管理和各模块显示项。
     QAction* managerAction = moduleMenu->addAction(
         themedIcon(this, QStringLiteral("view-list-details"), QStyle::SP_FileDialogDetailedView),
-        QString::fromUtf8(u8"模块管理"));
+        QString::fromUtf8(u8"模块管理")); ///< “模块管理”菜单项。
     connect(managerAction, &QAction::triggered, this, &MainWindow::showModuleManager);
     moduleMenu->addSeparator();
 
     // 只给启用的 UI 模块创建可勾选菜单项。
-    for (const ModuleConfig& module : modules_) {
+    for (const ModuleConfig& module : modules_) { ///< 当前建菜单项的模块配置。
         if (!module.enabled || !isUiType(module.type))
             continue;
         QAction* action = moduleMenu->addAction(
-            module.displayName.isEmpty() ? module.id : module.displayName);
+            module.displayName.isEmpty() ? module.id : module.displayName); ///< 该模块的显示/隐藏菜单项。
         action->setCheckable(true);
         action->setEnabled(true);
         action->setObjectName(QStringLiteral("ModuleAction.%1").arg(module.id));
@@ -846,13 +861,13 @@ void MainWindow::createActions()
         moduleActions_.insert(module.id, action);
     }
 
-    QMenu* styleMenu = titleMenuBar->addMenu(QString::fromUtf8(u8"样式(&S)"));
+    QMenu* styleMenu = titleMenuBar->addMenu(QString::fromUtf8(u8"样式(&S)")); ///< 样式菜单，含选择与重新加载 QSS。
     QAction* selectStyleAction = styleMenu->addAction(
         themedIcon(this, QStringLiteral("preferences-desktop-theme"), QStyle::SP_DesktopIcon),
-        QString::fromUtf8(u8"选择 QSS..."));
+        QString::fromUtf8(u8"选择 QSS...")); ///< “选择 QSS”菜单项。
     QAction* reloadStyleAction = styleMenu->addAction(
         themedIcon(this, QStringLiteral("view-refresh"), QStyle::SP_BrowserReload),
-        QString::fromUtf8(u8"重新加载当前 QSS"));
+        QString::fromUtf8(u8"重新加载当前 QSS")); ///< “重新加载当前 QSS”菜单项。
     connect(selectStyleAction, &QAction::triggered, this, &MainWindow::selectStyleSheet);
     connect(reloadStyleAction, &QAction::triggered, this, &MainWindow::reloadStyleSheet);
 
@@ -863,20 +878,20 @@ void MainWindow::createModuleDocks()
 {
     // 每个启用的 UI 模块预先创建 Dock：进程 UI 使用 ProcessWindowHost，
     // 主进程 UI 先放占位标签，插件启动后再替换。
-    ManagedDockWidget* previousDock = nullptr;
-    for (const ModuleConfig& module : modules_) {
+    ManagedDockWidget* previousDock = nullptr; ///< 上一个创建的 Dock，用于把后续 Dock 标签化到同一区域。
+    for (const ModuleConfig& module : modules_) { ///< 当前建 Dock 的模块配置。
         if (!module.enabled || !isUiType(module.type))
             continue;
 
         ManagedDockWidget* dockWidget = new ManagedDockWidget(
-            module.displayName.isEmpty() ? module.id : module.displayName, this);
+            module.displayName.isEmpty() ? module.id : module.displayName, this); ///< 该模块的 Dock 容器。
         dockWidget->setObjectName(QStringLiteral("ModuleDock.%1").arg(module.id));
         dockWidget->setProperty("moduleId", module.id);
         // 保留足够最小尺寸，使两个模块 Dock 水平拆分后仍可操作。
         dockWidget->setMinimumSize(180, 120);
 
         if (module.type == ModuleType::ProcessUi) {
-            ProcessWindowHost* host = new ProcessWindowHost(dockWidget);
+            ProcessWindowHost* host = new ProcessWindowHost(dockWidget); ///< 子进程窗口宿主，等待原生句柄到来。
             dockWidget->setWidget(host);
             connect(host,
                     &ProcessWindowHost::clientSizeChanged,
@@ -887,7 +902,7 @@ void MainWindow::createModuleDocks()
             processHosts_.insert(module.id, host);
         } else {
             QLabel* placeholder = new QLabel(
-                placeholderText(module.id, QString::fromUtf8(u8"模块正在加载")), dockWidget);
+                placeholderText(module.id, QString::fromUtf8(u8"模块正在加载")), dockWidget); ///< 插件加载前的占位页。
             placeholder->setAlignment(Qt::AlignCenter);
             placeholder->setWordWrap(true);
             dockWidget->setWidget(placeholder);
@@ -948,7 +963,7 @@ bool MainWindow::canHideModule(const QString& moduleId) const
 {
     if (pluginManager_ == nullptr)
         return true;
-    InProcessUiModule* module = pluginManager_->uiModule(moduleId);
+    InProcessUiModule* module = pluginManager_->uiModule(moduleId); ///< 该模块的界面对象，未加载时为空。
     return module == nullptr || module->canClose(ModuleCloseReason::Hide);
 }
 
@@ -956,13 +971,36 @@ bool MainWindow::canHideModule(const QString& moduleId) const
 // 已加载 UI 插件；取消、保存失败或保存超时都会忽略本次退出事件。
 void MainWindow::closeEvent(QCloseEvent* event)
 {
+    if (!preparingExit_) {
+        event->ignore();
+        preparingExit_ = true;
+        if (exitTimer_ == nullptr) {
+            exitTimer_ = new QTimer(this); ///< 轮询插件退出就绪状态的定时器，首次关闭时按需创建。
+            exitTimer_->setInterval(200);
+            connect(exitTimer_, &QTimer::timeout, this, &MainWindow::pollExitReadiness);
+        }
+        exitElapsed_.start();
+        if (pluginManager_) pluginManager_->beginPrepareForExit();
+        if (processSupervisor_) processSupervisor_->beginPrepareForExit();
+        exitTimer_->start();
+        return;
+    }
+    if ((pluginManager_ && !pluginManager_->isReadyForExit()) ||
+        (processSupervisor_ && !processSupervisor_->isReadyForExit())) {
+        event->ignore();
+        return;
+    }
+    if (exitTimer_ != nullptr) exitTimer_->stop();
     if (pluginManager_ != nullptr) {
-        for (const ModuleConfig& config : modules_) {
+        for (const ModuleConfig& config : modules_) { ///< 当前询问 canClose 的模块配置。
             if (!config.enabled || config.type != ModuleType::InProcessUi)
                 continue;
-            InProcessUiModule* module = pluginManager_->uiModule(config.id);
+            InProcessUiModule* module = pluginManager_->uiModule(config.id); ///< 该模块的界面对象。
             if (module != nullptr &&
                 !module->canClose(ModuleCloseReason::ApplicationExit)) {
+                preparingExit_ = false;
+                pluginManager_->cancelPrepareForExit();
+                if (processSupervisor_) processSupervisor_->cancelPrepareForExit();
                 event->ignore();
                 return;
             }
@@ -971,11 +1009,30 @@ void MainWindow::closeEvent(QCloseEvent* event)
     QMainWindow::closeEvent(event);
 }
 
+void MainWindow::pollExitReadiness()
+{
+    if (!preparingExit_) return;
+    if (exitElapsed_.elapsed() >= 30000) {
+        QStringList pending = processSupervisor_ ? processSupervisor_->pendingExitModules() : QStringList();
+        if (pluginManager_) pending.append(pluginManager_->pendingExitModules());
+        preparingExit_ = false;
+        exitTimer_->stop();
+        if (pluginManager_) pluginManager_->cancelPrepareForExit();
+        if (processSupervisor_) processSupervisor_->cancelPrepareForExit();
+        QMessageBox::warning(this, QString::fromUtf8(u8"退出未完成"),
+            QString::fromUtf8(u8"等待模块退出准备超过 30 秒，已取消关闭。请检查保存或服务状态。\n%1").arg(pending.join("\n")));
+        return;
+    }
+    if ((!pluginManager_ || pluginManager_->isReadyForExit()) &&
+        (!processSupervisor_ || processSupervisor_->isReadyForExit()))
+        close(); // 第二次 close 才进入已有草稿保护；不提前 shutdown 或直接 quit。
+}
+
 // 实际显示必须同时满足“用户希望显示”和“模块界面已经 ready”。
 void MainWindow::applyRequestedDockVisibility(const QString& moduleId,
                                               VisibilityOrigin origin)
 {
-    ManagedDockWidget* dockWidget = moduleDocks_.value(moduleId, nullptr);
+    ManagedDockWidget* dockWidget = moduleDocks_.value(moduleId, nullptr); ///< 该模块对应的 Dock。
     if (dockWidget == nullptr)
         return;
     if (!requestedDockVisibility_.value(moduleId, false) ||
@@ -987,10 +1044,10 @@ void MainWindow::applyRequestedDockVisibility(const QString& moduleId,
         addDockWidget(Qt::LeftDockWidgetArea, dockWidget);
 
     // 布局恢复或窗口晚到时，记住当前标签，show 后再抬回，避免抢走用户焦点。
-    ManagedDockWidget* activeTab = nullptr;
+    ManagedDockWidget* activeTab = nullptr; ///< 标签组中当前可见的同级 Dock，用于显示后置顶。
     if (origin != VisibilityOrigin::UserAction) {
-        const QList<QDockWidget*> siblings = tabifiedDockWidgets(dockWidget);
-        for (QDockWidget* sibling : siblings) {
+        const QList<QDockWidget*> siblings = tabifiedDockWidgets(dockWidget); ///< 与该 Dock 同组的标签页列表。
+        for (QDockWidget* sibling : siblings) { ///< 同组标签页中的当前项。
             if (sibling != nullptr && sibling->isVisible()) {
                 activeTab = qobject_cast<ManagedDockWidget*>(sibling);
                 break;
@@ -1001,9 +1058,9 @@ void MainWindow::applyRequestedDockVisibility(const QString& moduleId,
 
     // ProcessUi 只有在显示意图和 ready 同时成立时才收到 showWindow；后续
     // resizeEvent 使用独立 resizeWindow 帧，不会重复调用子进程 QWidget::show()。
-    ProcessWindowHost* host = processHosts_.value(moduleId, nullptr);
+    ProcessWindowHost* host = processHosts_.value(moduleId, nullptr); ///< 该模块的子进程窗口宿主。
     if (host != nullptr && host->hasEmbeddedWindow()) {
-        QString error;
+        QString error; ///< 承接子进程窗口显示失败原因。
         if (processSupervisor_ == nullptr ||
             !processSupervisor_->showWindow(moduleId, &error)) {
             host->showPlaceholder(placeholderText(moduleId, error));
@@ -1020,10 +1077,10 @@ void MainWindow::applyRequestedDockVisibility(const QString& moduleId,
 // 程序同步 QAction 时阻塞信号，避免把状态回写误当成一次用户操作。
 void MainWindow::syncModuleAction(const QString& moduleId)
 {
-    QAction* action = moduleActions_.value(moduleId, nullptr);
+    QAction* action = moduleActions_.value(moduleId, nullptr); ///< 该模块的菜单项。
     if (action == nullptr)
         return;
-    const QSignalBlocker blocker(action);
+    const QSignalBlocker blocker(action); ///< 同步勾选状态时不触发 triggered 信号。
     action->setChecked(requestedDockVisibility_.value(moduleId, false));
 }
 
@@ -1031,9 +1088,9 @@ void MainWindow::syncModuleAction(const QString& moduleId)
 void MainWindow::updateStatusSummary()
 {
     // 状态栏分母只统计 enabled 模块，分子只统计精确 Running 状态。
-    int enabledCount = 0;
-    int runningCount = 0;
-    for (const ModuleConfig& module : modules_) {
+    int enabledCount = 0; ///< 已启用模块总数。
+    int runningCount = 0; ///< 状态精确为 Running 的模块数。
+    for (const ModuleConfig& module : modules_) { ///< 当前参与统计的模块配置。
         if (!module.enabled)
             continue;
         ++enabledCount;
@@ -1059,7 +1116,7 @@ void MainWindow::reportStateFailure(const QString& title, const QString& detail)
 QString MainWindow::displayName(const QString& moduleId) const
 {
     // 未配置 DisplayName 时回退稳定 moduleId。
-    const ModuleConfig module = modulesById_.value(moduleId);
+    const ModuleConfig module = modulesById_.value(moduleId); ///< 该模块的配置快照，未命中时使用默认值。
     return module.displayName.isEmpty() ? moduleId : module.displayName;
 }
 
@@ -1086,7 +1143,7 @@ void MainWindow::changeEvent(QEvent* event)
 void MainWindow::startWindowMove(const QPoint& globalPosition,
                                  const QPoint& titleBarPosition)
 {
-    QWindow* nativeWindow = windowHandle();
+    QWindow* nativeWindow = windowHandle(); ///< 本窗口对应的原生 QWindow。
     if (nativeWindow == nullptr)
         return;
 
@@ -1095,31 +1152,31 @@ void MainWindow::startWindowMove(const QPoint& globalPosition,
         return;
     }
 
-    QRect restoredGeometry = normalGeometry();
+    QRect restoredGeometry = normalGeometry(); ///< 最大化前的普通窗口几何，用作恢复尺寸。
     if (!restoredGeometry.isValid() || restoredGeometry.width() <= 0 ||
         restoredGeometry.height() <= 0) {
         restoredGeometry = QRect(QPoint(), QSize(1200, 760));
     }
 
-    const int currentWidth = qMax(1, width());
+    const int currentWidth = qMax(1, width()); ///< 最大化状态下的窗口宽度，用于计算横向比例。
     const qreal horizontalRatio = qBound(
         0.0,
         static_cast<qreal>(globalPosition.x() - frameGeometry().left()) /
             static_cast<qreal>(currentWidth),
-        1.0);
+        1.0); ///< 鼠标在最大化窗口中的横向相对位置，用于放置恢复后的窗口。
     QPoint restoredTopLeft(
         globalPosition.x() - qRound(horizontalRatio * restoredGeometry.width()),
-        globalPosition.y() - titleBarPosition.y());
+        globalPosition.y() - titleBarPosition.y()); ///< 恢复窗口的左上角候选坐标。
 
-    QScreen* targetScreen = QGuiApplication::screenAt(globalPosition);
+    QScreen* targetScreen = QGuiApplication::screenAt(globalPosition); ///< 鼠标所在的屏幕，用于把恢复窗口限制在工作区内。
     if (targetScreen == nullptr)
         targetScreen = nativeWindow->screen();
     if (targetScreen != nullptr) {
-        const QRect available = targetScreen->availableGeometry();
+        const QRect available = targetScreen->availableGeometry(); ///< 该屏幕扣除任务栏后的可用区域。
         const int maximumX = qMax(
-            available.left(), available.right() - restoredGeometry.width() + 1);
+            available.left(), available.right() - restoredGeometry.width() + 1); ///< 恢复窗口左上角允许的最大 X。
         const int maximumY = qMax(
-            available.top(), available.bottom() - restoredGeometry.height() + 1);
+            available.top(), available.bottom() - restoredGeometry.height() + 1); ///< 恢复窗口左上角允许的最大 Y。
         restoredTopLeft.setX(qBound(available.left(),
                                     restoredTopLeft.x(),
                                     maximumX));
@@ -1131,7 +1188,7 @@ void MainWindow::startWindowMove(const QPoint& globalPosition,
     showNormal();
     setGeometry(QRect(restoredTopLeft, restoredGeometry.size()));
     QTimer::singleShot(0, this, [this]() {
-        QWindow* restoredWindow = windowHandle();
+        QWindow* restoredWindow = windowHandle(); ///< 窗口的原生句柄，空表示尚未创建平台窗口。
         if (restoredWindow != nullptr)
             restoredWindow->startSystemMove();
     });
@@ -1147,20 +1204,20 @@ bool MainWindow::nativeEvent(const QByteArray& eventType,
 #ifdef Q_OS_WIN
     Q_UNUSED(eventType)
     if (message != nullptr && result != nullptr) {
-        MSG* nativeMessage = static_cast<MSG*>(message);
+        MSG* nativeMessage = static_cast<MSG*>(message); ///< 当前待处理的 Win32 消息。
 
         if (nativeMessage->message == WM_GETMINMAXINFO) {
             // 最大化尺寸必须使用 monitor 工作区 rcWork，而不是完整 rcMonitor；
             // 这样任务栏位于上下左右任意一侧时都不会被无边框窗口覆盖。
-            MINMAXINFO* minMaxInfo = reinterpret_cast<MINMAXINFO*>(nativeMessage->lParam);
-            MONITORINFO monitorInfo = {};
+            MINMAXINFO* minMaxInfo = reinterpret_cast<MINMAXINFO*>(nativeMessage->lParam); ///< 待填充的最大化尺寸结构。
+            MONITORINFO monitorInfo = {}; ///< 承接目标显示器的完整与工作区矩形。
             monitorInfo.cbSize = sizeof(MONITORINFO);
             HMONITOR monitor = MonitorFromWindow(
-                nativeMessage->hwnd, MONITOR_DEFAULTTONEAREST);
+                nativeMessage->hwnd, MONITOR_DEFAULTTONEAREST); ///< 窗口所在的最近显示器句柄。
             if (minMaxInfo != nullptr && monitor != nullptr &&
                 GetMonitorInfo(monitor, &monitorInfo)) {
-                const RECT& monitorRect = monitorInfo.rcMonitor;
-                const RECT& workRect = monitorInfo.rcWork;
+                const RECT& monitorRect = monitorInfo.rcMonitor; ///< 显示器完整矩形。
+                const RECT& workRect = monitorInfo.rcWork; ///< 显示器扣除任务栏后的工作区矩形。
                 minMaxInfo->ptMaxPosition.x = workRect.left - monitorRect.left;
                 minMaxInfo->ptMaxPosition.y = workRect.top - monitorRect.top;
                 minMaxInfo->ptMaxSize.x = workRect.right - workRect.left;
@@ -1172,23 +1229,23 @@ bool MainWindow::nativeEvent(const QByteArray& eventType,
 
         if (nativeMessage->message == WM_NCHITTEST) {
             const QPoint screenPoint(GET_X_LPARAM(nativeMessage->lParam),
-                                     GET_Y_LPARAM(nativeMessage->lParam));
-            const QRect windowRect = nativeWindowRect(nativeMessage->hwnd);
+                                     GET_Y_LPARAM(nativeMessage->lParam)); ///< 鼠标位置，屏幕坐标。
+            const QRect windowRect = nativeWindowRect(nativeMessage->hwnd); ///< 当前窗口的屏幕矩形。
 
             // 自绘标题栏位于窗口客户区顶部。必须先判断它，再判断窗口边缘；否则标题栏
             // 最上方的 6 个物理像素会先被返回为 HTTOP，Windows 会把一次普通点击当成
             // 上边框缩放。标题栏本身仍由 Qt 处理拖动、双击最大化和按钮点击。
-            POINT nativeClientPoint = {screenPoint.x(), screenPoint.y()};
+            POINT nativeClientPoint = {screenPoint.x(), screenPoint.y()}; ///< 待换算为窗口客户区坐标的点。
             if (nativeMessage->hwnd != nullptr &&
                 ScreenToClient(nativeMessage->hwnd, &nativeClientPoint)) {
                 const qreal deviceScale = devicePixelRatioF() > 0.0
-                    ? devicePixelRatioF() : 1.0;
+                    ? devicePixelRatioF() : 1.0; ///< 物理像素与逻辑像素的比例，防止除零。
                 const QPoint logicalClientPoint(
                     qRound(static_cast<qreal>(nativeClientPoint.x) / deviceScale),
-                    qRound(static_cast<qreal>(nativeClientPoint.y) / deviceScale));
+                    qRound(static_cast<qreal>(nativeClientPoint.y) / deviceScale)); ///< 换算到 Qt 逻辑坐标的客户区点。
                 if (titleBar_ != nullptr) {
                     const QPoint titleBarPoint = titleBar_->mapFrom(
-                        this, logicalClientPoint);
+                        this, logicalClientPoint); ///< 把客户区点映射到标题栏自身坐标。
                     if (titleBar_->rect().contains(titleBarPoint)) {
                         *result = HTCLIENT;
                         return true;
@@ -1200,10 +1257,10 @@ bool MainWindow::nativeEvent(const QByteArray& eventType,
             // 普通状态先判断角，再判断边，保证角落获得正确的斜向调整光标。
             if (!isMaximized() && windowRect.isValid()) {
                 const qreal deviceScale = devicePixelRatioF() > 0.0
-                    ? devicePixelRatioF() : 1.0;
-                const int nativeBorderWidth = qMax(1, qRound(6.0 * deviceScale));
+                    ? devicePixelRatioF() : 1.0; ///< 物理像素与逻辑像素的比例，防止除零。
+                const int nativeBorderWidth = qMax(1, qRound(6.0 * deviceScale)); ///< 换算为物理像素的缩放边框宽度。
                 const long resizeResult = resizeHitTest(
-                    screenPoint, windowRect, nativeBorderWidth);
+                    screenPoint, windowRect, nativeBorderWidth); ///< 八方向缩放命中值。
                 if (resizeResult != HTNOWHERE) {
                     *result = resizeResult;
                     return true;

@@ -22,15 +22,18 @@ namespace
 {
 // 操作列最多同时显示“打开界面”和“重启子进程”两个按钮。这里使用稳定的 Qt 逻辑
 // 像素尺寸，并给操作列预留布局边距，避免全局 QSS padding 把图标挤出单元格。
-const QSize kActionButtonSize(32, 28);
-const QSize kActionIconSize(18, 18);
-const int kActionColumnWidth = 96;
-const int kActionRowHeight = 44;
-const int kActionCellHorizontalMargin = 6;
-const int kActionCellVerticalMargin = 2;
-const int kActionButtonSpacing = 4;
+const QSize kActionButtonSize(32, 28); ///< 操作列内单个按钮的固定尺寸。
+const QSize kActionIconSize(18, 18); ///< 操作按钮图标的固定尺寸。
+const int kActionColumnWidth = 96; ///< 操作列固定宽度，容纳两个并排按钮。
+const int kActionRowHeight = 44; ///< 表格行高，保证 28 像素按钮加边距不被裁切。
+const int kActionCellHorizontalMargin = 6; ///< 操作单元格左右留白，避开 QSS 的 padding。
+const int kActionCellVerticalMargin = 2; ///< 操作单元格上下留白，保证按钮垂直居中。
+const int kActionButtonSpacing = 4; ///< 两个操作按钮之间的间距。
 
 // 判断模块是否提供可以显示的界面按钮。
+/// @brief 判断模块类型是否提供可显示的界面窗口。
+/// @param type 待判断的模块类型。
+/// @return 属于两种 UI 类型时返回 true，否则返回 false。
 bool isUiType(ModuleType type)
 {
     // 两种 UI 类型都提供“显示模块界面”按钮。
@@ -38,6 +41,9 @@ bool isUiType(ModuleType type)
 }
 
 // 判断模块是否由 ProcessSupervisor 管理，只有这类模块允许重启。
+/// @brief 判断模块是否由 ProcessSupervisor 管理。
+/// @param type 待判断的模块类型。
+/// @return 属于两种子进程类型时返回 true，否则返回 false。
 bool isProcessType(ModuleType type)
 {
     // 只有子进程类型可以通过监督器执行 restart。
@@ -81,14 +87,14 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
     tableWidget_->setColumnWidth(3, kActionColumnWidth);
 
     // 按配置顺序创建行，并把 moduleId 保存到按钮动态属性。
-    int row = 0;
-    for (const ModuleConfig& module : modules) {
+    int row = 0; ///< 当前正在创建的行号，从 0 递增。
+    for (const ModuleConfig& module : modules) { ///< 当前正在建行的模块配置。
         rows_.insert(module.id, row);
         moduleStates_.insert(
             module.id,
             module.enabled ? QString::fromUtf8(u8"等待启动") : QString::fromUtf8(u8"已禁用"));
         QTableWidgetItem* nameItem = new QTableWidgetItem(
-            module.displayName.isEmpty() ? module.id : module.displayName);
+            module.displayName.isEmpty() ? module.id : module.displayName); ///< 模块名单元格，优先显示展示名。
         nameItem->setToolTip(module.id);
         tableWidget_->setItem(row, 0, nameItem);
         tableWidget_->setItem(row, 1, new QTableWidgetItem(moduleTypeText(module.type)));
@@ -98,10 +104,10 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
             new QTableWidgetItem(module.enabled
                 ? QString::fromUtf8(u8"等待启动") : QString::fromUtf8(u8"已禁用")));
 
-        QWidget* actionWidget = new QWidget(tableWidget_);
+        QWidget* actionWidget = new QWidget(tableWidget_); ///< 操作单元格容器，承载该行的操作按钮。
         actionWidget->setObjectName(
             QStringLiteral("ModuleActionCell.%1").arg(module.id));
-        QHBoxLayout* actionLayout = new QHBoxLayout(actionWidget);
+        QHBoxLayout* actionLayout = new QHBoxLayout(actionWidget); ///< 操作按钮的水平布局。
         actionLayout->setContentsMargins(kActionCellHorizontalMargin,
                                          kActionCellVerticalMargin,
                                          kActionCellHorizontalMargin,
@@ -110,8 +116,8 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
 
         if (isUiType(module.type)) {
             // showButton 初始禁用，直到对应 UI 对象/窗口句柄准备完成。
-            QToolButton* showButton = new QToolButton(actionWidget);
-            QIcon icon = QIcon::fromTheme(QStringLiteral("view-visible"));
+            QToolButton* showButton = new QToolButton(actionWidget); ///< 显示模块界面的按钮。
+            QIcon icon = QIcon::fromTheme(QStringLiteral("view-visible")); ///< 显示按钮图标，取不到主题图标时回退到 Qt 标准图标。
             if (icon.isNull())
                 icon = style()->standardIcon(QStyle::SP_DialogOpenButton);
             showButton->setIcon(icon);
@@ -134,8 +140,8 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
         }
         if (isProcessType(module.type)) {
             // 被禁用的配置不能重启；运行中或失败的子进程均可请求重启。
-            QToolButton* restartButton = new QToolButton(actionWidget);
-            QIcon icon = QIcon::fromTheme(QStringLiteral("view-refresh"));
+            QToolButton* restartButton = new QToolButton(actionWidget); ///< 重启子进程的按钮。
+            QIcon icon = QIcon::fromTheme(QStringLiteral("view-refresh")); ///< 重启按钮图标，取不到主题图标时回退到 Qt 标准图标。
             if (icon.isNull())
                 icon = style()->standardIcon(QStyle::SP_BrowserReload);
             restartButton->setIcon(icon);
@@ -163,7 +169,7 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
         ++row;
     }
 
-    QVBoxLayout* layout = new QVBoxLayout(this);
+    QVBoxLayout* layout = new QVBoxLayout(this); ///< 对话框的垂直布局，只放表格。
     layout->setContentsMargins(8, 8, 8, 8);
     layout->addWidget(tableWidget_);
 }
@@ -174,10 +180,10 @@ void ModuleManagerDialog::setModuleState(const QString& moduleId,
                                          const QString& detail)
 {
     // 未知 ID 可能来自已移除配置，安全忽略而不是越界访问表格。
-    const int row = rows_.value(moduleId, -1);
+    const int row = rows_.value(moduleId, -1); ///< 目标行号，-1 表示该模块不在表格中。
     if (row < 0)
         return;
-    QTableWidgetItem* item = tableWidget_->item(row, 2);
+    QTableWidgetItem* item = tableWidget_->item(row, 2); ///< 状态列的单元格。
     if (item == nullptr)
         return;
     item->setText(state);
@@ -190,7 +196,7 @@ void ModuleManagerDialog::setModuleState(const QString& moduleId,
 void ModuleManagerDialog::setUiAvailable(const QString& moduleId, bool available)
 {
     // 非 UI 模块不在 showButtons_ 中，因此没有按钮可更新。
-    QToolButton* button = showButtons_.value(moduleId, nullptr);
+    QToolButton* button = showButtons_.value(moduleId, nullptr); ///< 对应的显示按钮，可能不存在。
     if (button != nullptr)
         button->setEnabled(available);
 }
@@ -208,7 +214,7 @@ void ModuleManagerDialog::setRestartBusy(const QString& moduleId, bool busy)
 void ModuleManagerDialog::onShowButtonClicked()
 {
     // sender 是实际点击的 QToolButton，动态属性保存其 moduleId。
-    QObject* button = sender();
+    QObject* button = sender(); ///< 触发本次槽函数的按钮对象。
     if (button != nullptr)
         emit showModuleRequested(button->property("moduleId").toString());
 }
@@ -217,20 +223,20 @@ void ModuleManagerDialog::onShowButtonClicked()
 void ModuleManagerDialog::onRestartButtonClicked()
 {
     // 只发请求，不在对话框线程同步等待子进程停止/启动。
-    QObject* button = sender();
+    QObject* button = sender(); ///< 触发本次槽函数的按钮对象。
     if (button != nullptr)
         emit restartModuleRequested(button->property("moduleId").toString());
 }
 
 void ModuleManagerDialog::updateRestartButton(const QString& moduleId)
 {
-    QToolButton* button = restartButtons_.value(moduleId, nullptr);
+    QToolButton* button = restartButtons_.value(moduleId, nullptr); ///< 对应的重启按钮，可能不存在。
     if (button == nullptr)
         return;
-    const QString state = moduleStates_.value(moduleId);
+    const QString state = moduleStates_.value(moduleId); ///< 该模块最近一次上报的状态文本。
     const bool lifecycleBusy = state == QStringLiteral("Starting") ||
                                state == QStringLiteral("Stopping") ||
-                               state == QStringLiteral("Restarting");
+                               state == QStringLiteral("Restarting"); ///< 生命周期是否处于过渡态，此时不允许再次提交。
     button->setEnabled(button->property("configuredEnabled").toBool() &&
                        !restartBusy_.value(moduleId, false) &&
                        !lifecycleBusy);

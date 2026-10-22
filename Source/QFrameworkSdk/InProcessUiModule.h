@@ -14,12 +14,12 @@ class QFRAMEWORK_EXPORT InProcessUiModule : public QWidget, public ModuleEndpoin
     Q_OBJECT
 
 public:
-    /// @brief 创建主进程 QWidget 模块基类；参数：parent 是 Dock/插件管理器设置的父控件；返回值：无。
-    /// @param parent Qt 父对象或父控件；用于建立所有权关系，允许为空。
-    /// @return 无。
+    /// @brief 创建主进程 UI 模块基类，只初始化 QWidget；此时尚未加入宿主 Dock。
+    /// @param parent Qt 父控件，可为空；插件由 QPluginLoader 构造时通常为空，非空时并入 Qt 父子树。
+    /// @return 无（构造函数不返回值）。
     explicit InProcessUiModule(QWidget* parent = nullptr);
-    /// @brief 释放 QWidget 子树并完成端点析构；参数：无；返回值：无。
-    /// @return 无。
+    /// @brief 虚析构，保证卸载 DLL 前完整析构派生模块的控件子树。
+    /// @return 无（析构函数不返回值）。
     ~InProcessUiModule() override;
 };
 }

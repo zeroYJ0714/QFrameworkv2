@@ -40,6 +40,9 @@
 #include <QThread>
 #include <QTimer>
 #include <QWaitCondition>
+#include <QWeakPointer>
+
+#include <string>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -56,6 +59,7 @@
 #include "MainWindow.h"
 #include "ManagedDockWidget.h"
 #include "MessageBus.h"
+#include "MessagePayload.h"
 #include "ModuleManagerDialog.h"
 #include "PluginManager.h"
 #include "ProcessProtocol.h"
@@ -68,9 +72,7 @@
 #include "WindowTitleBar.h"
 #include "ProtocolVersion.h"
 #include "MessageTopics.h"
-#include "Generated/image_messages.pb.h"
-#include "Generated/log_messages.pb.h"
-#include "Generated/status_messages.pb.h"
+#include "Generated/master_message.pb.h"
 
 namespace
 {
@@ -207,6 +209,17 @@ public:
         return true;
     }
 
+    // 共享入口验证 ModuleEndpoint 新宿主契约；测试替身只保留内容快照，
+    // 正式的同对象复用由 MessageBus 专项测试检查 constData 地址。
+    bool publishSharedFromModule(const QString& moduleId,
+                                 const QString& topic,
+                                 const qframework::MessagePayload& payload) override
+    {
+        if (payload.isNull())
+            return false;
+        return publishFromModule(moduleId, topic, *payload);
+    }
+
     // 记录模块日志。该测试不关心级别，所以用 Q_UNUSED 明确忽略它。
     void logFromModule(qframework::LogLevel level,
                        const QString& moduleId,
@@ -253,6 +266,8 @@ struct ReceivedMessage
     QString sender;
     // 复制后的业务负载；测试不保留底层 Socket/共享内存指针。
     QByteArray data;
+    // 回调入口看到的 constData 地址；仅用于证明多个进程内队列没有复制大块数据。
+    quintptr dataAddress = 0;
 };
 
 // MessageBus 测试模块：既可以充当发布者，也可以充当订阅者。
@@ -282,6 +297,7 @@ public:
         message.topic = topic;
         message.sender = senderModuleId;
         message.data = data;
+        message.dataAddress = reinterpret_cast<quintptr>(data.constData());
         received_.append(message);
         changed_.wakeAll();
     }
@@ -426,6 +442,13 @@ public:
     }
 
     // 只声明当前场景需要的发布主题，顺便验证框架的主题权限检查没有被绕过。
+    void beginPrepareForExit() override { prepareClock_.start(); }
+    bool isReadyForExit() const override {
+        return mode_ != QStringLiteral("RuntimePrepareNever") &&
+            (!prepareClock_.isValid() || prepareClock_.elapsed() >= 400);
+    }
+    void cancelPrepareForExit() override { prepareClock_.invalidate(); }
+
     QStringList publishedTopics() const override
     {
         if (mode_ == QStringLiteral("RuntimeHungCallback"))
@@ -462,6 +485,7 @@ public:
     // 模块进入 Running 前执行一次场景初始化；返回 false 会被框架视为启动失败。
     bool onStart() override
     {
+        if (mode_.startsWith(QStringLiteral("RuntimePrepare"))) return true;
         if (mode_ == QStringLiteral("RuntimeHungCallback"))
             return true;
         if (mode_ == QStringLiteral("RuntimePublishStress")) {
@@ -554,6 +578,7 @@ private:
     }
 
     // 保存构造时选定的测试模式，子进程生命周期内不再修改。
+    QElapsedTimer prepareClock_;
     QString mode_;
     QVector<RuntimePublishWorker*> publishWorkers_;
     QMutex hungMutex_;
@@ -693,7 +718,7 @@ int runFaultProcessClient(int argc, char* argv[])
         return 20;
     if (moduleId.startsWith(QStringLiteral("RuntimeQueue")) ||
         moduleId == QStringLiteral("RuntimeHungCallback") ||
-        moduleId == QStringLiteral("RuntimePublishStress")) {
+        moduleId == QStringLiteral("RuntimePublishStress") || moduleId.startsWith(QStringLiteral("RuntimePrepare"))) {
         // 队列专项场景必须走真实 ProcessRuntime，才能覆盖内部 ACK 和共享内存。
         return qframework::ProcessRuntime::run(
             &application,
@@ -1182,10 +1207,11 @@ void BaselineTest::configIsReadOnlyAndResolvesPaths()
     QCOMPARE(config.logging().flushIntervalMs, 100);
     QCOMPARE(config.messageBus().topics.value(QStringLiteral("QFRAMEWORK_IMAGE_RAW")).policy,
              qframework::QueuePolicy::Latest);
-    QCOMPARE(config.layout().presets.size(), 1);
+    QCOMPARE(config.layout().presets.size(), 2);
     QCOMPARE(config.layout().presets.first().index, 1);
     QCOMPARE(config.layout().presets.first().name, QString::fromUtf8(u8"默认布局"));
-    QVERIFY(config.layout().presets.first().filePath.isEmpty());
+    QVERIFY(config.layout().presets.first().filePath.endsWith(QStringLiteral("Layouts/1.qflayout")));
+    QVERIFY(config.layout().presets.last().filePath.endsWith(QStringLiteral("Layouts/2.qflayout")));
 
     QVERIFY(file.open(QIODevice::ReadOnly));
     const QByteArray after = file.readAll();
@@ -1622,9 +1648,244 @@ void BaselineTest::messageBusPoliciesAndOrdering()
     QVERIFY(bus.unregisterModule(QStringLiteral("Subscriber"), false));
 }
 
+// 目的：Reliable 队列持续满时仍逐次统计 rejected，但同类日志每秒只写一次。
+// 准备：容量为 1 且暂停投递，先占满队列；动作：连续拒绝 101 次，跨过 1 秒再拒绝。
+// 断言：第一秒只有一条主日志，下一窗口补一条并说明此前抑制了 100 次，避免故障时
+// 日志线程和磁盘 I/O 反过来拖慢整个程序；所有 Logger/MessageBus 等待都有明确上限。
+void BaselineTest::messageBusRejectionLogIsRateLimited()
+{
+    QTemporaryDir temporary;
+    QVERIFY(temporary.isValid());
+    qframework::Logger& logger = qframework::Logger::instance();
+    logger.stop();
+    struct LoggerStopGuard
+    {
+        qframework::Logger* logger = nullptr;
+        ~LoggerStopGuard() { if (logger) logger->stop(); }
+    } loggerGuard{&logger};
+    QString loggerError;
+    QVERIFY2(logger.start(temporary.path(), 1024 * 1024, 10, &loggerError),
+             qPrintable(loggerError));
+
+    qframework::MessageBusConfig config;
+    config.defaultQueueCapacity = 1;
+    config.maxMessageBytes = 64;
+    qframework::TopicConfig reliable;
+    reliable.queueCapacity = 1;
+    reliable.maxMessageBytes = 64;
+    reliable.policy = qframework::QueuePolicy::Reliable;
+    config.topics.insert(QStringLiteral("REJECTION_LOG"), reliable);
+
+    BusTestModule publisher(
+        QStringList() << QStringLiteral("REJECTION_LOG"), QStringList());
+    BusTestModule subscriber(
+        QStringList(), QStringList() << QStringLiteral("REJECTION_LOG"));
+    qframework::MessageBus bus(config);
+    QString error;
+    QVERIFY2(bus.registerModule(QStringLiteral("LogPublisher"), &publisher, &error),
+             qPrintable(error));
+    QVERIFY2(bus.registerModule(QStringLiteral("LogSubscriber"), &subscriber, &error),
+             qPrintable(error));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("LogPublisher"), true));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("LogSubscriber"), true));
+
+    QVERIFY(publisher.publish(QStringLiteral("REJECTION_LOG"), QByteArray("first")));
+    for (int index = 0; index < 101; ++index)
+        QVERIFY(!publisher.publish(QStringLiteral("REJECTION_LOG"), QByteArray("reject")));
+    QCOMPARE(bus.queueStats(QStringLiteral("LogSubscriber")).rejected, 101ULL);
+
+    logger.flush();
+    const QByteArray firstBatch = readAllLogs(temporary.path());
+    const QByteArray marker =
+        QString::fromUtf8(u8"至少一个订阅者队列已满：REJECTION_LOG").toUtf8();
+    QCOMPARE(firstBatch.count(marker), 1);
+
+    QTest::qWait(1050);
+    QVERIFY(!publisher.publish(QStringLiteral("REJECTION_LOG"), QByteArray("again")));
+    logger.flush();
+    const QByteArray secondBatch = readAllLogs(temporary.path());
+    QCOMPARE(secondBatch.count(marker), 2);
+    QVERIFY(secondBatch.contains(
+        QString::fromUtf8(u8"此前 100 次相同拒绝已限频").toUtf8()));
+
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(2000));
+    QVERIFY(bus.unregisterModule(QStringLiteral("LogPublisher"), false));
+    QVERIFY(bus.unregisterModule(QStringLiteral("LogSubscriber"), false));
+    logger.stop();
+    loggerGuard.logger = nullptr;
+}
+
+// 目的：验证 publishShared 在进程内只创建一份不可变 QByteArray 对象，并由
+// 所有订阅队列共享同一引用；停止或投递完成后不能残留强引用。
+// 准备：总线保持暂停，注册一个发布者和两个订阅者；原始强引用发布后立即清空。
+// 动作：先用 QWeakPointer 证明排队期间载荷仍存活，再恢复投递并等待两个回调。
+// 断言：两个回调和原始载荷的 constData 地址完全相同，内容未变；队列释放后
+// 弱引用失效，说明正常投递路径没有把共享载荷永久保留在总线中。
+void BaselineTest::messageBusSharedPayloadIsReused()
+{
+    qframework::MessageBusConfig config;
+    config.defaultQueueCapacity = 4;
+    config.maxMessageBytes = 4096;
+    config.shutdownDrainTimeoutMs = 2000;
+
+    BusTestModule publisher(QStringList() << QStringLiteral("SHARED"), QStringList());
+    BusTestModule firstSubscriber(QStringList(),
+                                  QStringList() << QStringLiteral("SHARED"));
+    BusTestModule secondSubscriber(QStringList(),
+                                   QStringList() << QStringLiteral("SHARED"));
+
+    qframework::MessageBus bus(config);
+    QString error;
+    QVERIFY2(bus.registerModule(QStringLiteral("SharedPublisher"), &publisher, &error),
+             qPrintable(error));
+    QVERIFY2(bus.registerModule(QStringLiteral("SharedSubscriberA"),
+                                &firstSubscriber,
+                                &error),
+             qPrintable(error));
+    QVERIFY2(bus.registerModule(QStringLiteral("SharedSubscriberB"),
+                                &secondSubscriber,
+                                &error),
+             qPrintable(error));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("SharedPublisher"), true));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("SharedSubscriberA"), true));
+    QVERIFY(bus.setModuleRunning(QStringLiteral("SharedSubscriberB"), true));
+
+    qframework::MessagePayload payload(new QByteArray(1024, 'S'));
+    const quintptr originalAddress =
+        reinterpret_cast<quintptr>(payload->constData());
+    QWeakPointer<const QByteArray> weakPayload = payload.toWeakRef();
+    QVERIFY(publisher.publishShared(QStringLiteral("SHARED"), payload));
+    payload.clear();
+    QVERIFY(!weakPayload.toStrongRef().isNull());
+
+    bus.setDeliveryEnabled(true);
+    QVERIFY(firstSubscriber.waitForCount(1, 2000));
+    QVERIFY(secondSubscriber.waitForCount(1, 2000));
+    const ReceivedMessage first = firstSubscriber.received().constFirst();
+    const ReceivedMessage second = secondSubscriber.received().constFirst();
+    QCOMPARE(first.data, QByteArray(1024, 'S'));
+    QCOMPARE(second.data, QByteArray(1024, 'S'));
+    QCOMPARE(first.dataAddress, originalAddress);
+    QCOMPARE(second.dataAddress, originalAddress);
+    QTRY_VERIFY_WITH_TIMEOUT(weakPayload.toStrongRef().isNull(), 2000);
+
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(2000));
+    QVERIFY(bus.unregisterModule(QStringLiteral("SharedPublisher"), false));
+    QVERIFY(bus.unregisterModule(QStringLiteral("SharedSubscriberA"), false));
+    QVERIFY(bus.unregisterModule(QStringLiteral("SharedSubscriberB"), false));
+
+    // 第二个总线保持暂停，专门制造 Latest 覆盖、Reliable 拒绝和停止清空。
+    // 每个弱引用对应一个独立 QByteArray 对象，因此可以准确判断是哪条路径
+    // 释放了最后一个 MessagePayload 强引用，而不依赖进程内存统计。
+    qframework::MessageBusConfig releaseConfig;
+    releaseConfig.defaultQueueCapacity = 4;
+    releaseConfig.maxMessageBytes = 4096;
+    releaseConfig.shutdownDrainTimeoutMs = 2000;
+    qframework::TopicConfig latest;
+    latest.queueCapacity = 1;
+    latest.maxMessageBytes = 4096;
+    latest.policy = qframework::QueuePolicy::Latest;
+    releaseConfig.topics.insert(QStringLiteral("SHARED_LATEST"), latest);
+    qframework::TopicConfig reliable = latest;
+    reliable.policy = qframework::QueuePolicy::Reliable;
+    releaseConfig.topics.insert(QStringLiteral("SHARED_RELIABLE"), reliable);
+
+    BusTestModule releasePublisher(
+        QStringList() << QStringLiteral("SHARED_LATEST")
+                      << QStringLiteral("SHARED_RELIABLE"),
+        QStringList());
+    BusTestModule releaseSubscriber(
+        QStringList(),
+        QStringList() << QStringLiteral("SHARED_LATEST")
+                      << QStringLiteral("SHARED_RELIABLE"));
+    qframework::MessageBus releaseBus(releaseConfig);
+    QVERIFY2(releaseBus.registerModule(QStringLiteral("ReleasePublisher"),
+                                       &releasePublisher,
+                                       &error),
+             qPrintable(error));
+    QVERIFY2(releaseBus.registerModule(QStringLiteral("ReleaseSubscriber"),
+                                       &releaseSubscriber,
+                                       &error),
+             qPrintable(error));
+    QVERIFY(releaseBus.setModuleRunning(QStringLiteral("ReleasePublisher"), true));
+    QVERIFY(releaseBus.setModuleRunning(QStringLiteral("ReleaseSubscriber"), true));
+
+    qframework::MessagePayload latestOld(new QByteArray(512, 'O'));
+    QWeakPointer<const QByteArray> latestOldWeak = latestOld.toWeakRef();
+    QVERIFY(releasePublisher.publishShared(QStringLiteral("SHARED_LATEST"), latestOld));
+    latestOld.clear();
+    qframework::MessagePayload latestNew(new QByteArray(512, 'N'));
+    QWeakPointer<const QByteArray> latestNewWeak = latestNew.toWeakRef();
+    QVERIFY(releasePublisher.publishShared(QStringLiteral("SHARED_LATEST"), latestNew));
+    latestNew.clear();
+    QTRY_VERIFY_WITH_TIMEOUT(latestOldWeak.toStrongRef().isNull(), 2000);
+    QVERIFY(!latestNewWeak.toStrongRef().isNull());
+
+    qframework::MessagePayload reliableOld(new QByteArray(512, 'R'));
+    QWeakPointer<const QByteArray> reliableOldWeak = reliableOld.toWeakRef();
+    QVERIFY(releasePublisher.publishShared(QStringLiteral("SHARED_RELIABLE"),
+                                           reliableOld));
+    reliableOld.clear();
+    qframework::MessagePayload reliableRejected(new QByteArray(512, 'X'));
+    QWeakPointer<const QByteArray> reliableRejectedWeak =
+        reliableRejected.toWeakRef();
+    QVERIFY(!releasePublisher.publishShared(QStringLiteral("SHARED_RELIABLE"),
+                                            reliableRejected));
+    reliableRejected.clear();
+    QTRY_VERIFY_WITH_TIMEOUT(reliableRejectedWeak.toStrongRef().isNull(), 2000);
+    QVERIFY(!reliableOldWeak.toStrongRef().isNull());
+
+    QVERIFY(releaseBus.beginModuleStop(QStringLiteral("ReleaseSubscriber"), true));
+    QTRY_VERIFY_WITH_TIMEOUT(latestNewWeak.toStrongRef().isNull(), 2000);
+    QTRY_VERIFY_WITH_TIMEOUT(reliableOldWeak.toStrongRef().isNull(), 2000);
+    releaseBus.beginShutdown();
+    QVERIFY(releaseBus.stopQueues(2000));
+    QVERIFY(releaseBus.unregisterModule(QStringLiteral("ReleasePublisher"), false));
+    QVERIFY(releaseBus.unregisterModule(QStringLiteral("ReleaseSubscriber"), false));
+}
+
 // 目的：验证插件元数据、配置顺序、禁用模块和单模块故障隔离。
 // 准备：使用真实构建出的两个示例 DLL；动作：按不同配置组合加载并启动。
 // 断言：状态信号顺序正确、UI 模块收到消息、禁用项跳过、错误项不拖垮后续模块。
+// 缺失、禁用和未配置的可选 UI 插件均不阻止框架初始化和主窗口显示。
+void BaselineTest::optionalUiPluginDoesNotBlockStartup()
+{
+    for (const QByteArray mode : {QByteArray("missing"), QByteArray("disabled"), QByteArray("removed")}) {
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        QFile file(temp.filePath("test.ini"));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QByteArray ini("[Modules]\nNames=");
+        if (mode != "removed") ini += "OptionalUi";
+        ini += "\n[Module.OptionalUi]\nType=InProcessUi\nFilePath=missing.dll\nEnabled=";
+        ini += mode == "disabled" ? "false" : "true";
+        ini += "\n[Logging]\nDirectory=logs\n";
+        QCOMPARE(file.write(ini), qint64(ini.size()));
+        file.close();
+        // 缺失插件产生预期的非致命警告；自动关闭测试自己的模态对话框。
+        QTimer dismissWarnings;
+        connect(&dismissWarnings, &QTimer::timeout, [] {
+            for (QWidget* widget : QApplication::topLevelWidgets()) {
+                if (auto* message = qobject_cast<QMessageBox*>(widget))
+                    message->accept();
+            }
+        });
+        dismissWarnings.start(20);
+        qframework::FrameworkRuntime runtime(qobject_cast<QApplication*>(QCoreApplication::instance()));
+        QString error;
+        QVERIFY2(runtime.initialize(file.fileName(), &error), qPrintable(error));
+        QVERIFY(runtime.mainWindow());
+        runtime.mainWindow()->show();
+        QVERIFY(runtime.mainWindow()->isVisible());
+        QCoreApplication::processEvents();
+        QVERIFY(!runtime.mainWindow()->close());
+        QTRY_VERIFY_WITH_TIMEOUT(!runtime.mainWindow()->isVisible(), 2000);
+        runtime.shutdown();
+    }
+}
+
 void BaselineTest::pluginLoaderAndModuleIntegration()
 {
     const QString uiPath = pluginPath(QStringLiteral("InProcessUiExample"));
@@ -2090,7 +2351,10 @@ void BaselineTest::processIpcInlineSharedBidirectional()
 {
     // 一次测试覆盖四条路径：父发小/大消息到子进程，子再原样回发小/大消息。
     // 这样既能验证 QLocalSocket 控制帧，也能验证共享段在 publish ACK 后释放。
-    const qframework::MessageBusConfig busConfig = queueTestBusConfig();
+    qframework::MessageBusConfig busConfig = queueTestBusConfig();
+    // 全局默认只有 256 字节，但 TEST_*_SHARED 主题仍为 4096 字节。
+    // 1024 字节消息只有在父子两端都尊重主题覆盖值时才能双向通过。
+    busConfig.maxMessageBytes = 256;
     qframework::MessageBus bus(busConfig);
     BusTestModule publisher(
         QStringList() << QStringLiteral("TEST_PARENT_INLINE")
@@ -2467,6 +2731,143 @@ void BaselineTest::processStopAckAdvancesState()
     QVERIFY(bus.stopQueues(500));
 }
 
+// 显示过的嵌入窗口即使隐藏，也应在主事件循环停止后正常退出。
+void BaselineTest::processShutdownDeliversStopWithoutEventLoop_data()
+{
+    QTest::addColumn<bool>("trainingUi");
+    QTest::addColumn<int>("windowMode");
+    QTest::newRow("headless") << false << 0;
+    QTest::newRow("training-ui") << true << 0;
+    QTest::newRow("embedded-visible") << true << 1;
+    QTest::newRow("embedded-hidden") << true << 2;
+}
+
+void BaselineTest::processShutdownDeliversStopWithoutEventLoop()
+{
+    QFETCH(bool, trainingUi);
+    QFETCH(int, windowMode);
+    int cleanExits = 0;
+    int guiTicks = 0;
+    const auto busConfig = faultBusConfig();
+    qframework::MessageBus bus(busConfig);
+    qframework::ProcessSupervisor supervisor(
+        &bus, busConfig, lifecycleProcessConfig(3000));
+    const QVector<qframework::ModuleConfig> modules = {
+        faultProcessModuleConfig(QStringLiteral("RuntimePrepareShutdownA")),
+        trainingUi
+            ? processModuleConfig(QStringLiteral("ProcessUiExample"),
+                                  qframework::ModuleType::ProcessUi)
+            : faultProcessModuleConfig(QStringLiteral("RuntimePrepareShutdownB"))
+    };
+    qframework::MainWindow window(modules, nullptr, windowMode != 0 ? &supervisor : nullptr, nullptr);
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.runningModuleIds().size(), 2, 4000);
+    if (windowMode != 0) {
+        window.resize(720, 400);
+        window.show();
+        auto* host = window.findChild<qframework::ProcessWindowHost*>();
+        QVERIFY(host != nullptr);
+        QTRY_VERIFY_WITH_TIMEOUT(host->hasEmbeddedWindow(), 4000);
+        auto* action = window.findChild<QAction*>(
+            QStringLiteral("ModuleAction.%1").arg(modules.last().id));
+        QVERIFY(action != nullptr);
+        if (!action->isChecked()) action->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(host->isVisible(), 2000);
+        QTest::qWait(100);
+        if (windowMode == 2) window.hide();
+    }
+
+    const auto processes = supervisor.findChildren<QProcess*>();
+    QCOMPARE(processes.size(), 2);
+    for (QProcess* process : processes) {
+        connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                &window, [&cleanExits](int code, QProcess::ExitStatus status) {
+                    if (code == 0 && status == QProcess::NormalExit) ++cleanExits;
+                });
+    }
+    QTimer guiTimer;
+    connect(&guiTimer, &QTimer::timeout, &window, [&guiTicks]() { ++guiTicks; });
+    guiTimer.start(1);
+    QElapsedTimer elapsed;
+    elapsed.start();
+    supervisor.shutdown();
+    const qint64 shutdownMs = elapsed.elapsed();
+    guiTimer.stop();
+    qInfo("Healthy child shutdown: %lld ms, clean exits: %d", shutdownMs, cleanExits);
+    QCOMPARE(cleanExits, 2);
+    QVERIFY2(shutdownMs < 1500, "Healthy children waited for the stop timeout");
+    QCOMPARE(guiTicks, 0);
+    QVERIFY(supervisor.runningModuleIds().isEmpty());
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(500));
+}
+
+// 退出准备不拆窗口；停止、重启和句柄已经失效的崩溃恢复都能安全清理。
+void BaselineTest::processUiStopRestartAndCrashReleaseWindow()
+{
+    const auto busConfig = faultBusConfig();
+    qframework::MessageBus bus(busConfig);
+    auto processConfig = lifecycleProcessConfig(3000);
+    processConfig.maxRestartCount = 1;
+    qframework::ProcessSupervisor supervisor(&bus, busConfig, processConfig);
+    const QString moduleId = QStringLiteral("ProcessUiExample");
+    const QVector<qframework::ModuleConfig> modules = {
+        processModuleConfig(moduleId, qframework::ModuleType::ProcessUi)
+    };
+    qframework::MainWindow window(modules, nullptr, &supervisor, nullptr);
+    window.resize(720, 400);
+    window.show();
+    auto* host = window.findChild<qframework::ProcessWindowHost*>();
+    QVERIFY(host != nullptr);
+    qRegisterMetaType<quintptr>("quintptr");
+    QSignalSpy handles(&supervisor, &qframework::ProcessSupervisor::windowHandleReady);
+    QSignalSpy stopped(&supervisor, &qframework::ProcessSupervisor::stopFinished);
+    QSignalSpy restarted(&supervisor, &qframework::ProcessSupervisor::restartFinished);
+    QStringList errors;
+    QVERIFY2(supervisor.startAll(modules, &errors), qPrintable(errors.join('\n')));
+    QTRY_VERIFY_WITH_TIMEOUT(host->hasEmbeddedWindow(), 4000);
+    auto* action = window.findChild<QAction*>(QStringLiteral("ModuleAction.%1").arg(moduleId));
+    QVERIFY(action != nullptr);
+    if (!action->isChecked()) action->trigger();
+    QTRY_VERIFY_WITH_TIMEOUT(host->isVisible(), 2000);
+
+    supervisor.beginPrepareForExit();
+    QTRY_VERIFY_WITH_TIMEOUT(supervisor.isReadyForExit(), 4000);
+    QVERIFY(host->hasEmbeddedWindow());
+    supervisor.cancelPrepareForExit();
+    QVERIFY(host->hasEmbeddedWindow());
+
+    QString error;
+    QVERIFY2(supervisor.requestStop(moduleId, &error), qPrintable(error));
+    QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 4000);
+    QVERIFY(stopped.first().at(1).toBool());
+    QVERIFY(!host->hasEmbeddedWindow());
+    host->showPlaceholder(QStringLiteral("Stopped"));
+    QVERIFY(!host->hasEmbeddedWindow());
+
+    QVERIFY2(supervisor.requestRestart(moduleId, &error), qPrintable(error));
+    QTRY_COMPARE_WITH_TIMEOUT(restarted.count(), 1, 5000);
+    QVERIFY(restarted.last().at(1).toBool());
+    QTRY_VERIFY_WITH_TIMEOUT(host->hasEmbeddedWindow(), 4000);
+    QVERIFY2(supervisor.requestRestart(moduleId, &error), qPrintable(error));
+    QTRY_COMPARE_WITH_TIMEOUT(restarted.count(), 2, 5000);
+    QVERIFY(restarted.last().at(1).toBool());
+    QTRY_VERIFY_WITH_TIMEOUT(host->hasEmbeddedWindow(), 4000);
+
+    const int handleCount = handles.count();
+    QVERIFY(supervisor.terminate(moduleId));
+    QTRY_COMPARE_WITH_TIMEOUT(handles.count(), handleCount + 1, 5000);
+    QTRY_VERIFY_WITH_TIMEOUT(host->hasEmbeddedWindow(), 4000);
+    QCOMPARE(supervisor.state(moduleId), QStringLiteral("Running"));
+
+    supervisor.shutdown();
+    QVERIFY(!host->hasEmbeddedWindow());
+    QVERIFY(supervisor.runningModuleIds().isEmpty());
+    bus.beginShutdown();
+    QVERIFY(bus.stopQueues(500));
+}
+
 // 三个无响应子进程共用一次退出总预算，耗时不能线性乘以进程数量。
 void BaselineTest::processShutdownUsesOneTotalDeadline()
 {
@@ -2703,17 +3104,26 @@ void BaselineTest::shutdownRequestsFailFastForHungInProcessModule()
     QVERIFY(bus.unregisterModule(QStringLiteral("FailFastPublisher"), false));
 }
 
-// 源码级守卫配合上一项进程行为测试，防止未来重新引入 QThread::terminate()。
+// 源码级守卫覆盖消息、日志和子进程运行线程，防止未来重新引入
+// QThread::terminate() 或 QThread 子类中的未限定 terminate()。
 void BaselineTest::messageQueueNeverUsesThreadTerminate()
 {
-    const QString sourcePath = QDir::cleanPath(
-        QCoreApplication::applicationDirPath() +
-        QStringLiteral("/../../../../Source/QFramework/Process/ProcessRuntime.cpp"));
-    QFile sourceFile(sourcePath);
-    QVERIFY2(sourceFile.open(QIODevice::ReadOnly), qPrintable(sourcePath));
-    const QByteArray source = sourceFile.readAll();
-    QVERIFY(!source.contains("QThread::terminate"));
-    QVERIFY(!source.contains("terminate();"));
+    const QString sourceRoot = QDir::cleanPath(
+        QCoreApplication::applicationDirPath()
+        + QStringLiteral("/../../../../Source/QFramework"));
+    const QStringList relativePaths = {
+        QStringLiteral("Process/ProcessRuntime.cpp"),
+        QStringLiteral("Messaging/MessageBus.cpp"),
+        QStringLiteral("Logging/Logger.cpp")
+    };
+    for (const QString& relativePath : relativePaths) {
+        const QString sourcePath = QDir(sourceRoot).filePath(relativePath);
+        QFile sourceFile(sourcePath);
+        QVERIFY2(sourceFile.open(QIODevice::ReadOnly), qPrintable(sourcePath));
+        const QByteArray source = sourceFile.readAll();
+        QVERIFY2(!source.contains("QThread::terminate"), qPrintable(sourcePath));
+        QVERIFY2(!source.contains("terminate();"), qPrintable(sourcePath));
+    }
 }
 
 // 四个业务 QThread 持续 publish，连续重启三轮，验证 stop/delete 与 enqueue 同步。
@@ -3830,6 +4240,12 @@ void BaselineTest::framelessTitleBarAndWindowControls()
 #ifdef Q_OS_WIN
     // 标题栏现在始终走 Qt 客户区；空白区拖动由 QWindow::startSystemMove() 发起。
     QCOMPARE(nativeHitTestResult(titleBar, dragPoint), long(HTCLIENT));
+    // 标题栏覆盖窗口客户区顶部；点击最上方几像素也必须保持 HTCLIENT，不能被
+    // nativeEvent() 的 HTTOP 缩放命中提前截获。标题栏下方的左边缘仍应支持缩放。
+    const QPoint titleBarTopPoint(titleBar->rect().center().x(), 1);
+    QCOMPARE(nativeHitTestResult(titleBar, titleBarTopPoint), long(HTCLIENT));
+    const QPoint leftResizePoint(1, titleBar->height() + 20);
+    QCOMPARE(nativeHitTestResult(titleBar, leftResizePoint), long(HTLEFT));
 #endif
 
     // 先断开真实系统移动槽，避免自动测试启动 Windows 模态拖动循环；这里专门验证
@@ -3840,7 +4256,19 @@ void BaselineTest::framelessTitleBarAndWindowControls()
                                 nullptr));
     QSignalSpy moveSpy(titleBar, &qframework::WindowTitleBar::moveRequested);
     QTest::mouseClick(titleBar, Qt::LeftButton, Qt::NoModifier, dragPoint);
+    QCOMPARE(moveSpy.count(), 0);
+    QTest::mousePress(titleBar, Qt::LeftButton, Qt::NoModifier, dragPoint);
+    const QPoint movedPoint =
+        dragPoint + QPoint(QApplication::startDragDistance() + 2, 0);
+    QMouseEvent moveEvent(QEvent::MouseMove,
+                          movedPoint,
+                          titleBar->mapToGlobal(movedPoint),
+                          Qt::NoButton,
+                          Qt::LeftButton,
+                          Qt::NoModifier);
+    QApplication::sendEvent(titleBar, &moveEvent);
     QCOMPARE(moveSpy.count(), 1);
+    QTest::mouseRelease(titleBar, Qt::LeftButton, Qt::NoModifier, movedPoint);
 
     // 双击空白区仍应切换最大化/还原，不依赖 Windows 的 HTCAPTION 默认行为。
     QTest::mouseDClick(titleBar, Qt::LeftButton, Qt::NoModifier, dragPoint);
@@ -3851,6 +4279,8 @@ void BaselineTest::framelessTitleBarAndWindowControls()
     QTest::mouseClick(maximizeButton, Qt::LeftButton);
     QTRY_VERIFY(window.isMaximized());
     QCOMPARE(maximizeButton->toolTip(), QString::fromUtf8(u8"还原"));
+    QTest::mouseClick(titleBar, Qt::LeftButton, Qt::NoModifier, titleBarTopPoint);
+    QTRY_VERIFY(window.isMaximized());
 
     QTest::mouseClick(maximizeButton, Qt::LeftButton);
     QTRY_VERIFY(!window.isMaximized());
@@ -4050,4 +4480,78 @@ int main(int argc, char* argv[])
     QApplication application(argc, argv);
     BaselineTest test;
     return QTest::qExec(&test, argc, argv);
+}
+
+void BaselineTest::processPrepareExitAndCancellation()
+{
+    const auto busConfig = faultBusConfig();
+    qframework::MessageBus bus(busConfig);
+    auto processConfig = lifecycleProcessConfig();
+    processConfig.maxRestartCount = 2;
+    qframework::ProcessSupervisor supervisor(&bus, busConfig, processConfig);
+    const QString id = QStringLiteral("RuntimePrepareReady");
+    QStringList errors;
+    QVERIFY(supervisor.startAll({faultProcessModuleConfig(id)}, &errors));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(id), QStringLiteral("Running"), 5000);
+    supervisor.beginPrepareForExit();
+    QVERIFY(!supervisor.isReadyForExit());
+    QVERIFY(supervisor.pendingExitModules().contains(id));
+    supervisor.cancelPrepareForExit();
+    QTest::qWait(500); QVERIFY(!supervisor.isReadyForExit());
+    supervisor.beginPrepareForExit();
+    QVERIFY(!supervisor.isReadyForExit());
+    QTRY_VERIFY(supervisor.isReadyForExit());
+    supervisor.cancelPrepareForExit();
+    QSignalSpy restarted(&supervisor, &qframework::ProcessSupervisor::restartFinished);
+    QString error; QVERIFY(supervisor.requestRestart(id, &error));
+    QTRY_COMPARE_WITH_TIMEOUT(restarted.count(), 1, 5000);
+    QVERIFY(restarted.first().at(1).toBool());
+    supervisor.beginPrepareForExit(); QTRY_VERIFY(supervisor.isReadyForExit());
+    QVERIFY(supervisor.terminate(id));
+    QTest::qWait(1000);
+    QVERIFY(supervisor.state(id) != QStringLiteral("Running"));
+    supervisor.cancelPrepareForExit();
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(id), QStringLiteral("Running"), 5000);
+    supervisor.shutdown(); bus.beginShutdown(); QVERIFY(bus.stopQueues(500));
+}
+
+void BaselineTest::processStopPreparationCrashDoesNotRestart()
+{
+    const auto busConfig = faultBusConfig();
+    qframework::MessageBus bus(busConfig);
+    auto processConfig = lifecycleProcessConfig();
+    processConfig.maxRestartCount = 2;
+    qframework::ProcessSupervisor supervisor(&bus, busConfig, processConfig);
+    const QString id = QStringLiteral("RuntimePrepareNever");
+    QStringList errors;
+    QVERIFY(supervisor.startAll({faultProcessModuleConfig(id)}, &errors));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(id), QStringLiteral("Running"), 5000);
+    QSignalSpy stopped(&supervisor, &qframework::ProcessSupervisor::stopFinished);
+    QString error;
+    QVERIFY(supervisor.requestStop(id, &error));
+    QVERIFY(supervisor.terminate(id));
+    QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 5000);
+    QVERIFY(!stopped.first().at(1).toBool());
+    QTest::qWait(processConfig.restartDelayMs + 500);
+    QVERIFY(supervisor.state(id) != QStringLiteral("Running"));
+    supervisor.shutdown(); bus.beginShutdown(); QVERIFY(bus.stopQueues(500));
+}
+
+void BaselineTest::processPrepareTimeoutPreservesProcess()
+{
+    const auto busConfig = faultBusConfig();
+    qframework::MessageBus bus(busConfig);
+    qframework::ProcessSupervisor supervisor(&bus, busConfig, lifecycleProcessConfig());
+    const QString id = QStringLiteral("RuntimePrepareNever");
+    QStringList errors;
+    QVERIFY(supervisor.startAll({faultProcessModuleConfig(id)}, &errors));
+    QTRY_COMPARE_WITH_TIMEOUT(supervisor.state(id), QStringLiteral("Running"), 5000);
+    QSignalSpy restarted(&supervisor, &qframework::ProcessSupervisor::restartFinished);
+    QString error; QVERIFY(supervisor.requestRestart(id, &error));
+    QVERIFY(!supervisor.requestStop(id, &error));
+    QTRY_COMPARE_WITH_TIMEOUT(restarted.count(), 1, 35000);
+    QVERIFY(!restarted.first().at(1).toBool());
+    QCOMPARE(supervisor.state(id), QStringLiteral("Running"));
+    QVERIFY(supervisor.requestStop(id, &error));
+    supervisor.shutdown(); bus.beginShutdown(); QVERIFY(bus.stopQueues(500));
 }

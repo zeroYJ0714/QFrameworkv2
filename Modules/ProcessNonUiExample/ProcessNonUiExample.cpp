@@ -3,8 +3,7 @@
 #include <QDateTime>
 #include <QThread>
 
-#include "Generated/log_messages.pb.h"
-#include "Generated/status_messages.pb.h"
+#include "Generated/master_message.pb.h"
 #include "MessageTopics.h"
 
 // 本示例与主进程非 UI 示例使用相同的主题契约，差别在于所有消息先经过

@@ -7,6 +7,8 @@
 
 namespace qframework
 {
+/// @brief 返回框架二进制的版本字符串。
+/// @return 指向字符串字面量的只读指针，调用方不需要也不能释放。
 const char* frameworkVersion()
 {
     // 字符串字面量具有静态存储期，调用方不需要也不能释放返回指针。

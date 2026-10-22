@@ -15,56 +15,49 @@ class QFRAMEWORK_EXPORT StyleManager : public QObject
     Q_OBJECT
 
 public:
-    // StyleManager 不拥有 QApplication，只通过 QCoreApplication::instance 查找。
-    /// @brief 创建 StyleManager 对象并初始化其基础状态。
-    /// @param parent Qt 父对象或父控件；用于建立所有权关系，允许为空。
+    /// @brief 构造样式管理器；此时尚未加载任何 QSS，内部路径和文本快照都是空字符串。
+    /// @param parent 所属 QObject，通常为 FrameworkRuntime，允许为空。
     /// @return 无（构造函数不返回值）。
     explicit StyleManager(QObject* parent = nullptr);
 
-    // 加载新文件成功后才替换当前路径/内容；失败保留旧样式。
-    /// @brief 加载 `loadStyleSheet` 对应的框架操作。
-    /// @param filePath 文件路径。
-    /// @param errorMessage 可选错误说明输出参数。
-    /// @return 条件或操作成功时返回 true，否则返回 false。
+    /// @brief 读取并校验 QSS 文件，全部通过后一次性应用到 QApplication；成功后更新快照并发射 styleSheetChanged，失败则保留旧样式。
+    /// @param filePath 待加载的 QSS 文件路径，扩展名必须是 .qss。
+    /// @param errorMessage 可选的错误输出参数；失败时写入中文原因，不需要错误文本时传 nullptr。
+    /// @return 应用成功返回 true；扩展名无效、读取失败、超过大小上限、非 UTF-8、结构不完整或当前进程没有 QApplication 时返回 false。
     bool loadStyleSheet(const QString& filePath,
-                        QString* errorMessage = nullptr); ///< `errorMessage` 对应的对象指针；所有权和线程归属见本类文件级说明。
-    // 使用上一次成功路径重新读取，适合开发时修改 QSS 后刷新。
-    /// @brief 执行 `reloadStyleSheet` 所定义的类职责。
-    /// @param errorMessage 可选错误说明输出参数。
-    /// @return 条件或操作成功时返回 true，否则返回 false。
+                        QString* errorMessage = nullptr);
+    /// @brief 按最近一次成功加载的路径重新读取并应用样式，用于开发期改完 QSS 后热加载。
+    /// @param errorMessage 可选的错误输出参数；失败时写入中文原因，不需要错误文本时传 nullptr。
+    /// @return 重载成功返回 true；从未成功加载过任何文件，或重新加载失败时返回 false。
     bool reloadStyleSheet(QString* errorMessage = nullptr);
-
-    /// @brief 执行 `currentFilePath` 所定义的类职责。
-    /// @return 返回对应 Qt 值或容器的安全副本。
+    /// @brief 查询当前生效样式的绝对文件路径。
+    /// @return 绝对路径副本（调用方修改它不影响内部状态）；尚未成功加载过样式时返回空字符串。
     QString currentFilePath() const;
-    /// @brief 执行 `currentStyleSheet` 所定义的类职责。
-    /// @return 返回对应 Qt 值或容器的安全副本。
+    /// @brief 查询当前生效样式表的完整文本。
+    /// @return QSS 文本副本（调用方可以安全修改）；尚未成功加载过样式时返回空字符串。
     QString currentStyleSheet() const;
 
 signals:
-    // 只在新样式已成功设置到 QApplication 后发出。
-    /// @brief 执行 `styleSheetChanged` 所定义的类职责。
-    /// @param styleSheet 完整 QSS 文本。
+    /// @brief 新样式已成功设置到 QApplication 之后发射，用于把同一份样式同步给 UI 子进程。
+    /// @param styleSheet 完整 QSS 文本，与当前生效的样式一致。
     /// @return 无。
     void styleSheetChanged(const QString& styleSheet);
 
 private:
-    // readStyleSheet 负责文件/UTF-8/结构校验，不修改 QApplication。
-    /// @brief 读取 `readStyleSheet` 对应的框架操作。
-    /// @param filePath 文件路径。
-    /// @param styleSheet 完整 QSS 文本。
-    /// @param errorMessage 可选错误说明输出参数。
-    /// @return 条件或操作成功时返回 true，否则返回 false。
+    /// @brief 读取 QSS 文件并依次完成扩展名、大小、UTF-8 编码和括号结构校验，全程不修改 QApplication 和成员快照。
+    /// @param filePath 待读取的 QSS 文件路径。
+    /// @param styleSheet 输出参数，接收校验通过的文件内容，调用方必须传入有效指针。
+    /// @param errorMessage 可选的错误输出参数；失败时写入中文原因，不需要错误文本时传 nullptr。
+    /// @return 全部校验通过返回 true；任一环节失败返回 false，此时不写入 styleSheet。
     bool readStyleSheet(const QString& filePath,
                         QString* styleSheet,
-                        QString* errorMessage) const; ///< `const` 对应的对象指针；所有权和线程归属见本类文件级说明。
-    /// @brief 检查 `isStructurallyValid` 对应的框架操作。
-    /// @param styleSheet 完整 QSS 文本。
-    /// @return 条件或操作成功时返回 true，否则返回 false。
+                        QString* errorMessage) const;
+    /// @brief 用轻量状态机检查引号、注释和大括号是否闭合，在交给 QApplication 之前拦截半写入的 QSS 文件。
+    /// @param styleSheet 待校验的样式文本。
+    /// @return 结构完整返回 true；存在未闭合的引号、注释或大括号返回 false。
     bool isStructurallyValid(const QString& styleSheet) const;
 
-    // 这两个字段始终代表最近一次成功加载的样式。
-    QString currentFilePath_; ///< 保存 `currentFilePath` 对应的对象状态或配置值。
-    QString currentStyleSheet_; ///< 保存 `currentStyleSheet` 对应的对象状态或配置值。
+    QString currentFilePath_; ///< 最近一次成功加载的 QSS 绝对路径，供 reloadStyleSheet 复用；从未成功加载时为空。
+    QString currentStyleSheet_; ///< 最近一次成功应用的完整 QSS 文本，与 QApplication 当前生效的样式一致。
 };
 }

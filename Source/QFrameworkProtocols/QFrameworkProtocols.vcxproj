@@ -121,15 +121,31 @@
     <ClInclude Include="MessageTopics.h" />
     <ClInclude Include="ProtocolVersion.h" />
     <ClInclude Include="Generated\master_message.pb.h" />
+    <ClInclude Include="Generated\step_catalog.pb.h" />
+    <ClInclude Include="Generated\usecase_message.pb.h" />
     <ClInclude Include="..\QFrameworkSdk\QFrameworkGlobal.h" />
     <ClCompile Include="ProtocolVersion.cpp" />
     <ClCompile Include="Generated\master_message.pb.cc" />
+    <ClCompile Include="Generated\step_catalog.pb.cc" />
+    <ClCompile Include="Generated\usecase_message.pb.cc" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="Protos\master_message.proto">
       <Message>生成统一 QFramework/ADB Protobuf C++ 源码</Message>
       <Command>"$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe" --proto_path="$(ProjectDir)Protos" --cpp_out=dllexport_decl=QFRAMEWORK_PROTOCOLS_EXPORT:"$(ProjectDir)Generated" "%(FullPath)"</Command>
       <Outputs>$(ProjectDir)Generated\master_message.pb.cc;$(ProjectDir)Generated\master_message.pb.h;%(Outputs)</Outputs>
+      <AdditionalInputs>$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe;%(AdditionalInputs)</AdditionalInputs>
+    </CustomBuild>
+    <CustomBuild Include="Protos\step_catalog.proto">
+      <Message>生成公共步骤目录 Protobuf C++ 源码</Message>
+      <Command>"$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe" --proto_path="$(ProjectDir)Protos" --cpp_out=dllexport_decl=QFRAMEWORK_PROTOCOLS_EXPORT:"$(ProjectDir)Generated" "%(FullPath)"</Command>
+      <Outputs>$(ProjectDir)Generated\step_catalog.pb.cc;$(ProjectDir)Generated\step_catalog.pb.h;%(Outputs)</Outputs>
+      <AdditionalInputs>$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe;%(AdditionalInputs)</AdditionalInputs>
+    </CustomBuild>
+    <CustomBuild Include="Protos\usecase_message.proto">
+      <Message>生成用例管理/任务测试 Protobuf C++ 源码</Message>
+      <Command>"$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe" --proto_path="$(ProjectDir)Protos" --cpp_out=dllexport_decl=QFRAMEWORK_PROTOCOLS_EXPORT:"$(ProjectDir)Generated" "%(FullPath)"</Command>
+      <Outputs>$(ProjectDir)Generated\usecase_message.pb.cc;$(ProjectDir)Generated\usecase_message.pb.h;%(Outputs)</Outputs>
       <AdditionalInputs>$(SolutionDir)ThirdParty\Protobuf\3.21.12\tools\protoc.exe;%(AdditionalInputs)</AdditionalInputs>
     </CustomBuild>
   </ItemGroup>

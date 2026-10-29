@@ -1,3 +1,8 @@
+// 【阅读导引】管理加载到主进程的 DLL 模块。
+// 阅读顺序：loadAndStart 分为加载注册和业务启动两轮，保证前面的模块发消息时后面的订阅者已经登记。
+// 需要分清：loadOne 核对文件名、元数据、接口类型；uiModule 可能返回 nullptr。关闭时等消息回调结束再卸载 DLL，否则虚函数代码可能已经不存在。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：发现、加载、注册和卸载进程内 Qt 插件，并把模块主题交给 MessageBus。
 // QPluginLoader 和插件对象由 PluginManager 所在线程拥有；插件 onStart/onStop/onMessage
 // 不在这里跨线程直接调用，关闭时先停止发布入口，再等待消息队列按有界流程收尾。
@@ -50,6 +55,10 @@ struct PluginManager::LoadedPlugin
 };
 
 // 保存中央 MessageBus 借用指针；实际 DLL 直到 loadAndStart() 才加载。
+/// @brief 构造插件管理器，保存中央消息总线借用指针。
+/// @param messageBus 中央消息总线，所有权在 FrameworkRuntime。
+/// @param parent 所属 QObject，可为空。
+/// @return 无（构造函数不返回值）。
 PluginManager::PluginManager(MessageBus* messageBus, QObject* parent)
     : QObject(parent),
       messageBus_(messageBus),
@@ -57,12 +66,16 @@ PluginManager::PluginManager(MessageBus* messageBus, QObject* parent)
 {
 }
 
+/// @brief 向所有已启动插件广播进入退出准备阶段。
+/// @return 无；跳过隔离中的插件。
 void PluginManager::beginPrepareForExit()
 {
     for (LoadedPlugin* plugin : loaded_) ///< plugin：逐个通知的已加载插件。
         if (plugin->started && !plugin->quarantined) plugin->endpoint->beginPrepareForExit();
 }
 
+/// @brief 查询是否所有已启动插件都已完成退出准备。
+/// @return 全部就绪返回 true；任一插件未就绪返回 false。
 bool PluginManager::isReadyForExit() const
 {
     for (LoadedPlugin* plugin : loaded_) ///< plugin：逐个查询的已加载插件。
@@ -79,6 +92,8 @@ QStringList PluginManager::pendingExitModules() const
     return pending;
 }
 
+/// @brief 取消所有已启动插件的退出准备状态。
+/// @return 无；跳过隔离中的插件。
 void PluginManager::cancelPrepareForExit()
 {
     for (LoadedPlugin* plugin : loaded_) ///< plugin：逐个通知的已加载插件。
@@ -98,6 +113,11 @@ PluginManager::~PluginManager()
 }
 
 // 按配置顺序分两阶段加载和启动全部主进程插件；单个失败不会中止后续项。
+/// @brief 按配置顺序分两轮加载并启动全部主进程插件。
+/// @param modules 模块配置列表，非主进程类型会被跳过。
+/// @param errors 可选的错误收集列表，可为空。
+/// @param enableDeliveryAfterStart 启动完成后是否统一放行消息投递。
+/// @return 所有插件都加载且启动成功返回 true，任一失败返回 false。
 bool PluginManager::loadAndStart(const QVector<ModuleConfig>& modules,
                                  QStringList* errors,
                                  bool enableDeliveryAfterStart)
@@ -137,6 +157,9 @@ bool PluginManager::loadAndStart(const QVector<ModuleConfig>& modules,
 }
 
 // 只回收消息线程已经停止的插件；超时插件保留 loader/endpoint，不并发 onStop。
+/// @brief 按逆序回收消息线程已停止的插件，超时者标记为隔离保留。
+/// @param timedOutModuleIds 上游判定停止超时的模块 ID。
+/// @return 关闭后仍需隔离保留的模块 ID 列表。
 QStringList PluginManager::shutdown(const QStringList& timedOutModuleIds)
 {
     if (shutdownComplete_)
@@ -161,6 +184,8 @@ QStringList PluginManager::shutdown(const QStringList& timedOutModuleIds)
     return quarantinedModuleIds();
 }
 
+/// @brief 重试回收仍处于隔离状态的插件。
+/// @return 本轮之后仍需隔离保留的模块 ID 列表。
 QStringList PluginManager::retryQuarantinedShutdown()
 {
     QVector<LoadedPlugin*> remaining; ///< 仍未成功回收的隔离插件。
@@ -176,6 +201,8 @@ QStringList PluginManager::retryQuarantinedShutdown()
 }
 
 // 按 loaded_ 顺序返回已成功执行 onStart 的模块 ID。
+/// @brief 列出已成功执行 onStart 的模块 ID。
+/// @return 按加载顺序排列的运行中模块 ID 列表。
 QStringList PluginManager::runningModuleIds() const
 {
     QStringList result; ///< 运行中模块 ID 收集结果。
@@ -186,6 +213,8 @@ QStringList PluginManager::runningModuleIds() const
     return result;
 }
 
+/// @brief 列出因停止超时被隔离保留的模块 ID。
+/// @return 处于隔离状态的模块 ID 列表。
 QStringList PluginManager::quarantinedModuleIds() const
 {
     QStringList result; ///< 隔离模块 ID 收集结果。
@@ -197,6 +226,9 @@ QStringList PluginManager::quarantinedModuleIds() const
 }
 
 // 返回 UI 插件对象借用指针；非 UI、未知或失败模块返回 nullptr。
+/// @brief 查询指定模块对应的 UI 插件对象。
+/// @param moduleId 目标模块 ID。
+/// @return UI 插件借用指针；非 UI、未知或已失败时返回 nullptr。
 InProcessUiModule* PluginManager::uiModule(const QString& moduleId) const
 {
     for (const LoadedPlugin* plugin : loaded_) { ///< plugin：逐个匹配的已加载插件。
@@ -207,6 +239,10 @@ InProcessUiModule* PluginManager::uiModule(const QString& moduleId) const
 }
 
 // 加载一个 DLL：先验证路径和 JSON 元数据，再构造实例、校验基类并注册总线。
+/// @brief 加载并注册单个进程内插件 DLL，逐步校验路径、元数据和基类。
+/// @param config 该模块的配置。
+/// @param errorMessage 失败原因输出参数，不能为空。
+/// @return 加载并注册成功返回 true，任一步骤失败返回 false。
 bool PluginManager::loadOne(const ModuleConfig& config, QString* errorMessage)
 {
     // 文件名必须等于 ModuleId，降低配置指向错误 DLL 但仍能加载的风险。
@@ -283,6 +319,10 @@ bool PluginManager::loadOne(const ModuleConfig& config, QString* errorMessage)
 }
 
 // 运行一个已加载插件的 onStart；异常或 false 都撤销发布权限并返回错误。
+/// @brief 执行插件的 onStart，失败或抛异常时撤销发布权限。
+/// @param plugin 已加载的插件记录。
+/// @param errorMessage 失败原因输出参数，不能为空。
+/// @return onStart 返回 true 且无异常时返回 true，否则返回 false。
 bool PluginManager::startOne(LoadedPlugin* plugin, QString* errorMessage)
 {
     // onStart 期间允许 publish，因此先把模块标记为运行；失败再撤销。
@@ -311,6 +351,9 @@ bool PluginManager::startOne(LoadedPlugin* plugin, QString* errorMessage)
 }
 
 // 前置条件是消息队列已经停止；否则绝不能并发调用 onStop 或卸载其 DLL。
+/// @brief 停止并卸载单个插件，要求其消息队列已停止。
+/// @param plugin 待回收的插件记录。
+/// @return 成功卸载返回 true；队列仍在运行导致注销失败时返回 false。
 bool PluginManager::releasePlugin(LoadedPlugin* plugin)
 {
     if (plugin == nullptr)
@@ -341,6 +384,9 @@ bool PluginManager::releasePlugin(LoadedPlugin* plugin)
 }
 
 // 清理启动失败的单个插件，不影响 loaded_ 中其余有效模块。
+/// @brief 回收启动失败的插件，尽力执行 onStop 后注销并卸载。
+/// @param plugin 启动失败的插件记录。
+/// @return 无。
 void PluginManager::removeFailed(LoadedPlugin* plugin)
 {
     // 即使 onStart 失败也尝试一次 onStop，让模块释放已创建的局部资源。

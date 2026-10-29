@@ -1,3 +1,8 @@
+// 【阅读导引】协调主窗口、模块菜单和 Dock。
+// 阅读顺序：createModuleDocks 建容器，attachInProcessUiModules 放入插件界面；setRequestedDockVisible 记录意图，applyRequestedDockVisibility 计算实际显示。
+// 需要分清：框架只调用通用端点，不直接依赖 ImageShow 等业务类型。菜单隐藏/关闭会询问 canClose；布局切换和窗口临时隐藏不是插件业务关闭。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：把框架模块状态映射为菜单、Dock、状态栏和模块管理对话框。
 // MainWindow 只在 GUI 线程使用 QWidget/QAction/QTimer；插件加载、MessageBus 和子进程监督由
 // 其他对象完成，本类通过 Qt 信号槽接收状态。关闭流程先询问各模块 canClose，再在 5 秒内等待保存
@@ -144,6 +149,13 @@ long resizeHitTest(const QPoint& screenPoint,
 }
 
 // 创建主窗口静态控件和模块占位页，并连接三类管理器的状态信号。
+/// @brief 构造主窗口：创建标题栏、菜单、模块 Dock 和状态栏，并连接管理器信号。
+/// @param modules 模块配置列表，决定菜单项和 Dock 的数量。
+/// @param pluginManager 主进程插件管理器，可为空。
+/// @param processSupervisor 子进程监督器，可为空。
+/// @param styleManager 样式管理器，可为空。
+/// @param parent 父控件，通常为空。
+/// @return 无（构造函数不返回值）。
 MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
                        PluginManager* pluginManager,
                        ProcessSupervisor* processSupervisor,
@@ -195,7 +207,7 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
     connect(titleBar_,
             &WindowTitleBar::minimizeRequested,
             this,
-            &MainWindow::showMinimized);
+            &MainWindow::minimizeWindow);
     connect(titleBar_,
             &WindowTitleBar::maximizeRestoreRequested,
             this,
@@ -203,7 +215,7 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
     connect(titleBar_,
             &WindowTitleBar::closeRequested,
             this,
-            &MainWindow::close);
+            &MainWindow::closeWindow);
     setDockNestingEnabled(true);
     // ProcessWindowHost 内部承载跨进程原生 HWND。QMainWindow 默认会为 Dock 重排启动
     // AnimatedDocks，在 HWND 连续改变父级和尺寸的过程中，Qt 可能暂时保留 pluggingWidget
@@ -276,11 +288,16 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
 /// @return 无（析构函数不返回值）。
 MainWindow::~MainWindow() = default;
 
+/// @brief 查询 Dock 分隔条当前使用的颜色。
+/// @return 分隔条颜色副本。
 QColor MainWindow::dockSeparatorColor() const
 {
     return dockSeparatorColor_;
 }
 
+/// @brief 设置 Dock 分隔条颜色，变化时请求重绘主窗口。
+/// @param color 新的分隔条颜色。
+/// @return 无；颜色未变化时不重绘。
 void MainWindow::setDockSeparatorColor(const QColor& color)
 {
     if (dockSeparatorColor_ == color)
@@ -290,11 +307,16 @@ void MainWindow::setDockSeparatorColor(const QColor& color)
     update();
 }
 
+/// @brief 查询 Dock 分隔条鼠标悬停时使用的颜色。
+/// @return 悬停颜色副本。
 QColor MainWindow::dockSeparatorHoverColor() const
 {
     return dockSeparatorHoverColor_;
 }
 
+/// @brief 设置 Dock 分隔条悬停颜色，变化时请求重绘主窗口。
+/// @param color 新的悬停颜色。
+/// @return 无；颜色未变化时不重绘。
 void MainWindow::setDockSeparatorHoverColor(const QColor& color)
 {
     if (dockSeparatorHoverColor_ == color)
@@ -304,6 +326,8 @@ void MainWindow::setDockSeparatorHoverColor(const QColor& color)
 }
 
 // 把已成功加载的主进程 QWidget 替换对应占位页并登记为可用。
+/// @brief 把已加载的主进程插件界面放入对应 Dock，替换占位页并登记为可用。
+/// @return 无；没有插件管理器时直接返回。
 void MainWindow::attachInProcessUiModules()
 {
     // QPluginLoader 拥有模块对象；Dock 只是临时成为 QWidget 父容器。
@@ -327,6 +351,8 @@ void MainWindow::attachInProcessUiModules()
 }
 
 // 插件 DLL 卸载前移除 QWidget 父关系并换回占位页，避免 DLL 中代码悬空。
+/// @brief 在插件 DLL 卸载前把界面控件移出 Dock 并换回占位页。
+/// @return 无；没有插件管理器时直接返回。
 void MainWindow::releaseInProcessUiModules()
 {
     // DLL 卸载前必须把插件 QWidget 从 Dock 取出并清除 Qt parent。
@@ -352,6 +378,12 @@ void MainWindow::releaseInProcessUiModules()
 }
 
 // 委托布局管理器恢复文件，再按当前 UI 可用性隐藏失效 Dock。
+/// @brief 从文件恢复布局，并把文件中的显示意图写入当前 Dock 状态。
+/// @param filePath 布局文件路径。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @param unavailableModuleIds 可选输出参数，写入当前不可用的模块 ID。
+/// @param activateLayout 是否把该文件记为当前活动布局。
+/// @return 恢复成功返回 true，否则返回 false。
 bool MainWindow::loadLayoutFile(const QString& filePath,
                                 QString* errorMessage,
                                 QStringList* unavailableModuleIds,
@@ -391,6 +423,9 @@ bool MainWindow::loadLayoutFile(const QString& filePath,
 }
 
 // 由 FrameworkRuntime 注入一次配置快照；运行期间不监听 INI 文件变化。
+/// @brief 注入布局预设配置并重建菜单项，同时按文件有效性决定各项是否可用。
+/// @param presets 布局预设配置列表，来自一次性的配置快照。
+/// @return 无。
 void MainWindow::setLayoutPresets(const QVector<LayoutPresetConfig>& presets)
 {
     clearLayoutPresetActions();
@@ -439,12 +474,17 @@ void MainWindow::setLayoutPresets(const QVector<LayoutPresetConfig>& presets)
 }
 
 // 启动只尝试编号 1；错误写日志并禁用该项，不弹出启动警告对话框。
+/// @brief 启动时尝试加载编号为 1 的布局预设。
+/// @return 加载成功返回 true；预设缺失或加载失败返回 false。
 bool MainWindow::loadInitialLayoutPreset()
 {
     return activateLayoutPreset(1, true, nullptr);
 }
 
 // 查找配置快照中的稳定编号，避免用菜单文字反向匹配重复 Name。
+/// @brief 按稳定编号查找布局预设配置。
+/// @param index 预设编号。
+/// @return 命中的配置指针，指向内部快照；未找到返回 nullptr。
 const LayoutPresetConfig* MainWindow::layoutPreset(int index) const
 {
     for (const LayoutPresetConfig& preset : layoutPresets_) { ///< 当前比对的预设配置。
@@ -455,6 +495,8 @@ const LayoutPresetConfig* MainWindow::layoutPreset(int index) const
 }
 
 // 删除旧 QAction 后再注入新快照，保证重复调用不会产生两套菜单项。
+/// @brief 删除全部已创建的布局预设菜单项，避免重复注入。
+/// @return 无。
 void MainWindow::clearLayoutPresetActions()
 {
     for (QAction* action : layoutPresetActions_) { ///< 当前要删除的预设菜单项。
@@ -466,6 +508,11 @@ void MainWindow::clearLayoutPresetActions()
 }
 
 // 统一处理启动和用户点击；只有成功恢复后才改变活动编号和勾选状态。
+/// @brief 激活指定编号的布局预设，成功后才更新活动编号和勾选状态。
+/// @param index 预设编号。
+/// @param startup 是否为启动阶段调用，决定失败时是禁用菜单项还是弹窗。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 激活成功返回 true，否则返回 false。
 bool MainWindow::activateLayoutPreset(int index,
                                       bool startup,
                                       QString* errorMessage)
@@ -529,6 +576,8 @@ bool MainWindow::activateLayoutPreset(int index,
 }
 
 // 返回由 MainWindow 拥有的 LayoutManager 借用指针。
+/// @brief 返回布局管理器的借用指针。
+/// @return LayoutManager 指针，所有权仍属于主窗口。
 LayoutManager* MainWindow::layoutManager() const
 {
     // LayoutManager 生命周期跟随 MainWindow，调用方不得删除。
@@ -536,6 +585,8 @@ LayoutManager* MainWindow::layoutManager() const
 }
 
 // 显示单例非模态模块管理对话框。
+/// @brief 显示并前置唯一的非模态模块管理对话框。
+/// @return 无。
 void MainWindow::showModuleManager()
 {
     // 非模态对话框可重复 show/raise，不创建多个实例。
@@ -545,6 +596,9 @@ void MainWindow::showModuleManager()
 }
 
 // 从 QAction 动态属性解析 moduleId，复用统一显示入口。
+/// @brief 处理模块菜单项勾选变化，取出模块 ID 后走统一显示入口。
+/// @param checked 菜单项勾选后的状态。
+/// @return 无。
 void MainWindow::onModuleActionTriggered(bool checked)
 {
     // 每个 QAction 的动态属性保存 moduleId，避免为每个模块创建专用槽。
@@ -557,6 +611,8 @@ void MainWindow::onModuleActionTriggered(bool checked)
 }
 
 // 只有 Dock 关闭按钮才撤销显示意图；标签切换不会经过这里。
+/// @brief 处理 Dock 关闭按钮请求，撤销该模块的显示意图。
+/// @return 无；发送者不是 ManagedDockWidget 时忽略。
 void MainWindow::onDockCloseRequested()
 {
     ManagedDockWidget* dockWidget = qobject_cast<ManagedDockWidget*>(sender()); ///< 发出关闭请求的 Dock。
@@ -568,12 +624,18 @@ void MainWindow::onDockCloseRequested()
 }
 
 // 处理管理对话框的显示请求。
+/// @brief 处理模块管理对话框的“显示界面”请求。
+/// @param moduleId 目标模块的稳定标识。
+/// @return 无。
 void MainWindow::onShowModuleRequested(const QString& moduleId)
 {
     setRequestedDockVisible(moduleId, true, VisibilityOrigin::UserAction);
 }
 
 // 处理管理对话框的子进程重启请求并统一呈现错误。
+/// @brief 处理模块管理对话框的“重启子进程”请求并统一呈现错误。
+/// @param moduleId 目标模块的稳定标识。
+/// @return 无；没有子进程监督器时直接返回。
 void MainWindow::onRestartModuleRequested(const QString& moduleId)
 {
     // 这里只提交状态转换；QProcess/Socket 信号在后续事件循环中完成重启。
@@ -585,6 +647,11 @@ void MainWindow::onRestartModuleRequested(const QString& moduleId)
 }
 
 // 最终结果只从状态机 signal 进入 UI，避免请求函数返回值被误当成重启完成。
+/// @brief 接收子进程重启最终结果，并提示成功或失败原因。
+/// @param moduleId 目标模块的稳定标识。
+/// @param success 重启是否成功。
+/// @param detail 失败时的具体原因。
+/// @return 无。
 void MainWindow::onRestartFinished(const QString& moduleId,
                                    bool success,
                                    const QString& detail)
@@ -601,6 +668,11 @@ void MainWindow::onRestartFinished(const QString& moduleId,
 }
 
 // 接收插件/监督器状态，更新表格、占位页和状态栏快照。
+/// @brief 接收模块状态变化，同步表格、占位页和状态栏统计。
+/// @param moduleId 目标模块的稳定标识。
+/// @param state 新的生命周期状态文本。
+/// @param detail 状态附带的详细说明，可为空。
+/// @return 无。
 void MainWindow::onModuleStateChanged(const QString& moduleId,
                                       const QString& state,
                                       const QString& detail)
@@ -623,6 +695,10 @@ void MainWindow::onModuleStateChanged(const QString& moduleId,
 }
 
 // 将监督器最终故障转换成用户可见错误提示。
+/// @brief 接收监督器耗尽自动重启后的最终故障，并弹出用户可见提示。
+/// @param moduleId 目标模块的稳定标识。
+/// @param detail 具体故障原因。
+/// @return 无。
 void MainWindow::onModuleFault(const QString& moduleId, const QString& detail)
 {
     // moduleFault 只在自动重启次数耗尽后发出，因此需要用户可见提示。
@@ -632,6 +708,10 @@ void MainWindow::onModuleFault(const QString& moduleId, const QString& detail)
 }
 
 // 接收子进程原生窗口句柄；是否发送显示命令仍由用户/布局意图决定。
+/// @brief 接收子进程上报的原生窗口句柄，包装进宿主并登记界面可用。
+/// @param moduleId 目标模块的稳定标识。
+/// @param windowId 子进程原生窗口句柄。
+/// @return 无；没有宿主控件或包装失败时通过错误提示上报。
 void MainWindow::onWindowHandleReady(const QString& moduleId, quintptr windowId)
 {
     // 先包装 HWND，再把 ready 状态交给统一显示入口；明确隐藏时不补发 showWindow。
@@ -647,6 +727,10 @@ void MainWindow::onWindowHandleReady(const QString& moduleId, quintptr windowId)
 }
 
 // 宿主连续 resize 合并后，只把最终客户区尺寸转发给用户仍要求显示的当前 generation。
+/// @brief 把宿主合并后的最终客户区尺寸转发给仍在运行的子进程窗口。
+/// @param moduleId 目标模块的稳定标识。
+/// @param size 宿主控件最终的客户区尺寸。
+/// @return 无；任一前置条件不满足时静默忽略。
 void MainWindow::onProcessWindowSizeChanged(const QString& moduleId,
                                             const QSize& size)
 {
@@ -677,6 +761,9 @@ void MainWindow::onProcessWindowSizeChanged(const QString& moduleId,
 }
 
 // 预设 QAction 的 checked 变化先由 QActionGroup 完成；槽只提交成功的布局。
+/// @brief 处理布局预设菜单项触发，按动态属性中的编号激活对应预设。
+/// @param checked 菜单项勾选后的状态；勾选状态由 QActionGroup 负责，此处忽略。
+/// @return 无。
 void MainWindow::onLayoutPresetTriggered(bool checked)
 {
     Q_UNUSED(checked);
@@ -687,6 +774,8 @@ void MainWindow::onLayoutPresetTriggered(bool checked)
 }
 
 // 打开非原生文件选择器，加载用户选择的 .qflayout 并报告不可用模块。
+/// @brief 弹出文件选择器加载 .qflayout，并记录其中当前不可用的模块。
+/// @return 无；用户取消或加载失败时只提示不改变窗口状态。
 void MainWindow::loadLayoutFromDialog()
 {
     // 使用非原生对话框保证测试和不同开发机行为一致。
@@ -716,6 +805,8 @@ void MainWindow::loadLayoutFromDialog()
 }
 
 // 保存到当前选中的 INI 预设；没有活动预设时按钮本身保持置灰。
+/// @brief 把当前布局覆盖保存到当前活动预设文件。
+/// @return 无；没有活动预设或保存失败时只更新按钮和提示。
 void MainWindow::saveCurrentLayout()
 {
     const LayoutPresetConfig* preset = layoutPreset(activeLayoutIndex_); ///< 当前活动预设配置。
@@ -738,6 +829,8 @@ void MainWindow::saveCurrentLayout()
 }
 
 // 选择新路径并保存布局，必要时自动补齐 .qflayout 后缀。
+/// @brief 弹出保存对话框把当前布局另存为新文件，并自动补齐扩展名。
+/// @return 无；用户取消或保存失败时只提示不改变活动布局。
 void MainWindow::saveLayoutAs()
 {
     // “另存为”无论当前是否已经加载布局都必须显示路径选择框；当前文件路径只作为
@@ -768,6 +861,8 @@ void MainWindow::saveLayoutAs()
 }
 
 // 选择并应用新的全局 QSS，失败时保留旧样式。
+/// @brief 弹出文件选择器加载新的全局 QSS，失败时保留当前样式。
+/// @return 无；没有样式管理器或用户取消时直接返回。
 void MainWindow::selectStyleSheet()
 {
     // StyleManager 采用成功后替换语义，加载失败不会清掉当前 QSS。
@@ -792,6 +887,8 @@ void MainWindow::selectStyleSheet()
 }
 
 // 重新读取最近一次成功的 QSS 文件。
+/// @brief 重新读取最近一次成功加载的 QSS 文件，用于开发期快速验证。
+/// @return 无；没有样式管理器或重载失败时只提示。
 void MainWindow::reloadStyleSheet()
 {
     // 重读最近一次成功文件，适合开发时修改样式后快速验证。
@@ -805,9 +902,19 @@ void MainWindow::reloadStyleSheet()
     statusBar()->showMessage(QString::fromUtf8(u8"当前 QSS 已重新加载"), 4000);
 }
 
+// 标题栏只发出请求，真正的窗口状态变化集中在 MainWindow，避免子控件知道模块或
+// 进程实现，也避免绕过 Qt 的 WindowStateChange、closeEvent 和退出清理流程。
+/// @brief 响应标题栏最小化请求，把窗口最小化到任务栏。
+/// @return 无。
+void MainWindow::minimizeWindow()
+{
+    showMinimized();
+}
 
 // 普通状态进入最大化，最大化状态恢复普通窗口。Windows 收到标题栏拖动时也可能
 // 自动完成“最大化 -> 普通”转换，changeEvent() 会随后更新按钮视觉状态。
+/// @brief 在最大化与普通窗口状态之间切换。
+/// @return 无。
 void MainWindow::toggleMaximizedState()
 {
     if (isMaximized())
@@ -816,8 +923,18 @@ void MainWindow::toggleMaximizedState()
         showMaximized();
 }
 
+// close() 会进入现有 QWidget/QMainWindow closeEvent 链路，而不是直接调用 qApp->quit。
+// 这样 FrameworkRuntime 仍能按原顺序停止模块、进程和消息总线。
+/// @brief 响应标题栏关闭请求，走 QWidget::close 的关闭事件链路。
+/// @return 无。
+void MainWindow::closeWindow()
+{
+    close();
+}
 
 // 创建文件、模块和样式菜单，并把动作连接到本类槽函数。
+/// @brief 创建布局、模块和样式三组菜单，并把动作连接到本类槽函数。
+/// @return 无。
 void MainWindow::createActions()
 {
     // 菜单按文件、模块、样式三组构造；模块菜单可提前记录晚到窗口的显示意图。
@@ -874,6 +991,8 @@ void MainWindow::createActions()
 }
 
 // 为启用的 UI 模块创建 Dock/占位页，并注册可见性和模块 ID 映射。
+/// @brief 为每个启用的 UI 模块创建 Dock 和占位内容，并登记到各映射表。
+/// @return 无。
 void MainWindow::createModuleDocks()
 {
     // 每个启用的 UI 模块预先创建 Dock：进程 UI 使用 ProcessWindowHost，
@@ -926,6 +1045,10 @@ void MainWindow::createModuleDocks()
 }
 
 // 同步菜单、管理对话框和布局注册表中的 UI 可用标志。
+/// @brief 更新模块界面可用标志，并同步菜单、管理对话框和实际可见性。
+/// @param moduleId 目标模块的稳定标识。
+/// @param available 界面当前是否可用（窗口或插件已就绪）。
+/// @return 无。
 void MainWindow::setUiAvailable(const QString& moduleId, bool available)
 {
     // ready 只决定此刻能否显示；不能覆盖用户或布局保存的显示意图。
@@ -937,6 +1060,11 @@ void MainWindow::setUiAvailable(const QString& moduleId, bool available)
 }
 
 // 写入用户/布局意图后再统一计算实际可见性。
+/// @brief 记录模块的显示意图，再统一计算实际可见性；被拒绝时回滚菜单状态。
+/// @param moduleId 目标模块的稳定标识。
+/// @param visible 用户或布局要求的可见性。
+/// @param origin 该意图的来源，决定是否允许询问模块 canClose。
+/// @return 无。
 void MainWindow::setRequestedDockVisible(const QString& moduleId,
                                          bool visible,
                                          VisibilityOrigin origin)
@@ -959,6 +1087,9 @@ void MainWindow::setRequestedDockVisible(const QString& moduleId,
 
 // ProcessUi 没有同进程 QWidget 接口，继续沿用原关闭行为；只有已经加载的
 // InProcessUi 模块可能通过 canClose(Hide) 拒绝丢弃本地草稿。
+/// @brief 询问主进程 UI 模块是否允许隐藏界面。
+/// @param moduleId 目标模块的稳定标识。
+/// @return 允许隐藏返回 true；没有插件管理器或模块未加载时同样返回 true。
 bool MainWindow::canHideModule(const QString& moduleId) const
 {
     if (pluginManager_ == nullptr)
@@ -969,6 +1100,9 @@ bool MainWindow::canHideModule(const QString& moduleId) const
 
 // 顶层窗口关闭是模块停止之前唯一仍可让用户保存草稿的边界。按配置顺序调用
 // 已加载 UI 插件；取消、保存失败或保存超时都会忽略本次退出事件。
+/// @brief 拦截窗口关闭事件，先让各 UI 插件完成保存，全部就绪后才真正关闭。
+/// @param event 关闭事件；未就绪时保持 ignore 以拒绝本次关闭。
+/// @return 无。
 void MainWindow::closeEvent(QCloseEvent* event)
 {
     if (!preparingExit_) {
@@ -1009,6 +1143,8 @@ void MainWindow::closeEvent(QCloseEvent* event)
     QMainWindow::closeEvent(event);
 }
 
+/// @brief 定时检查插件是否已全部保存完成，就绪后再次触发关闭。
+/// @return 无；尚未就绪时等待下一次定时器触发。
 void MainWindow::pollExitReadiness()
 {
     if (!preparingExit_) return;
@@ -1029,6 +1165,10 @@ void MainWindow::pollExitReadiness()
 }
 
 // 实际显示必须同时满足“用户希望显示”和“模块界面已经 ready”。
+/// @brief 综合显示意图和界面可用性计算 Dock 的实际可见性并应用。
+/// @param moduleId 目标模块的稳定标识。
+/// @param origin 本次可见性计算的来源，决定是否保留当前标签页。
+/// @return 无。
 void MainWindow::applyRequestedDockVisibility(const QString& moduleId,
                                               VisibilityOrigin origin)
 {
@@ -1075,6 +1215,9 @@ void MainWindow::applyRequestedDockVisibility(const QString& moduleId,
 }
 
 // 程序同步 QAction 时阻塞信号，避免把状态回写误当成一次用户操作。
+/// @brief 把模块菜单项的勾选状态同步为当前显示意图，并抑制信号回环。
+/// @param moduleId 目标模块的稳定标识。
+/// @return 无；该模块没有菜单项时直接返回。
 void MainWindow::syncModuleAction(const QString& moduleId)
 {
     QAction* action = moduleActions_.value(moduleId, nullptr); ///< 该模块的菜单项。
@@ -1085,6 +1228,8 @@ void MainWindow::syncModuleAction(const QString& moduleId)
 }
 
 // 重新计算状态栏“运行中/启用总数”摘要。
+/// @brief 按启用模块总数和 Running 模块数刷新状态栏摘要文本。
+/// @return 无。
 void MainWindow::updateStatusSummary()
 {
     // 状态栏分母只统计 enabled 模块，分子只统计精确 Running 状态。
@@ -1102,6 +1247,10 @@ void MainWindow::updateStatusSummary()
 }
 
 // 同时写错误日志并弹出一次用户提示，保证故障既可见又可追溯。
+/// @brief 同时写集中日志并弹出一次用户警告，保证故障可见且可追溯。
+/// @param title 提示标题和日志前缀。
+/// @param detail 具体失败原因。
+/// @return 无。
 void MainWindow::reportStateFailure(const QString& title, const QString& detail)
 {
     // 故障同时写集中日志和显示一次用户提示，便于事后追踪。
@@ -1113,6 +1262,9 @@ void MainWindow::reportStateFailure(const QString& title, const QString& detail)
 }
 
 // 取配置 DisplayName；为空时回退稳定 moduleId。
+/// @brief 取模块的展示名，未配置时回退到稳定 ID。
+/// @param moduleId 目标模块的稳定标识。
+/// @return 展示名；未配置 DisplayName 时返回 moduleId 本身。
 QString MainWindow::displayName(const QString& moduleId) const
 {
     // 未配置 DisplayName 时回退稳定 moduleId。
@@ -1121,6 +1273,10 @@ QString MainWindow::displayName(const QString& moduleId) const
 }
 
 // 生成占位页的两行文本：模块显示名 + 当前生命周期原因。
+/// @brief 生成占位页文本：第一行模块展示名，第二行当前生命周期原因。
+/// @param moduleId 目标模块的稳定标识。
+/// @param detail 当前状态或具体原因。
+/// @return 两行文本，用于 Dock 占位页显示。
 QString MainWindow::placeholderText(const QString& moduleId,
                                     const QString& detail) const
 {
@@ -1130,6 +1286,9 @@ QString MainWindow::placeholderText(const QString& moduleId,
 
 // Qt 在 showMaximized()/showNormal() 或系统贴边恢复后发送 WindowStateChange。
 // 先让 QMainWindow 完成自身状态更新，再让标题栏刷新最大化/还原图标和辅助文本。
+/// @brief 接收窗口状态变化事件，刷新标题栏的最大化/还原按钮外观。
+/// @param event 变更事件，仅 WindowStateChange 需要处理。
+/// @return 无。
 void MainWindow::changeEvent(QEvent* event)
 {
     QMainWindow::changeEvent(event);
@@ -1140,6 +1299,10 @@ void MainWindow::changeEvent(QEvent* event)
 // 使用 Qt 官方系统移动接口启动拖动。普通状态直接交给窗口管理器；最大化状态先
 // 恢复到 normalGeometry()，并按鼠标在最大化窗口中的横向比例放置恢复窗口，避免
 // 窗口突然跳到屏幕一侧。下一轮事件循环开始系统拖动时，鼠标左键仍保持按下。
+/// @brief 请求窗口管理器开始系统拖动，最大化时先恢复并按比例重定位窗口。
+/// @param globalPosition 按下时的全局屏幕坐标。
+/// @param titleBarPosition 按下点在标题栏内的相对坐标。
+/// @return 无。
 void MainWindow::startWindowMove(const QPoint& globalPosition,
                                  const QPoint& titleBarPosition)
 {
@@ -1197,6 +1360,11 @@ void MainWindow::startWindowMove(const QPoint& globalPosition,
 // 无边框窗口不再有 Windows 原生非客户区，所以这里把“边缘/标题栏/客户区”的命中
 // 结果交给 Windows。Windows 收到 HT* 返回值后负责移动、八方向缩放和贴边，不需要
 // 自己调用 QWidget::move() 写一个持续运行的鼠标循环。
+/// @brief 处理 Windows 原生消息，把窗口边缘和标题栏命中结果交回 Windows 处理。
+/// @param eventType Qt 事件类型标识，本实现不使用。
+/// @param message 原生 MSG 指针，非 Windows 平台为空。
+/// @param result 原生返回值输出参数，写入 HT* 命中值或 0。
+/// @return 已处理返回 true；未处理时交回 QMainWindow 默认实现。
 bool MainWindow::nativeEvent(const QByteArray& eventType,
                              void* message,
                              long* result)

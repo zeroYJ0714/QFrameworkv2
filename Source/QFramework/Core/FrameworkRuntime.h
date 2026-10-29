@@ -1,3 +1,8 @@
+// 【阅读导引】主程序的装配和收尾入口。
+// 阅读顺序：从 initialize 看配置、Logger、MessageBus、PluginManager、MainWindow 的创建顺序，再看 show 和 shutdown。
+// 需要分清：模块故障可以作为启动警告；配置等基础设施失败才让初始化返回 false。退出要先停消息再释放对象，防止回调访问已销毁插件。
+// 这是声明/类型入口：先看 public 接口和字段注释；复杂执行过程再到同名 .cpp 或指定实现文件阅读。
+
 #pragma once
 
 // 文件职责：声明主应用的总生命周期协调器。

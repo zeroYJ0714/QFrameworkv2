@@ -1,0 +1,7 @@
+syntax = "proto3";
+package qframework.protocols;
+
+// 公共步骤目录刷新通知；接收端必须容忍重复，后续 usecase 协议导入并复用。
+message StepCatalogChanged {
+  uint64 step_definition_id = 1; // 发生增删改的公共步骤定义 ID（step_definition.id）；接收端据此重新拉取目录，不携带变更内容本身。
+}

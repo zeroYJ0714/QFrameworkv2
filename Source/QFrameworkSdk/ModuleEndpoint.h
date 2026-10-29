@@ -1,3 +1,8 @@
+// 【阅读导引】让业务模块通过稳定接口与宿主交互。
+// 阅读顺序：先读 ModuleHost 和 ModuleEndpoint；前者由宿主实现，后者由模块继承。bindHost/setRunning 是宿主管理的状态。
+// 需要分清：publish/log 借用宿主，不拥有宿主。onMessage 的线程与 QObject 所在线程可能不同；UI 更新应转回 GUI 线程。canClose 返回 false 表示本次关闭不能继续。
+// 这是声明/类型入口：先看 public 接口和字段注释；复杂执行过程再到同名 .cpp 或指定实现文件阅读。
+
 #pragma once
 
 // 文件职责：声明插件和 QFramework 宿主之间的最小公共契约。

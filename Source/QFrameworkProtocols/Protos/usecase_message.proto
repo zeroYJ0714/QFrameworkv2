@@ -1,0 +1,1106 @@
+// 采用 proto3 语法：字段默认值由协议运行库提供，未设置的标量字段按类型取零值。
+// 新增字段必须向后兼容，不能依赖“是否设置”区分业务状态，除非使用 oneof 或显式枚举。
+syntax = "proto3";
+
+// 所有消息和枚举都放在 qframework.protocols 命名空间，必须与 master_message.proto
+// 使用同一 package，才能在生成代码中互相引用 Msg、ADB 和 SQL 类型。
+package qframework.protocols;
+
+// 公共通知沿用现有工程唯一定义；文档目录副本用于独立验证。
+import public "step_catalog.proto";
+
+// =============================================================================
+// QFramework 用例管理 + 任务测试 新增协议（usecase_message.proto 的替换版本）
+// =============================================================================
+//
+// 复用关系：
+//   Msg（外层信封）、SqlRequest/SqlResponse、CurrentDeviceQuery/Response/Changed、
+//   AdbRequest/AdbResponse 及所有 Adb*Event 都定义在
+//   Project/Source/QFrameworkProtocols/Protos/master_message.proto。
+//   本文件与它同 package，一起交给 protoc；本文件不重复声明这些消息；StepCatalogChanged通过step_catalog.proto复用。
+//
+// 传输约定：
+//   每条总线消息都是 Msg 的序列化字节；Msg.str 保存本文件某个消息的
+//   SerializeToString() 原始字节，禁止经过 QString/UTF-8 文本转换。
+//   哪个主题装哪个消息见 05-主题.h。
+//
+// Msg.src/dst 路由约定（与现有 SQL/ADB 模块的校验逻辑一致）：
+//   - src 必须等于发送模块 ID；接收方校验 src == senderModuleId，不等直接丢弃；
+//   - 点对点主题（上下文、执行请求/停止、目录添加、任务选择/日志上下文）
+//     dst 填目标模块 ID，接收方校验 dst == 自己的模块 ID；
+//   - 广播主题（ExecutionEvent、StepCatalogChanged、Task* 事件）dst 为空串，
+//     接收方只校验 src；
+//   - ExecutionEvent 是广播：UseCase/UseCaseStep/TaskList 都会收到所有 execution
+//     的事件，各自只处理自己发起的 execution_id，其余静默忽略。
+//
+// ID 约定：
+//   - 所有数据库主键（test_group_id、usecase_id、step_instance_id、task_id、
+//     batch_id …）用 uint64 承载 SQLite INTEGER PRIMARY KEY；0 表示“无/未指定”，
+//     因为 SQLite AUTOINCREMENT 主键从 1 开始，0 永远不是合法行 ID。
+//   - execution_id 是调用方生成的 UUID 文本（QUuid::toString(WithoutBraces)），
+//     36 个 ASCII 字符；同一个 UUID 只能对应一个不可变的执行目标。
+//   - 时间戳字段名以 _ms 结尾的都是 UTC Unix 毫秒（QDateTime::currentMSecsSinceEpoch）；
+//     以 elapsed_ 开头的是单调时钟（QElapsedTimer）差值，不是墙钟。
+//
+// 字段号约定：
+//   已发布的字段号不得复用或改变类型；新增字段只能追加更大的字段号。
+
+// -----------------------------------------------------------------------------
+// 枚举
+// -----------------------------------------------------------------------------
+
+// 用例类型。数值与数据库列 usecases.usecase_type、step_types.usecase_type 的
+// INTEGER 值一一对应；写入 batch.csv 时使用去掉前缀后的枚举名称文本。
+enum UseCaseType {
+  // 功能测试：关心完整流程是否正常结束，允许处理过false分支后成功，没有指标；对应 SQL 值 0。
+  USE_CASE_TYPE_FUNCTION = 0;
+  // 延时测试：以“最后一个触控 ACK 到画面稳定”的毫秒数为指标，阈值列 threshold_ms；对应 SQL 值 1。
+  USE_CASE_TYPE_DELAY = 1;
+  // 性能（卡顿）测试：以视频相邻帧最大间隔换算出的丢失帧数为指标，阈值列 threshold_frames；对应 SQL 值 2。
+  USE_CASE_TYPE_PERFORMANCE = 2;
+  // 组合目录标记：只出现在 step_types.usecase_type=3，表示该步骤是组合步骤。
+  // 不能作为 usecases.usecase_type 的值，也不能出现在 StepListContext.usecase_type。
+  USE_CASE_TYPE_CUSTOM = 3;
+}
+
+// 一次 execution、一个用例或一个步骤实例的执行状态。
+// 事件流按 event_sequence 排序后解释；SUCCEEDED/FAILED/STOPPED 是终态。
+// 写入 events.csv 的 status 列时去掉前缀写为 PENDING/RUNNING/SUCCEEDED/FAILED/STOPPED。
+enum ExecutionStatus {
+  // 已接收请求、尚未开始执行动作。EXECUTION 层的第一条事件（event_sequence=1）固定是它。
+  EXECUTION_STATUS_PENDING = 0;
+  // 正在执行：该层级从此刻开始计 elapsed_ms。
+  EXECUTION_STATUS_RUNNING = 1;
+  // 正常完成：所有动作都已发送并按推算时长等待完毕。
+  EXECUTION_STATUS_SUCCEEDED = 2;
+  // 失败：参数非法、设备离线/切换、画面未启动导致触控被拒、ADB 拒绝或 ACK 超时等；error_code 说明原因。
+  EXECUTION_STATUS_FAILED = 3;
+  // 用户主动停止：收到匹配 execution_id 的 StopExecutionRequest 或应用异步退出准备才会出现，
+  // 设备离线/切换不是 STOPPED 而是 FAILED。
+  EXECUTION_STATUS_STOPPED = 4;
+}
+
+// 与status分开：仅正常STEP终态填TRUE/FALSE；其他场景UNSPECIFIED。
+enum ExecutionResult {
+  EXECUTION_RESULT_UNSPECIFIED = 0;
+  EXECUTION_RESULT_TRUE = 1;
+  EXECUTION_RESULT_FALSE = 2;
+}
+
+// ExecutionEvent 所描述的层级。写入 events.csv 的 event_type 列时去掉前缀，
+// 写为 STEP/USECASE/EXECUTION；UNSPECIFIED 不允许落库。
+enum ExecutionEventType {
+  // 未设置：协议缺陷或旧发送方；TaskList 收到后拒绝落库并以协议错误结束尝试。
+  EXECUTION_EVENT_TYPE_UNSPECIFIED = 0;
+  // 步骤实例级事件：必须带 usecase_id 和 step_instance_id，两个 terminal 标志均为 false。
+  EXECUTION_EVENT_TYPE_STEP = 1;
+  // 用例级事件：必须带 usecase_id，step_instance_id=0；终态时 usecase_terminal=true。
+  EXECUTION_EVENT_TYPE_USECASE = 2;
+  // 整次 execution 级事件：step_instance_id=0；没有唯一用例目标时 usecase_id=0；
+  // 终态时 batch_terminal=true，且是该 execution 的最后一条事件。
+  EXECUTION_EVENT_TYPE_EXECUTION = 3;
+}
+
+// TaskController 的批次运行态；通过 TaskStateEvent.state 发布。
+// 它描述“批次”而不是“任务项”；任务项摘要用 TaskCaseStatus。
+// 与 batch.csv 头部 status 的对应：RUNNING/SUCCEEDED/FAILED/STOPPED/INTERRUPTED/SKIPPED
+// 直接同名落库；IDLE/STOPPING/UNKNOWN 只存在内存，不写库。
+enum TaskRuntimeState {
+  // 未知：接收方尚未收到任何状态；不应主动发送。
+  TASK_RUNTIME_STATE_UNKNOWN = 0;
+  // 空闲：该任务当前没有批次在创建或运行。
+  TASK_RUNTIME_STATE_IDLE = 1;
+  // 批次正在执行尝试。
+  TASK_RUNTIME_STATE_RUNNING = 2;
+  // 已发送 StopExecutionRequest，等待当前尝试自然收尾；不写库。
+  TASK_RUNTIME_STATE_STOPPING = 3;
+  // 批次所有尝试成功且指标均未超阈值。
+  TASK_RUNTIME_STATE_SUCCEEDED = 4;
+  // 批次内有尝试失败（包含指标不可用或超阈值）；fail_stop=1 时剩余计划已写 NOT_RUN。
+  TASK_RUNTIME_STATE_FAILED = 5;
+  // 用户手工停止；当前尝试 STOPPED，剩余计划 NOT_RUN。
+  TASK_RUNTIME_STATE_STOPPED = 6;
+  // 进程重启时发现批次仍为 RUNNING，被恢复逻辑标记；未终态尝试全部改 NOT_RUN。
+  TASK_RUNTIME_STATE_INTERRUPTED = 7;
+  // 定时触发时因忙/无设备/画面未启动而跳过；批次不含 attempts。
+  TASK_RUNTIME_STATE_SKIPPED = 8;
+}
+
+// 批次触发来源；对应 batch.csv 头部 trigger 的 MANUAL/SCHEDULE。
+enum TaskTrigger {
+  // 用户在 TaskList 点击“运行”。
+  TASK_TRIGGER_MANUAL = 0;
+  // 每日定时到点由调度器创建（含被 SKIPPED 的批次）。
+  TASK_TRIGGER_SCHEDULE = 1;
+}
+
+// 指标可用性；对应 attempts.csv 的 metric_status 列和 batch.csv 的 result_metric_status 列。
+// 只有 AVAILABLE 时 actual_metric 才有意义。
+enum MetricStatus {
+  // 尚无结论：对应 SQL 空串，只用于 PENDING/RUNNING。
+  METRIC_STATUS_UNSPECIFIED = 0;
+  // 已取得有效指标值；对应 SQL 'AVAILABLE'。
+  METRIC_STATUS_AVAILABLE = 1;
+  // 该用例类型没有指标（FUNCTION 已执行）；对应 SQL 'NOT_APPLICABLE'。
+  METRIC_STATUS_NOT_APPLICABLE = 2;
+  // 应当有指标但无法取得（无帧、无触控 ACK、画面不稳定超时等），同时判失败；
+  // 对应 SQL 'METRIC_UNAVAILABLE'。
+  METRIC_STATUS_UNAVAILABLE = 3;
+  // 尝试未执行（NOT_RUN）；对应 SQL 'NOT_RUN'。
+  METRIC_STATUS_NOT_RUN = 4;
+}
+
+// 批次内一个用例快照（batch.csv 第二段一行）的汇总终态；对应 result_final_status 列。
+// 只在 TaskBatchEvent.status 使用；批次本身的状态用 TaskRuntimeState。
+enum TaskCaseStatus {
+  // 配置的尝试尚未全部终态（包含运行中）；对应 SQL 'PENDING'。
+  TASK_CASE_STATUS_PENDING = 0;
+  // 全部尝试成功且指标合格；对应 SQL 'SUCCEEDED'。
+  TASK_CASE_STATUS_SUCCEEDED = 1;
+  // 有尝试失败或指标不可用/超阈值；对应 SQL 'FAILED'。
+  TASK_CASE_STATUS_FAILED = 2;
+  // 手工停止时该项已部分执行；对应 SQL 'STOPPED'。
+  TASK_CASE_STATUS_STOPPED = 3;
+  // 重启恢复时该项原本未终态；对应 SQL 'INTERRUPTED'。
+  TASK_CASE_STATUS_INTERRUPTED = 4;
+  // 该项一次都没执行（失败停止/手工停止前尚未开始）；对应 SQL 'NOT_RUN'。
+  TASK_CASE_STATUS_NOT_RUN = 5;
+}
+
+// LocateAnything 运行模式。同一时刻只能有一个模式占用模型/GPU。
+enum LocateAnythingRuntimeMode {
+  // 未知或尚未完成初始化的模式；不能据此允许检测或训练。
+  LOCATEANYTHING_RUNTIME_MODE_UNSPECIFIED = 0;
+  // 推理模式：inference worker 可以处理 ImageDetectionRequest。
+  LOCATEANYTHING_RUNTIME_MODE_INFERENCE = 1;
+  // 训练模式：训练进程占用模型资源，新的检测请求必须返回 TRAINING_MODE。
+  LOCATEANYTHING_RUNTIME_MODE_TRAINING = 2;
+}
+
+// backend/inference/training 的统一运行状态。
+enum LocateAnythingRuntimeState {
+  // 尚未取得 backend、worker 或训练进程的可靠状态。
+  LOCATEANYTHING_RUNTIME_STATE_UNKNOWN = 0;
+  // 正在启动或切换运行模式，调用方应等待后重新查询，不应假定可用。
+  LOCATEANYTHING_RUNTIME_STATE_STARTING = 1;
+  // 当前模式已准备完成，可以根据 mode 接收对应操作。
+  LOCATEANYTHING_RUNTIME_STATE_READY = 2;
+  // 正在执行检测、校验、训练或加载操作；互斥操作应立即拒绝或排队规则明确拒绝。
+  LOCATEANYTHING_RUNTIME_STATE_BUSY = 3;
+  // 正在停止进程或释放模型资源，尚未达到可重新使用的状态。
+  LOCATEANYTHING_RUNTIME_STATE_STOPPING = 4;
+  // backend、worker、训练进程或模型初始化失败；必须通过新的请求/重启恢复。
+  LOCATEANYTHING_RUNTIME_STATE_FAILED = 5;
+}
+
+// 一次训练 run 的状态；COMPLETED/STOPPED/FAILED 是终态。
+enum LocateAnythingTrainingState {
+  // 没有可用的训练状态，例如尚未提交训练请求。
+  LOCATEANYTHING_TRAINING_STATE_UNKNOWN = 0;
+  // 正在运行 dataset_validator.py，尚未启动训练脚本。
+  LOCATEANYTHING_TRAINING_STATE_VALIDATING = 1;
+  // 校验通过，正在创建 run 目录和训练进程。
+  LOCATEANYTHING_TRAINING_STATE_STARTING = 2;
+  // 训练脚本已运行；step、loss 和日志由 LocateAnythingTrainingEvent 发布。
+  LOCATEANYTHING_TRAINING_STATE_RUNNING = 3;
+  // 已收到停止请求，正在等待训练进程退出并写出最终状态。
+  LOCATEANYTHING_TRAINING_STATE_STOPPING = 4;
+  // 训练达到 max_steps 或正常完成，run 目录和 checkpoint 保留。
+  LOCATEANYTHING_TRAINING_STATE_COMPLETED = 5;
+  // 用户停止训练后的终态；停止不删除数据集或已有 run 文件。
+  LOCATEANYTHING_TRAINING_STATE_STOPPED = 6;
+  // 校验、启动、训练脚本、模型或 checkpoint 出现不可恢复错误。
+  LOCATEANYTHING_TRAINING_STATE_FAILED = 7;
+  // 服务端明确确认没有活动或历史 run；区别于无法判断的 UNKNOWN。
+  LOCATEANYTHING_TRAINING_STATE_IDLE = 8;
+  // Publishing the result and waiting for inference to become ready.
+  LOCATEANYTHING_TRAINING_STATE_FINALIZING = 9;
+}
+
+// -----------------------------------------------------------------------------
+// 用例管理：上下文
+// -----------------------------------------------------------------------------
+
+// 当前选中的测试组/用例组。
+// 主题 QFRAMEWORK_USECASE_GROUP_CONTEXT：UseCaseManage -> UseCase（点对点）。
+// 只携带 ID；接收方必须用 ID 重新查询数据库，不能把名称当事实。
+message UseCaseGroupContext {
+  // 测试组 ID（test_groups.id），必须 > 0。
+  uint64 test_group_id = 1;
+  // 用例组 ID（usecase_groups.id），必须 > 0 且属于 test_group_id。
+  uint64 usecase_group_id = 2;
+}
+
+// 当前选中的用例。
+// 主题 QFRAMEWORK_USECASE_CONTEXT：UseCase -> UseCaseStep（点对点）。
+// 所有 ID 必须同时存在且 > 0；UseCase 在发送前必须确认三层 ID 仍存在。
+message UseCaseContext {
+  // 测试组 ID（test_groups.id）。
+  uint64 test_group_id = 1;
+  // 用例组 ID（usecase_groups.id）。
+  uint64 usecase_group_id = 2;
+  // 用例 ID（usecases.id）；UseCaseStep 据此查询 usecase_steps 并重画流程图。
+  uint64 usecase_id = 3;
+}
+
+// 步骤列表定位条件：根据当前用例类型定位可用的公共步骤目录。
+// 主题 QFRAMEWORK_USECASE_STEPLIST_CONTEXT：UseCase -> StepList（点对点）。
+// 与 UseCaseContext 在同一个选择动作里连续发送，两者的 usecase_id 必须相同。
+message StepListContext {
+  // 当前用例类型，只允许 FUNCTION/DELAY/PERFORMANCE；StepList 按
+  // step_types.usecase_type = 该值 查询目录。CUSTOM 非法，收到后忽略并记录诊断。
+  UseCaseType usecase_type = 1;
+  // 当前用例 ID（usecases.id）。StepList 不据此查库，只记住并回显到
+  // StepListAddRequest.usecase_id；为 0 表示当前没有选中用例，StepList 禁用双击添加。
+  uint64 usecase_id = 2;
+}
+
+// 请求把一个公共步骤定义添加为指定用例的新实例。
+// 主题 QFRAMEWORK_USECASE_STEPLIST_ADD：StepList -> UseCaseStep（点对点）。
+message StepListAddRequest {
+  // 公共步骤定义 ID（steps.id），必须 > 0；UseCaseStep 据此读取定义和默认参数。
+  uint64 step_definition_id = 1;
+  // 目标用例 ID，来自 StepList 最近一次收到的 StepListContext.usecase_id。
+  // UseCaseStep 必须校验它等于自己的当前用例；不一致（用户刚切换了用例）时丢弃
+  // 并记录诊断，不能把步骤加到新用例上。
+  uint64 usecase_id = 2;
+}
+
+// -----------------------------------------------------------------------------
+// 用例执行：请求 / 停止 / 事件
+// -----------------------------------------------------------------------------
+
+// 完整用例执行目标：按列表顺序解释根节点及命中分支/return；首个失败终止execution。
+message UseCaseExecutionTarget {
+  // 用例 ID 列表（usecases.id），顺序就是用户在列表中选择的顺序；不能为空，
+  // 每个值 > 0，不允许重复。TaskList 每次只放一个 usecase_id。
+  repeated uint64 usecase_ids = 1;
+}
+
+// 选中步骤执行目标：只执行某个用例中指定的步骤实例。
+message StepExecutionTarget {
+  // 所属用例 ID（usecases.id），必须 > 0。
+  uint64 usecase_id = 1;
+  // 步骤实例 ID 列表（usecase_steps.id），按调用方传入顺序执行，忽略外部分支和return；每个实例都必须属于
+  // usecase_id，否则整个请求以 INVALID_PARAMETER 失败。不能为空。
+  repeated uint64 step_instance_ids = 2;
+}
+
+// 执行请求。
+// 主题 QFRAMEWORK_USECASE_EXECUTION_REQUEST：UseCase/UseCaseStep/TaskList ->
+// ExecuteStep（点对点）。每次手工执行、每个任务尝试都生成一个新的 UUID。
+message ExecutionRequest {
+  // 本次执行的 UUID，36 个 ASCII 字符；同一 UUID 只能对应一个不可变的目标。
+  // 相同 UUID + 相同目标重投视为幂等（只重放已发事件或静默）；相同 UUID + 不同目标
+  // 是调用方错误，ExecuteStep 丢弃并记录 INVALID_PARAMETER 诊断。
+  string execution_id = 1;
+  // 执行目标；必须且只能设置一个分支，缺失时 ExecuteStep 以 INVALID_PARAMETER 终态回应。
+  oneof target {
+    // 完整用例执行：根顺序、非根1=true/2=false；正常结果return优先；首个失败停止后续用例。
+    UseCaseExecutionTarget usecases = 2;
+    // 选中步骤执行：正常false继续且最终FAILED；异常立即停止；组合内部仍走完整流程。
+    StepExecutionTarget steps = 3;
+  }
+}
+
+// 停止请求。
+// 主题 QFRAMEWORK_USECASE_STOP_EXECUTION：UseCase/UseCaseStep/TaskList ->
+// ExecuteStep（点对点）。只停止相同 execution_id 的执行；未知或已终态的 ID 只记录
+// 可审计诊断，不影响其他执行，也不发布任何事件。
+message StopExecutionRequest {
+  // 要停止的执行 UUID，必须等于某个正在运行的 ExecutionRequest.execution_id。
+  string execution_id = 1;
+}
+
+// ExecuteStep 发出的有序执行事件。
+// 主题 QFRAMEWORK_USECASE_EXECUTION_EVENT：ExecuteStep -> UseCase/UseCaseStep/TaskList（广播）。
+// UseCaseLog 不订阅本权威主题；ExecuteStep 发布成功后再向 LOG_DISPLAY 镜像显示文本。
+// 直接（手工）执行不把事件写入数据库；TaskList 把任务尝试的事件追加到批次文件夹的 events.csv。
+//
+// 事件顺序（一次正常 execution）：
+//   EXECUTION PENDING(seq=1) -> EXECUTION RUNNING -> [USECASE RUNNING ->
+//   (STEP RUNNING -> STEP 终态)* -> USECASE 终态]* -> EXECUTION 终态
+// 相同 execution_id 的重投只重放已发事件或保持静默，不生成新序号；
+// 不同 execution_id 遇忙时只发送一条 seq=1 的 EXECUTION/FAILED/EXECUTION_BUSY 终态。
+message ExecutionEvent {
+  // 所属执行的 UUID，等于 ExecutionRequest.execution_id。
+  string execution_id = 1;
+  // 该层级此刻的状态。
+  ExecutionStatus status = 2;
+  // 用例 ID（usecases.id）。STEP/USECASE 事件必须 > 0；EXECUTION 事件在多用例手工
+  // 执行时为 0，TaskList 的单用例尝试要求三类事件都等于目标用例。
+  uint64 usecase_id = 3;
+  // 步骤实例 ID（usecase_steps.id）。STEP 事件必须 > 0；USECASE/EXECUTION 事件为 0，
+  // 写 events.csv 时为空字段。组合步骤对外只报告组合实例自己的 ID，不暴露内部节点。
+  uint64 step_instance_id = 4;
+  // 步骤名称快照（steps.name），仅 STEP 事件填写，用于日志显示；其他层级为空串。
+  string step_name = 5;
+  // 单调时钟耗时（毫秒）：该层级从 RUNNING 到本终态的时长。
+  // PENDING、RUNNING 和启动前失败均为 0。写 events.csv 的 elapsed_ms 列。
+  int64 elapsed_ms = 6;
+  // 稳定错误码文本，成功为空串。取值集合：EXECUTION_BUSY、DEVICE_OFFLINE、
+  // DEVICE_CHANGED、FRAME_UNAVAILABLE、MODEL_NOT_READY、TRAINING_MODE、
+  // LOCATEANYTHING_BUSY、INFERENCE_TIMEOUT、INVALID_DETECTION_RESULT、
+  // INVALID_PARAMETER、INVALID_STEP_DEFINITION、ADB_TIMEOUT、NOT_SUPPORTED。
+  // 另含CONDITION_NOT_MET、LOOP_LIMIT_EXCEEDED、SQL_TIMEOUT、SQL_ERROR、REQUEST_TIMEOUT、
+  // MESSAGE_REJECTED及05模块文档所列语音/总线错误。同一场景不得另造同义码。
+  string error_code = 7;
+  // 面向人的诊断文字，可为空；不得包含完整数据库路径等敏感信息。
+  string error_message = 8;
+  // 仅 USECASE 事件的终态为 true，表示该用例已结束；其他情况 false。不入库。
+  bool usecase_terminal = 9;
+  // 仅 EXECUTION 事件的终态为 true，表示整次 execution 已结束、之后不会再有事件；
+  // 其他情况 false。只有它能结束 TaskList 的当前 attempt。不入库。
+  bool batch_terminal = 10;
+  // 该 execution 内的事件序号，从 1 开始严格递增、无空洞；接收方据此去重和排序。
+  // 写 events.csv 的 event_sequence 列，(execution_id, event_sequence) 唯一。
+  uint64 event_sequence = 11;
+  // 事件层级；决定 usecase_id/step_instance_id/terminal 标志的合法组合。
+  ExecutionEventType event_type = 12;
+  // 事件生成时的 UTC Unix 毫秒，必须 > 0；原样写 events.csv 的 event_at_ms 列，
+  // 不能用收消息或提交事务的时间替代。
+  int64 timestamp_ms = 13;
+  // STEP 终态事件专用：本步骤最后一个触控/按键 AdbRequest 收到 accepted=true 的
+  // AdbResponse 时的 UTC Unix 毫秒。本步骤没有向设备发送动作（wait、组合中全是
+  // 等待节点）时为 0；非 STEP 事件为 0。TaskWorker 取整个 execution 内的最大值作为
+  // 延时指标（画面稳定法）的起点。不写任务历史文件。
+  int64 last_action_ack_ms = 14;
+  // 正常条件未命中是SUCCEEDED/FALSE；不是STEP执行异常。
+  ExecutionResult result = 15;
+}
+
+// -----------------------------------------------------------------------------
+// 公共步骤目录
+// -----------------------------------------------------------------------------
+
+// 公共步骤目录发生变化，通知 StepList 重新查询。
+// 主题 QFRAMEWORK_USECASE_STEP_CATALOG_CHANGED：ImageShow（保存录制步骤）/
+// UseCaseStep（创建组合）-> StepList（广播）。
+// StepCatalogChanged 定义于 step_catalog.proto，不在此重复声明。
+
+// -----------------------------------------------------------------------------
+// LocateAnything：单图检测
+// -----------------------------------------------------------------------------
+
+// 一个图片像素坐标框。服务必须保证坐标属于请求 PNG，且 x2>x1、y2>y1。
+message ImageDetectionBox {
+  // 左边界横坐标，单位为请求 PNG 的像素；必须落在图片有效范围内。
+  int32 x1 = 1;
+  // 上边界纵坐标，单位为请求 PNG 的像素；包含该行，取值范围为 [0, 图片高度-1]。
+  int32 y1 = 2;
+  // 右边界横坐标，单位为请求 PNG 的像素；必须大于 x1 且不得越过图片右边界。
+  int32 x2 = 3;
+  // 下边界纵坐标，单位为请求 PNG 的像素；必须大于 y1 且不得越过图片下边界。
+  int32 y2 = 4;
+  // 模型为该框返回的目标标签；供日志和结果核对，不能代替请求中的 target_phrase。
+  string label = 5;
+}
+
+// ExecuteStep 在真正执行图像步骤时冻结一张画面并发送；视频帧到达本身不产生本消息。
+// 主题 QFRAMEWORK_LOCATEANYTHING_DETECTION_REQUEST：ExecuteStep ->
+// LocateAnything_ProcessNonUi（点对点，Reliable）。
+message ImageDetectionRequest {
+  // 本次检测的关联 ID；调用方为每次新检测生成非空唯一值，响应必须原样回显。
+  // LocateAnything 用它识别重复请求，ExecuteStep 用它丢弃迟到或不匹配的响应。
+  string request_id = 1;
+  // 发起本次检测的执行 UUID，必须等于当前 ExecutionRequest.execution_id；用于把模型结果
+  // 绑定到唯一执行，不允许检测模块自行创建或改写。
+  string execution_id = 2;
+  // 当前图像步骤实例 ID（usecase_steps.id），必须 > 0 且属于 execution_id 的执行目标。
+  uint64 step_instance_id = 3;
+  // 冻结画面编码后的完整 PNG 原始字节；不是文件路径、Base64 或 QString 文本。
+  // 发送前必须能解码且不超过运行时配置的 max_image_bytes/max_image_side。
+  bytes image_png = 4;
+  // 要定位的自然语言目标，例如“导航图标”；必须非空且不含协议控制字符。
+  string target_phrase = 5;
+  // 传给模型的生成策略名称；空串表示使用服务端配置的默认策略。
+  // 非空值必须属于服务端允许列表，未知值按 INVALID_PARAMETER 拒绝。
+  string generation_mode = 6;
+  // 本次模型回答允许生成的最大 token 数；0 表示使用服务端默认值，调用方只能在
+  // 服务端上限以内设置，超过上限按 INVALID_PARAMETER 拒绝。
+  uint32 max_new_tokens = 7;
+  // 本次检测硬超时，单位毫秒；0 表示使用服务端 inference_timeout_ms 默认值。
+  // 到期必须返回 INFERENCE_TIMEOUT 并释放单飞占用，不能留下永久 pending。
+  uint32 timeout_ms = 8;
+  // 冻结帧所属的 ADB serial；用于确认返回期间没有切换设备，必须非空。
+  string source_serial = 9;
+  // 冻结帧的单调视频序号；响应必须原样回显，ExecuteStep 用它关联原始画面。
+  uint64 source_sequence = 10;
+  // 本轮固定0，不旋转；保留字段兼容未来旋转处理，框始终属于请求PNG。
+  int32 source_rotation = 11;
+  // 编码进 image_png 的源图宽度，单位像素，必须 > 0 且与 PNG 解码结果一致。
+  uint32 source_width = 12;
+  // 编码进 image_png 的源图高度，单位像素，必须 > 0 且与 PNG 解码结果一致。
+  uint32 source_height = 13;
+  // 设备当前逻辑输入宽度，可与 PNG 宽度不同；纯检测可以为 0。
+  uint32 screen_width = 14;
+  // 设备当前逻辑输入高度；框始终返回 PNG 坐标，由执行器转换后点击。
+  uint32 screen_height = 15;
+  // 调用方维护的设备选择代次；当前设备选择变化时递增；本轮不跟踪尺寸/旋转变化。
+  // 响应回来时若与当前代次不同，ExecuteStep 必须丢弃结果并禁止点击。
+  uint64 device_epoch = 16;
+}
+
+// 单图检测终态响应。无框可返回success=false/error_code=TARGET_NOT_FOUND，
+// 执行器将其归一化为正常false；success=true且boxes为空也按正常false处理。
+// 主题 QFRAMEWORK_LOCATEANYTHING_DETECTION_RESPONSE：LocateAnything -> ExecuteStep（点对点）。
+message ImageDetectionResponse {
+  // 原样回显 ImageDetectionRequest.request_id；调用方只处理当前 pending 中的匹配值。
+  string request_id = 1;
+  // 检测操作是否得到可使用的协议结果；true 时 error_code/error_message 应为空，
+  // false 时 boxes 必须为空并提供稳定 error_code。
+  bool success = 2;
+  // 稳定机器错误码。常见值包括 TARGET_NOT_FOUND、MODEL_NOT_READY、TRAINING_MODE、
+  // LOCATEANYTHING_BUSY、INFERENCE_TIMEOUT、INVALID_DETECTION_RESULT、INVALID_PARAMETER、
+  // BACKEND_UNAVAILABLE；成功时为空串。
+  string error_code = 3;
+  // 面向人的错误详情；可用于 UI/日志，但调用方不得通过解析本字段决定业务分支。
+  string error_message = 4;
+  // 经边界、顺序和数量校验后的检测框；坐标属于请求 PNG。
+  // TARGET_NOT_FOUND 或其他失败时为空；click_navigation 首版要求恰好一个合法框。
+  repeated ImageDetectionBox boxes = 5;
+  // 模型/服务返回的原始回答，供诊断和审计；不能绕过 boxes 的结构化校验直接解析点击。
+  string raw_answer = 6;
+  // 原样回显请求的 source_serial；不匹配时调用方必须将响应视为无效。
+  string source_serial = 7;
+  // 原样回显请求的 source_sequence；用于证明结果对应哪一张冻结帧。
+  uint64 source_sequence = 8;
+  // 实际执行本次检测的基础模型版本或 manifest revision；用于日志和结果复现。
+  string model_revision = 9;
+  // 实际加载的 adapter 路径或稳定标识；未加载 adapter 时为空。
+  // UI 显示时应脱敏，不把完整本地路径写入普通执行日志。
+  string adapter_path = 10;
+  // LocateAnything 从接收请求到形成终态响应的单调耗时，单位毫秒；不得用墙钟相减。
+  int64 elapsed_ms = 11;
+  // 原样回显请求的 device_epoch；调用方据此拒绝设备切换后的迟到结果。
+  uint64 device_epoch = 12;
+}
+
+// -----------------------------------------------------------------------------
+// LocateAnything：数据集校验、训练和 adapter
+// -----------------------------------------------------------------------------
+
+// 数据集校验操作参数；只读取 recipe、JSONL 和图片，不启动训练、不修改正式数据集。
+message ValidateLocateAnythingDataset {
+  // 数据集 recipe.json 的路径；必须位于配置的受管 dataset root 内，经过规范化后
+  // 不得使用 ..、符号链接或大小写差异逃逸目录。
+  string recipe_path = 1;
+  // 本次最多校验的样本数；0 表示按服务端策略校验全部样本，非 0 仅可降低上限。
+  // 即使抽样校验成功，也必须在响应中用 sample_count/checked_samples 明确范围。
+  uint32 max_samples = 2;
+}
+
+// 启动一次 LocateAnything LoRA 训练所需的完整参数快照。
+// 只有最近一次数据集校验成功且推理请求已收尾时才允许受理。
+message StartLocateAnythingTraining {
+  // 已校验通过的 recipe.json 路径；必须仍位于受管 dataset root 且内容代次未变化。
+  string recipe_path = 1;
+  // 本次训练 run 的输出目录；必须位于受管 runs root、尚未被其他 run 占用。
+  // 模块负责创建和保留目录，停止或失败时不得删除已有训练产物。
+  string output_dir = 2;
+  // LoRA 低秩矩阵的 rank；必须 > 0 并在运行时允许范围内，值越大通常显存占用越高。
+  uint32 lora_rank = 3;
+  // 训练前把图片缩放到的最大边长，单位像素；0 表示采用训练配置默认值。
+  // 非 0 值必须满足模型能力和 GPU 显存门禁。
+  uint32 max_image_side = 4;
+  // 文本/视觉 token 序列最大长度；0 表示采用训练配置默认值，不能超过模型上限。
+  uint32 max_seq_length = 5;
+  // 本次最多执行的优化步骤数；必须 > 0，训练达到该值后进入 COMPLETED 终态。
+  uint32 max_steps = 6;
+  // 每隔多少训练步骤保存一次 checkpoint；必须 > 0 且通常不大于 max_steps。
+  uint32 save_steps = 7;
+  // 优化器学习率；必须为有限正数，调用方不得发送 NaN、无穷大或非正数。
+  double learning_rate = 8;
+  // 随机种子；相同数据、软件和硬件条件下用于提高训练过程的可复现性。
+  uint64 seed = 9;
+  // 是否运行无真实模型/GPU的模拟训练。true 只用于契约测试，产物必须标记
+  // SIMULATED_ONLY.txt，永远不能通过 LoadLocateAnythingAdapter 加载到推理 worker。
+  bool simulate = 10;
+}
+
+// 停止指定训练 run 的操作参数；停止是幂等操作，不删除 run 目录或 checkpoint。
+message StopLocateAnythingTraining {
+  // 要停止的训练 run ID，必须等于当前活动 run；未知或已终态的 ID 返回可审计结果，
+  // 不能误停另一个训练进程。
+  string run_id = 1;
+}
+
+// 查询指定训练 run 的权威状态，并按游标增量取得训练日志。
+message QueryLocateAnythingTraining {
+  // 要查询的 run ID；为空时可表示查询当前活动/最近 run，具体选择规则由服务端统一定义。
+  string run_id = 1;
+  // 调用方已经处理的最后一个日志序号；响应/后续事件只需提供更大的序号。
+  // 0 表示从当前可保留范围的起点读取，日志序号必须严格递增。
+  uint64 logs_since_sequence = 2;
+}
+
+// 列出指定训练输出目录中的 checkpoint，供 UI 定位和选择，不自动加载任何条目。
+message ListLocateAnythingCheckpoints {
+  // 要枚举的受管 run 输出目录；必须位于 runs root，禁止任意文件系统路径扫描。
+  string output_dir = 1;
+}
+
+// 请求加载一个真实训练产生的 adapter，并在加载成功后切换回推理模式。
+message LoadLocateAnythingAdapter {
+  // adapter 目录路径；必须位于受管 runs root，通过 manifest/base-model revision 检查，
+  // 且不得包含 SIMULATED_ONLY.txt。加载失败时继续保留最近一次已确认的运行状态。
+  string adapter_path = 1;
+}
+
+// Training UI -> LocateAnything_ProcessNonUi（点对点，Reliable）。
+// 显式返回推理；必须等待 inference_ready，不能以 HTTP 受理作为完成。
+message RecoverLocateAnythingInference {
+  // false 显式清空 adapter 并恢复基础模型；true 使用本 worker 最近一次训练前配置。
+  // worker 重启后配置快照丢失，true 返回 PREVIOUS_CONFIGURATION_UNKNOWN。
+  bool previous_configuration = 1;
+}
+
+// Training UI -> LocateAnything_ProcessNonUi，训练控制请求；经 Reliable 点对点主题投递。
+message LocateAnythingTrainingRequest {
+  // 本次训练控制调用的非空唯一关联 ID；响应必须原样回显，UI 用 request_id 与本地
+  // dataset/run generation 一起拒绝迟到响应。
+  string request_id = 1;
+  // 具体操作联合体；每个请求必须且只能设置一个分支，缺失时返回 INVALID_PARAMETER。
+  oneof operation {
+    // 校验 recipe、标注和媒体文件，不启动训练。
+    ValidateLocateAnythingDataset validate_dataset = 2;
+    // 创建 run 并开始 LoRA 训练；与推理操作互斥。
+    StartLocateAnythingTraining start_training = 3;
+    // 请求当前训练 run 自然停止并等待终态。
+    StopLocateAnythingTraining stop_training = 4;
+    // 查询 run 状态以及日志游标位置，供晚订阅或重开 UI 恢复。
+    QueryLocateAnythingTraining query_status = 5;
+    // 定位输出目录下可展示的 checkpoint 列表，不改变运行模式。
+    ListLocateAnythingCheckpoints list_checkpoints = 6;
+    // 校验并加载真实 adapter，成功后恢复 inference worker。
+    LoadLocateAnythingAdapter load_adapter = 7;
+    // 训练终态后显式恢复；活动 run 由运行时再次拒绝，不自动重试训练。
+    RecoverLocateAnythingInference recover_inference = 8;
+  }
+}
+
+// 一个 checkpoint 的只读目录快照；列表项只用于展示和后续显式选择。
+message LocateAnythingCheckpoint {
+  // 供 UI 显示的 checkpoint 名称，通常是目录名，不作为唯一文件系统权限凭据。
+  string name = 1;
+  // checkpoint 的规范化受管路径；调用方选择加载时仍须由服务端重新做安全检查。
+  string path = 2;
+  // checkpoint 最近修改时间，UTC Unix 毫秒；用于显示和稳定排序，不判断训练是否成功。
+  int64 modified_at_ms = 3;
+  // 是否由 simulate=true 的训练产生；true 的条目只能用于测试展示，禁止加载推理。
+  bool simulated = 4;
+  // 当前服务端检查后是否具备加载条件；false 时 UI 应禁用加载并展示响应中的原因。
+  // 真值只是当前快照，实际加载时仍需重新验证文件和模型 revision。
+  bool loadable = 5;
+}
+
+// LocateAnything_ProcessNonUi -> 原 Training UI 请求方（点对点，Reliable）。
+message LocateAnythingTrainingResponse {
+  // 原样回显 LocateAnythingTrainingRequest.request_id；不匹配当前 pending 时必须丢弃。
+  string request_id = 1;
+  // 请求是否通过校验并被按操作受理；对于 start/stop，训练的持续进度和最终完成情况
+  // 仍以 state 与 LocateAnythingTrainingEvent 为准，success=true 不等于训练已经完成。
+  bool success = 2;
+  // 稳定机器错误码；成功时为空。调用方依据它决定按钮和状态，不能解析 error_message。
+  string error_code = 3;
+  // 面向用户和开发者的错误详情；不得包含完整敏感路径、训练 token 或图片内容。
+  string error_message = 4;
+  // 与本次操作关联的训练 run ID；开始成功后必须非空，查询/停止时回显目标 run。
+  string run_id = 5;
+  // 响应形成时该 run 的权威训练状态；终态值不得被旧事件回退为运行态。
+  LocateAnythingTrainingState state = 6;
+  // 数据集是否通过完整协议校验；只对 validate_dataset 或相关状态查询有意义。
+  bool dataset_valid = 7;
+  // recipe 中定位到的数据集分组/条目总数；定义必须与训练脚本统计口径一致。
+  uint64 dataset_count = 8;
+  // recipe/JSONL 声明的样本总数，不等同于本次实际抽查数量。
+  uint64 sample_count = 9;
+  // 本次真正完成结构、媒体和坐标校验的样本数；不得大于 sample_count。
+  uint64 checked_samples = 10;
+  // 校验中成功定位并检查的图片等媒体文件数量；用于发现缺失或重复引用。
+  uint64 media_count = 11;
+  // 阻止数据集进入可训练状态的逐项错误；每项应包含相对文件名和可操作原因。
+  repeated string validation_errors = 12;
+  // 不阻止训练但需要用户知晓的逐项警告；不得混入 validation_errors 的硬失败条件。
+  repeated string validation_warnings = 13;
+  // list_checkpoints 或状态查询返回的 checkpoint 快照；其他操作可为空。
+  repeated LocateAnythingCheckpoint checkpoints = 14;
+  // 服务端当前已经产生的最大训练日志序号；UI 将它作为下一次增量查询的游标。
+  uint64 latest_log_sequence = 15;
+  // 服务端返回的受管 run 目录，仅用于下一次 list_checkpoints 请求，不显示完整路径。
+  string output_dir = 16;
+  // 查询快照中的进度，即使无新增日志也更新；单位为训练 step。
+  uint64 step = 17;
+  uint64 max_steps = 18; // 当前 run 的配置上限。
+  double loss = 19; // has_loss=true 时有效；不能把缺失值解释为零。
+  bool has_loss = 20; // 运行时确实报告了有限 loss。
+  // 启动被明确拒绝后的恢复事实；训练请求仍返回失败，不伪装成训练成功。
+  bool recovery_attempted = 21; // 本次失败处理是否尝试恢复训练前推理配置。
+  bool recovery_succeeded = 22; // 仅 recovery_attempted=true 且模型实际就绪时为 true。
+  string recovery_error_code = 23; // 仅恢复失败时非空；允许用户单独重试恢复。
+  string status_message = 24; // 当前阶段的简短说明，包括训练或结果加载失败原因。
+}
+
+// 训练进度/日志事件；只在状态或进度变化、收到训练脚本日志时发布，不做视频级广播。
+// 主题 QFRAMEWORK_LOCATEANYTHING_TRAINING_EVENT：LocateAnything -> Training UI（广播）。
+message LocateAnythingTrainingEvent {
+  // 事件所属训练 run ID；UI 只处理当前已确认 run，其他 run 的迟到事件静默丢弃。
+  string run_id = 1;
+  // 事件产生时训练状态；COMPLETED/STOPPED/FAILED 为终态，终态后不得再回退。
+  LocateAnythingTrainingState state = 2;
+  // 当前完成的训练步骤序号；尚未开始时为 0，运行中不得倒退。
+  uint64 step = 3;
+  // 本次 run 配置的最大训练步骤数；通常等于 StartLocateAnythingTraining.max_steps。
+  uint64 max_steps = 4;
+  // 当前步骤报告的 loss；只有训练脚本提供有效有限值时才用于曲线显示。
+  // 非训练进度事件可为 0，不能把 0 自动解释为模型已经收敛。
+  double loss = 5;
+  // run 内日志/事件游标，从 1 起严格递增；调用方据此去重、排序和增量恢复。
+  uint64 log_sequence = 6;
+  // 日志级别文本，例如 DEBUG、INFO、WARNING、ERROR；只控制显示样式，不决定终态。
+  string level = 7;
+  // 本条状态或训练脚本日志正文；不得包含敏感 token、完整图片或不必要的绝对路径。
+  string message = 8;
+  // 本事件新产生或更新的 checkpoint 路径；非 checkpoint 事件为空串。
+  // 路径仅供定位，加载前仍须执行真实/模拟、manifest 和 revision 检查。
+  string checkpoint_path = 9;
+  // 事件生成时的 UTC Unix 毫秒，必须 > 0；不使用 UI 接收时间替代。
+  int64 timestamp_ms = 10;
+  bool has_loss = 11; // loss 是否由运行时明确报告；缺失时 UI 显示“未报告”。
+}
+
+// 运行时状态广播；状态变化时发布，晚订阅 UI 仍须用 query_status 取得权威快照。
+// 主题 QFRAMEWORK_LOCATEANYTHING_RUNTIME_STATUS：LocateAnything -> ExecuteStep/Training UI。
+message LocateAnythingRuntimeStatus {
+  // 当前模型资源所属模式；UNSPECIFIED 表示尚不能判断，不得据此启用操作按钮。
+  LocateAnythingRuntimeMode mode = 1;
+  // backend/inference/training 组合后的统一状态；与 mode 一起解释实际可执行操作。
+  LocateAnythingRuntimeState state = 2;
+  // 当前状态的简短可读说明，例如启动阶段或最近错误；不作为机器分支条件。
+  string message = 3;
+  // backend 网关进程是否仍在运行；true 只表示进程存活，不证明健康检查或推理成功。
+  bool backend_running = 4;
+  // inference worker 进程是否运行；true 不代表模型已加载、GPU 正在工作或请求有进展。
+  bool inference_worker_running = 5;
+  // 训练进程是否仍在运行；必须与活动 run 和 training state 交叉校验。
+  bool training_running = 6;
+  // 发布状态时运行时是否检测到可用 CUDA；仅是能力快照，不等于显存充足或训练通过。
+  bool cuda_available = 7;
+  // CUDA 设备显示名称；cuda_available=false 时为空串，仅供诊断和 UI 展示。
+  string cuda_name = 8;
+  // 当前已加载基础模型的 manifest revision；未成功加载模型时为空串。
+  string model_revision = 9;
+  // 当前推理 worker 已确认加载的 adapter 路径或标识；使用基础模型时为空串。
+  // 普通 UI/日志显示时应脱敏，不能把路径本身当作加载成功证明。
+  string adapter_path = 10;
+  // 状态快照生成时的 UTC Unix 毫秒；晚订阅者仍须主动 query_status 获取权威快照。
+  int64 timestamp_ms = 11;
+  // 能力接口完整返回后的事实；旧服务/未知状态为 false，禁止真实训练。
+  bool capabilities_known = 12;
+  bool real_training_available = 13; // CUDA、BF16、PEFT 等共同决定，不能用 CUDA 代替。
+  bool bf16_supported = 14; // 当前 CUDA 设备的 BF16 诊断快照。
+  bool peft_available = 15; // 当前 Python 环境能否导入 PEFT。
+  string training_unavailable_reason = 16; // 脱敏诊断，不作为机器分支条件。
+  bool simulation_available = 17; // 独立能力，模拟不依赖真实训练能力。
+}
+
+// -----------------------------------------------------------------------------
+// 任务测试：上下文
+// 任务历史不在数据库中，而是 data/task_history/task_<id>/<批次目录>/ 下的
+// batch.csv / attempts.csv / events.csv（见 08-任务历史文件存储方案.md）。
+// 因此没有 batch_case_id/attempt_id 这类数据库主键；批次内用例用 case_order
+// （batch.csv 第二段的行序，从 1 起）定位，尝试用 execution_id 定位。
+// -----------------------------------------------------------------------------
+
+// TaskList 当前选中的任务/批次，通知 TaskCase 切换显示。
+// 主题 QFRAMEWORK_TASK_SELECTION_CONTEXT：TaskList -> TaskCase（点对点）。
+message TaskSelectionContext {
+  // 任务 ID（tasks.id），必须 > 0。
+  uint64 task_id = 1;
+  // 批次 ID = 批次创建时刻的 UTC 毫秒，等于 batch.csv 头部 batch_id，也是批次目录名
+  // 的后缀；0 表示“默认选择该任务最近一个批次”，由 TaskCase 自行列目录。
+  uint64 batch_id = 2;
+  // 建议展开的用例快照序号（batch.csv 的 case_order）；0 表示不指定。
+  uint32 case_order = 3;
+  // 建议高亮的尝试（attempts.csv 的 execution_id）；空串表示不指定。
+  string execution_id = 4;
+  // TaskList 本地递增的选择代次；TaskCase 用它丢弃比当前已处理代次更旧的上下文。
+  uint64 selection_generation = 5;
+}
+
+// TaskCase 当前的定位范围，通知 TaskLog 定位对应的任务/批次/用例/尝试日志视图。
+// 主题 QFRAMEWORK_TASK_LOG_CONTEXT：TaskCase -> TaskLog（点对点）。
+// TaskLog 只从 TaskCase 接收上下文，自己不发送任何上下文。
+message TaskLogContext {
+  // 任务 ID（tasks.id），必须 > 0。
+  uint64 task_id = 1;
+  // 批次 ID，必须 > 0；TaskLog 据此定位批次目录并读取 events.csv。
+  uint64 batch_id = 2;
+  // 用例快照序号（events.csv 的 case_order 列）；0 表示不限定用例。
+  uint32 case_order = 3;
+  // 尝试 UUID（events.csv 的 execution_id 列）；空串表示不限定尝试。
+  // 非空时必须属于 case_order 对应的用例。
+  string execution_id = 4;
+  // TaskCase 本地递增的选择代次；TaskLog 用它丢弃旧上下文和旧读取结果。
+  uint64 selection_generation = 5;
+}
+
+// -----------------------------------------------------------------------------
+// 任务测试：事件（轻量通知，事实以已落盘的历史文件为准）
+// -----------------------------------------------------------------------------
+
+// 任务定义（tasks/task_cases）已提交变更。
+// 主题 QFRAMEWORK_TASK_DEFINITION_CHANGED：TaskList -> TaskCase/TaskLog（广播）。
+// 只在定义事务提交成功后发布；接收方收到后重新查询 SQL，若任务已被删除
+// （tasks 行和 task_<id>/ 目录都不在）则清空上下文。
+message TaskDefinitionChanged {
+  // 已提交变更（新增/修改/删除）的任务 ID（tasks.id），必须 > 0。
+  uint64 task_id = 1;
+}
+
+// 批次运行态变化。
+// 主题 QFRAMEWORK_TASK_STATE_EVENT：TaskList -> TaskCase/TaskLog（广播）。
+// 只在 batch.csv 写入并 flush 成功后发布；接收方只据此刷新，不在内存中累加或推导计数。
+message TaskStateEvent {
+  // 任务 ID（tasks.id）。
+  uint64 task_id = 1;
+  // 批次 ID（batch.csv 头部 batch_id）；IDLE 状态下可为 0。
+  uint64 batch_id = 2;
+  // 批次当前运行态。
+  TaskRuntimeState state = 3;
+  // 批次触发来源。
+  TaskTrigger trigger = 4;
+  // 当前正在执行的轮次（1..total_rounds）；未开始或已结束时为最后一个已处理轮次。
+  uint32 current_round = 5;
+  // 任务配置的总轮数（batch.csv 头部 rounds）。
+  uint32 total_rounds = 6;
+  // 已到终态（SUCCEEDED/FAILED/STOPPED/NOT_RUN）的尝试数。
+  uint32 completed_attempts = 7;
+  // 批次创建时的尝试总数 = Σ(每个用例快照的 configured_count)。
+  uint32 planned_attempts = 8;
+  // 终态原因或跳过原因的可读文字，对应 batch.csv 头部 reason；运行中为空。
+  string reason = 9;
+  // 事件生成时的 UTC Unix 毫秒。
+  int64 timestamp_ms = 10;
+}
+
+// 一个用例快照（batch.csv 第二段一行）的汇总变化。
+// 主题 QFRAMEWORK_TASK_BATCH_EVENT：TaskList -> TaskCase/TaskLog（广播）。
+// 只在 attempts.csv 的 finished 行（以及批次终态时的 batch.csv）写入并 flush 成功后
+// 发布；不承载完整历史和原始执行事件。
+message TaskBatchEvent {
+  // 任务 ID（tasks.id）。
+  uint64 task_id = 1;
+  // 批次 ID（batch.csv 头部 batch_id）。
+  uint64 batch_id = 2;
+  // 用例快照序号（batch.csv 的 case_order）。
+  uint32 case_order = 3;
+  // 触发本次汇总变化的尝试 UUID；批次收尾等非单个尝试引起的汇总为空串。
+  string execution_id = 4;
+  // 用例 ID 快照（batch.csv 的 usecase_id 列）。
+  uint64 usecase_id = 5;
+  // 用例快照汇总终态。运行中（batch.csv 的 result_* 列仍为空）时为 PENDING；
+  // 批次终态后复制 result_final_status。
+  TaskCaseStatus status = 6;
+  // 已成功的尝试数：运行中由 attempts.csv 折叠得到，终态后等于 result_success_count。
+  uint32 success_count = 7;
+  // 该用例配置的尝试总数（rounds × repetitions），复制 batch.csv 的 configured_count。
+  uint32 configured_count = 8;
+  // 汇总指标原始值：由所有 AVAILABLE 尝试的 attempts.csv actual_metric 取最大值。
+  // 仅 metric_status=AVAILABLE 时有效，其他情况为 0。单位由阈值列决定：
+  // threshold_ms 非空为毫秒，threshold_frames 非空为帧。
+  int64 actual_metric = 9;
+  // 汇总指标状态，与将要/已经写入 result_metric_status 的值一致。
+  MetricStatus metric_status = 10;
+  // 事件生成时的 UTC Unix 毫秒。
+  int64 timestamp_ms = 11;
+}
+
+// 一条执行事件已追加到 events.csv。
+// 主题 QFRAMEWORK_TASK_LOG_EVENT：TaskList -> TaskCase/TaskLog（广播）。
+// 只有该行写入并 flush 成功后才发送；同 (execution_id, event_sequence) 的重投被
+// 内存去重集合拦下，不追加也不重发。字段与 events.csv 列一一对应，接收方可据此决定
+// 是否刷新，但显示内容仍以读取文件的结果为准。
+message TaskLogEvent {
+  // 任务 ID（tasks.id）。
+  uint64 task_id = 1;
+  // 批次 ID（batch.csv 头部 batch_id）。
+  uint64 batch_id = 2;
+  // 用例快照序号（events.csv 的 case_order 列）。
+  uint32 case_order = 3;
+  // 执行 UUID（events.csv 的 execution_id 列）。
+  string execution_id = 4;
+  // 事件序号（events.csv 的 event_sequence 列）。
+  uint64 event_sequence = 5;
+  // 执行状态（events.csv 的 status 列）。
+  ExecutionStatus status = 6;
+  // 用例 ID（events.csv 的 usecase_id 列），> 0。
+  uint64 usecase_id = 7;
+  // 步骤实例 ID；文件中为空字段时这里发 0。
+  uint64 step_instance_id = 8;
+  // 步骤名称（events.csv 的 step_name 列），非 STEP 为空串。
+  string step_name = 9;
+  // 层级耗时（events.csv 的 elapsed_ms 列）。
+  int64 elapsed_ms = 10;
+  // 错误码（events.csv 的 error_code 列）。
+  string error_code = 11;
+  // 错误说明（events.csv 的 error_message 列）。
+  string error_message = 12;
+  // 事件时间（events.csv 的 event_at_ms 列），即原 ExecutionEvent.timestamp_ms。
+  int64 timestamp_ms = 13;
+  // 事件层级（events.csv 的 event_type 列）。
+  ExecutionEventType event_type = 14;
+}
+
+// =============================================================================
+// 语音（ASR/TTS）域
+// =============================================================================
+//
+// 语音不是独立界面，而是执行器可用的步骤：play_voice（合成并播报一句话）与
+// expect_speech（采集车机回声并识别，与期望文本比对）。ASR/TTS 引擎由
+// VoiceEngine_ProcessNonUi 独占，其他模块只走 MessageBus，不直接访问引擎 SDK。
+// 音频输入优先复用 QFRAMEWORK_ADB_AUDIO_EVENT 的 PCM（scrcpy 以 mic 为音源时即
+// 车机麦克风回声）；若车机不暴露该通路，则需独立采集通道，见 17 模块计划。
+
+// 语音引擎运行模式；表明当前引擎处于合成、识别还是空闲。
+enum VoiceRuntimeMode {
+  // 未知/未初始化。
+  VOICE_RUNTIME_MODE_UNKNOWN = 0;
+  // 空闲，可接受新的请求。
+  VOICE_RUNTIME_MODE_IDLE = 1;
+  // 正在合成并输出 TTS 音频。
+  VOICE_RUNTIME_MODE_SYNTHESIZING = 2;
+  // 正在采集并识别 ASR 音频。
+  VOICE_RUNTIME_MODE_RECOGNIZING = 3;
+}
+
+// 语音引擎状态；覆盖引擎健康、设备可用性和运行模式。
+message VoiceRuntimeStatus {
+  // 引擎是否已初始化成功。
+  bool initialized = 1;
+  // 输入音频通路是否可用；false 时 expect_speech 应失败而不是空转。
+  bool audio_input_available = 2;
+  // 当前运行模式。
+  VoiceRuntimeMode mode = 3;
+  // 最近一次错误；空串表示无。
+  string error_message = 4;
+}
+
+// 语音合成请求；主题 QFRAMEWORK_VOICE_PLAY_REQUEST。
+// 由 ExecuteStep 在 play_voice 步骤时发送，经 TTS 引擎合成后注入车机（或本机播放）。
+message VoicePlayRequest {
+  // 调用方生成的关联 ID（bytes；与 SQL 的 bytes request_id 同约定，禁止与 ADB 的 string UUID 混用）。
+  bytes request_id = 1;
+  // 要合成并播报的文本。
+  string text = 2;
+  // 请求关联的 execution 或步骤；无对应执行目标时可为空串。
+  string execution_id = 3;
+  string voice = 4; // 空串使用引擎默认音色。
+  int64 timeout_ms = 5; // 正数；执行器默认30000 ms，对应play_timeout_ms。
+}
+
+// 语音合成应答；主题 QFRAMEWORK_VOICE_PLAY_RESPONSE。
+message VoicePlayResponse {
+  // 原样返回 VoicePlayRequest.request_id。
+  bytes request_id = 1;
+  // 是否成功完成合成与注入。
+  bool success = 2;
+  // 失败分类；成功时为空。
+  string error_code = 3;
+  // 可读错误说明；成功时为空。
+  string error_message = 4;
+  // 合成耗时（单调时钟，毫秒）；成功或失败均填。
+  int64 elapsed_ms = 5;
+}
+
+// 语音识别请求；主题 QFRAMEWORK_VOICE_EXPECT_REQUEST。
+// 采集车机回声，进行 ASR，并判断是否命中 expected_text。
+message VoiceExpectRequest {
+  // 调用方生成的关联 ID。
+  bytes request_id = 1;
+  // 期望识别到的文本；比对时按实现语义（包含/完全匹配，见 17 §3）执行。
+  string expected_text = 2;
+  // 置信度阈值；0 或未设置表示由引擎默认。
+  double confidence_threshold = 3;
+  // 识别超时（毫秒）。
+  int64 timeout_ms = 4;
+  // 请求关联的 execution 或步骤。
+  string execution_id = 5;
+}
+
+// 语音识别应答；主题 QFRAMEWORK_VOICE_EXPECT_RESPONSE。
+message VoiceExpectResponse {
+  // 原样返回 VoiceExpectRequest.request_id。
+  bytes request_id = 1;
+  // 是否成功完成识别。
+  bool success = 2;
+  // 是否命中 expected_text。
+  bool matched = 3;
+  // 实际识别到的文本，未识别到为空串。
+  string recognized_text = 4;
+  // 识别置信度。
+  double confidence = 5;
+  // 失败分类；成功时为空。
+  string error_code = 6;
+  // 可读错误说明；成功时为空。
+  string error_message = 7;
+  // 识别耗时（毫秒）。
+  int64 elapsed_ms = 8;
+}
+
+// =============================================================================
+// 车载总线（CAN / LIN）域
+// =============================================================================
+//
+// 总线不是独立界面，而是执行器可用的步骤：send_can_frame（发一帧 CAN）、
+// send_lin_frame（发一帧 LIN）、expect_signal（等一个信号值等于期望）。
+// VehicleBus_ProcessNonUi 独占 CAN/LIN 接口与 DBC/LDF 解码；DBC/LDF 与通道配置
+// 放 config/vehiclebus.json 和 data/vehiclebus/，不进 SQLite。
+
+// 总线通道类型。
+enum VehicleBusChannelType {
+  // 未知。
+  VEHICLE_BUS_CHANNEL_UNKNOWN = 0;
+  // CAN 通道。
+  VEHICLE_BUS_CHANNEL_CAN = 1;
+  // LIN 通道。
+  VEHICLE_BUS_CHANNEL_LIN = 2;
+}
+
+// 总线信号值类型。
+enum VehicleBusSignalKind {
+  // 未知。
+  VEHICLE_BUS_SIGNAL_UNKNOWN = 0;
+  // 布尔信号。
+  VEHICLE_BUS_SIGNAL_BOOL = 1;
+  // 整数信号。
+  VEHICLE_BUS_SIGNAL_INT = 2;
+  // 浮点信号。
+  VEHICLE_BUS_SIGNAL_FLOAT = 3;
+  // 文本信号。
+  VEHICLE_BUS_SIGNAL_STRING = 4;
+}
+
+// 总线请求错误分类。
+enum VehicleBusErrorCode {
+  // 未明确指定。
+  VEHICLE_BUS_ERROR_UNSPECIFIED = 0;
+  // 通道未打开或已断开。
+  VEHICLE_BUS_ERROR_CHANNEL_UNAVAILABLE = 1;
+  // DBC/LDF 或通道配置缺失/非法。
+  VEHICLE_BUS_ERROR_INVALID_CONFIGURATION = 2;
+  // 信号名称未在 DBC/LDF 中找到。
+  VEHICLE_BUS_ERROR_SIGNAL_NOT_FOUND = 3;
+  // 服务内部操作超时（故障）；正常信号监听到期未命中使用UNSPECIFIED+matched=false。
+  VEHICLE_BUS_ERROR_TIMEOUT = 4;
+  // 硬件或适配器错误。
+  VEHICLE_BUS_ERROR_HARDWARE = 5;
+}
+
+// 总线帧请求；主题 QFRAMEWORK_VEHICLEBUS_SEND_REQUEST。
+// ExecuteStep 在 send_can_frame / send_lin_frame 步骤时发送。
+message VehicleBusSendRequest {
+  // 调用方生成的关联 ID。
+  bytes request_id = 1;
+  // 总线通道类型。
+  VehicleBusChannelType channel_type = 2;
+  // 通道名（config/vehiclebus.json 中登记的通道）。
+  string channel = 3;
+  // 帧 ID（CAN 为 11/29 位仲裁 ID；LIN 为帧 ID）。
+  uint32 frame_id = 4;
+  // 原始负载字节，不含DLC/PID/校验和。CAN FD只接受合法长度，不自动补零。
+  bytes data = 5;
+  // 请求关联的 execution 或步骤。
+  string execution_id = 6;
+  bool extended = 7; // CAN扩展29位ID；false为标准11位；LIN必须false。
+  bool fd = 8; // CAN FD；false为经典CAN；LIN必须false。
+  bool brs = 9; // 位速率切换，仅fd=true允许。
+}
+
+// 总线帧应答；主题 QFRAMEWORK_VEHICLEBUS_SEND_RESPONSE。
+message VehicleBusSendResponse {
+  // 原样返回 VehicleBusSendRequest.request_id。
+  bytes request_id = 1;
+  // 是否成功发送。
+  bool success = 2;
+  // 错误分类。
+  VehicleBusErrorCode error_code = 3;
+  // 可读错误说明。
+  string error_message = 4;
+}
+
+// 总线信号等待请求；主题 QFRAMEWORK_VEHICLEBUS_SIGNAL_REQUEST。
+// ExecuteStep 在 expect_signal 步骤时发送；VehicleBus 轮询或订阅总线帧，直到
+// 指定信号值等于期望、或超时。
+message VehicleBusSignalRequest {
+  // 调用方生成的关联 ID。
+  bytes request_id = 1;
+  // UNKNOWN允许服务按channel配置解析；显式类型与配置不一致时拒绝。
+  VehicleBusChannelType channel_type = 2;
+  // 通道名。
+  string channel = 3;
+  // 信号名（DBC/LDF 中定义的信号）。
+  string signal_name = 4;
+  // 期望值；bool/int/float/string 按 kind 解释。
+  string expected_value = 5;
+  // 信号值类型。
+  VehicleBusSignalKind signal_kind = 6;
+  // 等待超时（毫秒）。
+  int64 timeout_ms = 7;
+  // 请求关联的 execution 或步骤。
+  string execution_id = 8;
+}
+
+// 总线信号等待应答；主题 QFRAMEWORK_VEHICLEBUS_SIGNAL_RESPONSE。
+message VehicleBusSignalResponse {
+  // 原样返回 VehicleBusSignalRequest.request_id。
+  bytes request_id = 1;
+  // 监听流程是否正常结束（包括正常到期未命中）。旧版success=命中的解释不再用于新服务。
+  bool success = 2;
+  // 最后实际读到的值；没有样本时为空串，未命中也可有值。
+  string actual_value = 3;
+  // 错误分类。
+  VehicleBusErrorCode error_code = 4;
+  // 可读错误说明。
+  string error_message = 5;
+  // 等待耗时（毫秒）。
+  int64 elapsed_ms = 6;
+  bool matched = 7; // success=true时解释；正常到期为false且error_code=UNSPECIFIED。
+}
+
+// 总线运行时状态；主题 QFRAMEWORK_VEHICLEBUS_STATE_EVENT。
+// 广播给 ExecuteStep 的观察支路；不重放，执行器不以它做门禁。
+message VehicleBusRuntimeStatus {
+  // 通道名（config/vehiclebus.json 登记）。
+  string channel = 1;
+  // 通道类型。
+  VehicleBusChannelType channel_type = 2;
+  // 通道是否已打开。
+  bool open = 3;
+  // 最近一次错误；空串表示无。
+  string error_message = 4;
+}
+
+// ExecuteStep与两个现有UI的操作互斥；属于待实现契约，不表示已接入。
+enum ExecutionControlAction {
+  EXECUTION_CONTROL_ACTION_UNSPECIFIED = 0;
+  EXECUTION_CONTROL_ACTION_ACQUIRE = 1;
+  EXECUTION_CONTROL_ACTION_RELEASE = 2;
+}
+// QFRAMEWORK_EXECUTION_CONTROL_REQUEST，dst分别为ImageShow/ADBShow。
+// 同execution重复ACQUIRE幂等；有手动工作时拒绝，不抢占。RELEASE按owner幂等，
+// 参与方记录本运行期已释放ID，禁止迟到ACQUIRE复活；超时调用方也必须向两方释放。
+message ExecutionControlRequest {
+  bytes request_id = 1; // 调用方生成的请求 ID；参与方的响应必须原样回填以便配对。
+  string execution_id = 2; // 目标执行 ID；必须对应一个正在运行的 execution，幂等判定按它进行。
+  ExecutionControlAction action = 3; // 申请（ACQUIRE）还是释放（RELEASE）界面控制权。
+}
+// QFRAMEWORK_EXECUTION_CONTROL_RESPONSE，dst=ExecuteStep；按Msg.src识别参与方。
+message ExecutionControlResponse {
+  bytes request_id = 1; // 原样回填请求的 request_id；调用方据此把响应配回等待项。
+  string execution_id = 2; // 原样回填请求的 execution_id。
+  ExecutionControlAction action = 3; // 本响应答复的动作，与请求一致。
+  bool success = 4; // ACQUIRE已关闭入口；RELEASE已解除对应锁。
+  string error_code = 5; // EXECUTION_BUSY或INVALID_PARAMETER等；成功为空。
+  string error_message = 6; // 失败的可读中文说明；成功时为空串。
+}

@@ -1,3 +1,8 @@
+// 【阅读导引】把 INI 配置翻译成程序能使用的结构体。
+// 阅读顺序：先读 load：解析模块清单，再解析消息容量、进程时限、布局和日志；resolvePath 把相对路径固定到配置文件目录。
+// 需要分清：配置是启动时的快照；模块是否存在、是否成功启动由运行时处理，配置读取成功不等于插件已可用。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：读取和校验 QFramework 的本地配置文件，并生成模块/进程运行配置。
 // 配置对象是值类型，解析过程不创建 UI、QProcess 或数据库连接；调用方在 GUI/框架线程
 // 取得副本后再把具体工作交给对应 Worker。错误通过返回值和 QString 输出，不抛出异常。
@@ -31,6 +36,10 @@ int positiveValue(const QVariant& value, int defaultValue)
 
 // 完整读取一份 INI 快照。成功时所有分组均已完成解析；失败时返回 false 并
 // 通过可选 errorMessage 告诉调用方具体字段，运行期不会使用半成品配置。
+/// @brief 读取并校验整份 INI 配置，生成模块、消息总线、进程、布局、样式和日志配置。
+/// @param iniFilePath 待加载的 INI 文件路径。
+/// @param errorMessage 可选的失败原因输出参数，可为空。
+/// @return 全部必需字段合法时返回 true；文件缺失或字段无效时返回 false。
 bool FrameworkConfig::load(const QString& iniFilePath, QString* errorMessage)
 {
     // 先验证真实文件，避免 QSettings 对不存在路径静默创建空配置的行为。
@@ -51,6 +60,7 @@ bool FrameworkConfig::load(const QString& iniFilePath, QString* errorMessage)
         return false;
     }
 
+    iniFilePath_ = fileInfo.absoluteFilePath();
     configDirectory_ = fileInfo.absoluteDir().absolutePath();
     modules_.clear();
 
@@ -185,16 +195,40 @@ bool FrameworkConfig::load(const QString& iniFilePath, QString* errorMessage)
     return true;
 }
 
+// 以下 getter 都返回值对象而不是可写引用，保证配置快照不会被外部偷偷修改。
+// iniFilePath 是实际加载文件的绝对路径。
+/// @brief 返回实际加载的 INI 文件绝对路径。
+/// @return 加载时的配置文件绝对路径；未加载时为空字符串。
+QString FrameworkConfig::iniFilePath() const { return iniFilePath_; }
+// configDirectory 是解析其他相对路径的基准目录。
+/// @brief 返回解析相对路径时使用的配置目录。
+/// @return 配置文件所在目录的绝对路径；未加载时为空字符串。
+QString FrameworkConfig::configDirectory() const { return configDirectory_; }
 // modules 保留 [Modules]/Names 中声明的顺序。
+/// @brief 返回按配置声明顺序排列的模块列表副本。
+/// @return 模块配置副本列表；未加载时为空。
 QVector<ModuleConfig> FrameworkConfig::modules() const { return modules_; }
 // 三类配置 getter 返回各自完整结构副本。
+/// @brief 返回消息总线配置副本。
+/// @return 全局默认容量、载荷上限、默认策略与各主题覆盖项。
 MessageBusConfig FrameworkConfig::messageBus() const { return messageBus_; }
+/// @brief 返回子进程监督配置副本。
+/// @return 注册、心跳、停止与重启相关的时限参数。
 ProcessConfig FrameworkConfig::process() const { return process_; }
+/// @brief 返回布局预设配置副本。
+/// @return 按编号排列的布局预设列表。
 LayoutConfig FrameworkConfig::layout() const { return layout_; }
+/// @brief 返回全局样式配置副本。
+/// @return 包含 QSS 文件路径的样式配置。
 StyleConfig FrameworkConfig::style() const { return style_; }
+/// @brief 返回日志配置副本。
+/// @return 日志目录、单文件上限与刷新周期。
 LoggingConfig FrameworkConfig::logging() const { return logging_; }
 
 // 统一把配置路径转换成干净路径；相对值永远以 INI 目录而非进程 cwd 为基准。
+/// @brief 把配置中的路径规范化为绝对干净路径，相对值以 INI 目录为基准。
+/// @param path 配置中读出的原始路径，允许为空。
+/// @return 规范化后的绝对路径；输入为空时返回空字符串。
 QString FrameworkConfig::resolvePath(const QString& path) const
 {
     // 空路径代表“未配置可选文件”，不是当前目录。
@@ -207,6 +241,10 @@ QString FrameworkConfig::resolvePath(const QString& path) const
 }
 
 // 把 INI 中的稳定模块类型文本写入 type；输出指针为空或文本未知时失败。
+/// @brief 把配置文本解析为 ModuleType 枚举，大小写敏感。
+/// @param value INI 中的类型文本。
+/// @param type 解析结果的输出参数，可为空表示仅校验。
+/// @return 文本匹配已知类型且输出指针有效时返回 true，否则返回 false。
 bool FrameworkConfig::parseModuleType(const QString& value, ModuleType* type)
 {
     // ModuleType 采用大小写敏感的稳定配置值，及时暴露拼写错误。
@@ -221,6 +259,10 @@ bool FrameworkConfig::parseModuleType(const QString& value, ModuleType* type)
 }
 
 // 把策略文本转换为 Reliable/Latest；允许大小写差异但不接受第三种隐含策略。
+/// @brief 把配置文本解析为 QueuePolicy 枚举，允许大小写差异。
+/// @param value INI 中的策略文本。
+/// @param policy 解析结果的输出参数，可为空表示仅校验。
+/// @return 文本为 Reliable 或 Latest 且输出指针有效时返回 true，否则返回 false。
 bool FrameworkConfig::parseQueuePolicy(const QString& value, QueuePolicy* policy)
 {
     // 队列策略允许大小写差异，但只接受 Reliable 和 Latest 两个值。

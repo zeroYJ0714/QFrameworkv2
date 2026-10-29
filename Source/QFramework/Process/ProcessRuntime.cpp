@@ -1,3 +1,8 @@
+// 【阅读导引】独立 EXE 中与主程序通信的一端。
+// 阅读顺序：run/execute 启动事件循环；连接后注册身份；handleFrame 处理控制和业务消息；发送队列统一进入 sendFrame。
+// 需要分清：所有 Socket 操作留在运行时线程。发送 ACK 用于运输层确认，不代表业务动作完成；断线、退出、共享内存释放都要按同一生命周期处理。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：实现进程模块侧的运行时宿主、认证握手、心跳和父子进程消息转发。
 // QLocalSocket、共享内存和进程端 QTimer 只在该运行时线程使用；本类不拥有父进程的
 // Supervisor，只借用连接并在断开/超时/停止时关闭自己的入口，所有消息按协议保留原始字节。
@@ -26,6 +31,7 @@
 #endif
 
 #include "ProcessProtocol.h"
+#include "../Ui/DialogStyle.h"
 
 // 子进程运行时的数据流：命令行参数 -> register -> 模块生命周期；
 // 父到子消息进入 MessageQueue，子到父 publish 进入 PublishQueue。
@@ -359,15 +365,17 @@ public:
     // 收到 ACK 后释放对应主题在途槽位，并唤醒可能等待发送的队列。
     /// @brief 收到 ACK 后释放对应主题的在途槽位。
     /// @param messageId 被确认的消息 ID。
+    /// @param acceptedValue 父进程是否接受，仅用于上层统计。
     /// @return 命中仍登记在途的消息返回 true；重复或迟到 ACK 返回 false。
-    bool acknowledge(const QString& messageId)
+    bool acknowledge(const QString& messageId, bool acceptedValue)
     {
         QMutexLocker locker(&mutex_); ///< 保护反向索引与在途表的互斥锁。
         const QString topic = messageTopics_.take(messageId); ///< 该消息的主题，取走后不再重复计数。
         if (topic.isEmpty())
             return false;
-        // 无论接受或拒绝，
+        // acceptedValue 只用于上层统计“父进程拒绝了多少条”；无论结果如何，
         // ACK 都代表这条在途消息已经有最终结果，必须释放一个槽位并唤醒排空。
+        Q_UNUSED(acceptedValue)
         const int count = inFlightByTopic_.value(topic, 0); ///< 该主题当前的在途条数。
         if (count <= 1)
             inFlightByTopic_.remove(topic);
@@ -628,6 +636,10 @@ private:
 };
 
 // 构造运行时并连接 Socket 信号；此时尚未连接父进程，也不会调用模块回调。
+/// @brief 构造子进程运行时，创建队列和 Socket 并连接信号，但尚未连接父进程。
+/// @param application 所属应用对象，同时作为本运行时的父对象。
+/// @param module 模块端点，由运行时借用并负责生命周期。
+/// @return 无（构造函数不返回值）。
 ProcessRuntime::ProcessRuntime(QCoreApplication* application, ModuleEndpoint* module)
     : QObject(application),
       application_(application),
@@ -650,6 +662,9 @@ ProcessRuntime::ProcessRuntime(QCoreApplication* application, ModuleEndpoint* mo
       unsafeMessageThread_(false),
       exitCode_(0),
       publishRejectedCount_(0),
+      publishDroppedCount_(0),
+      publishLocalRejectedCount_(0),
+      publishAbandonedCount_(0),
       lastPublishRejectWarningMs_(0)
 {
     connect(socket_, &QLocalSocket::connected,
@@ -664,12 +679,18 @@ ProcessRuntime::ProcessRuntime(QCoreApplication* application, ModuleEndpoint* mo
             &ProcessRuntime::onSocketError);
 }
 
+/// @brief 断言当前线程就是 Socket 所属线程，仅用于调试期发现跨线程访问。
+/// @return 无；断言失败会中止程序。
 void ProcessRuntime::assertSocketThread() const
 {
     Q_ASSERT(QThread::currentThread() == thread());
     Q_ASSERT(socket_ == nullptr || socket_->thread() == QThread::currentThread());
 }
 
+/// @brief 停止发布队列并按需向父进程上报一条队列统计日志。
+/// @param reason 统计日志中标注的停止原因，可为空。
+/// @param report 是否在存在丢弃/拒绝时向父进程发送日志帧。
+/// @return 发送成功或无需发送返回 true；上报失败返回 false。
 bool ProcessRuntime::stopPublishQueue(const QString& reason, bool report)
 {
     PublishQueue::Stats stats; ///< 停止后发布队列的累计统计。
@@ -679,6 +700,9 @@ bool ProcessRuntime::stopPublishQueue(const QString& reason, bool report)
             return true;
         stats = publishQueue_->stop();
     }
+    publishDroppedCount_ = stats.dropped;
+    publishLocalRejectedCount_ = stats.rejected;
+    publishAbandonedCount_ = stats.abandoned;
     if (!report || (stats.dropped == 0 && stats.rejected == 0 &&
                     stats.abandoned == 0 && publishRejectedCount_ == 0)) {
         return true;
@@ -733,10 +757,15 @@ ProcessRuntime::~ProcessRuntime()
 }
 
 // 对外唯一入口：安全停止时正常析构；卡死回调时泄漏到进程退出，避免删除活线程。
+/// @brief 子进程入口：创建运行时、跑完事件循环并按能否安全退出决定是否析构。
+/// @param application 所属应用对象。
+/// @param module 模块端点，成功后由运行时接管所有权。
+/// @return 进程退出码；参数无效为 2，无法安全退出时返回 7 或原退出码。
 int ProcessRuntime::run(QCoreApplication* application, ModuleEndpoint* module)
 {
     if (application == nullptr || module == nullptr)
         return 2;
+    installDialogStyle(qobject_cast<QApplication*>(application));
     ProcessRuntime* runtime = new ProcessRuntime(application, module); ///< 本次运行使用的运行时实例。
     const int result = runtime->execute(); ///< 事件循环结束后的内部退出码。
     if (!runtime->prepareForExit()) {
@@ -750,6 +779,8 @@ int ProcessRuntime::run(QCoreApplication* application, ModuleEndpoint* module)
 }
 
 // 参数有效后连接父进程并进入现有 Qt 事件循环，最终返回内部退出码。
+/// @brief 解析命令行参数、连接父进程并进入 Qt 事件循环。
+/// @return 进程退出码；参数无效时为 2。
 int ProcessRuntime::execute()
 {
     if (!parseArguments())
@@ -760,6 +791,8 @@ int ProcessRuntime::execute()
 }
 
 // 读取监督器注入的内部参数，校验模块类型，并把 ModuleEndpoint 绑定到 RuntimeHost。
+/// @brief 读取监督器注入的命令行参数、校验模块类型并绑定宿主适配器。
+/// @return 必需参数缺失或模块类型与界面类型不匹配时返回 false。
 bool ProcessRuntime::parseArguments()
 {
     arguments_ = application_->arguments();
@@ -793,12 +826,18 @@ bool ProcessRuntime::parseArguments()
 }
 
 // 仅用于无值开关，例如 --qframework-wait-for-debugger。
+/// @brief 判断命令行中是否存在指定开关。
+/// @param name 开关名，含前导的 --。
+/// @return 存在返回 true，否则返回 false。
 bool ProcessRuntime::hasArgument(const QString& name) const
 {
     return arguments_.contains(name);
 }
 
 // 返回命令行开关后的一个值；缺失或位于末尾都返回空字符串。
+/// @brief 读取命令行开关紧跟的一个取值。
+/// @param name 开关名，含前导的 --。
+/// @return 开关后的取值；开关缺失或位于末尾时返回空字符串。
 QString ProcessRuntime::argumentValue(const QString& name) const
 {
     const int index = arguments_.indexOf(name); ///< 开关在参数列表中的位置。
@@ -808,6 +847,9 @@ QString ProcessRuntime::argumentValue(const QString& name) const
 }
 
 // 查询主题专用规则，不存在时构造默认规则，并保证容量/大小至少为 1。
+/// @brief 查询指定主题的队列规则，未配置时回退默认值并做下限保护。
+/// @param topic 主题名。
+/// @return 该主题最终生效的容量、大小上限和策略。
 ProcessRuntime::TopicSettings ProcessRuntime::topicConfig(const QString& topic) const
 {
     TopicSettings result = topicConfigs_.value(topic); ///< 主题规则，未配置时使用默认值填充。
@@ -822,6 +864,9 @@ ProcessRuntime::TopicSettings ProcessRuntime::topicConfig(const QString& topic) 
 }
 
 // 把 registerAck 中的 JSON 队列规则转换为强类型 TopicSettings 快照。
+/// @brief 解析 registerAck 中的 JSON 队列规则并转换为本地强类型快照。
+/// @param frame 父进程下发的 registerAck 帧。
+/// @return 解析成功返回 true；策略名非法或条目字段缺失返回 false。
 bool ProcessRuntime::parseTopicConfigs(const QJsonObject& frame)
 {
     // registerAck 携带的是父进程的最终配置。子进程把它解析成自己的快照，
@@ -878,6 +923,8 @@ bool ProcessRuntime::parseTopicConfigs(const QJsonObject& frame)
 }
 
 // Socket 建立后首先发送身份、随机令牌以及发布/订阅主题声明。
+/// @brief Socket 连接建立后发送注册帧，声明身份、令牌和发布订阅主题。
+/// @return 无；发送失败时按协议错误结束子进程。
 void ProcessRuntime::onSocketConnected()
 {
     assertSocketThread();
@@ -901,6 +948,8 @@ void ProcessRuntime::onSocketConnected()
 }
 
 // 累积任意长度的 Socket 数据，循环取出所有完整帧；半帧留到下一次 readyRead。
+/// @brief 读取 Socket 数据并循环取出全部完整帧，半帧留待下次读取。
+/// @return 无；帧非法或停止过程中会提前返回。
 void ProcessRuntime::onSocketReadyRead()
 {
     assertSocketThread();
@@ -927,6 +976,8 @@ void ProcessRuntime::onSocketReadyRead()
 }
 
 // 非正常停止期间断线视为运行故障，使用专用退出码结束子进程。
+/// @brief 处理 Socket 断开：非停止阶段的断线按运行故障结束子进程。
+/// @return 无。
 void ProcessRuntime::onSocketDisconnected()
 {
     assertSocketThread();
@@ -935,6 +986,9 @@ void ProcessRuntime::onSocketDisconnected()
 }
 
 // 注册前的连接错误无法恢复；注册后的断线会由 disconnected 路径处理。
+/// @brief 处理 Socket 错误：注册确认前的错误直接按连接失败结束。
+/// @param error Socket 错误码，本实现只区分阶段，不细分错误类型。
+/// @return 无。
 void ProcessRuntime::onSocketError(QLocalSocket::LocalSocketError error)
 {
     assertSocketThread();
@@ -944,6 +998,9 @@ void ProcessRuntime::onSocketError(QLocalSocket::LocalSocketError error)
 }
 
 // 统一分派注册、心跳、样式、窗口、停止、ACK 和业务消息控制帧。
+/// @brief 按 type 字段统一分派注册、心跳、样式、窗口、停止、ACK 和业务消息帧。
+/// @param frame 已解析完成的协议帧。
+/// @return 无。
 void ProcessRuntime::handleFrame(const QJsonObject& frame)
 {
     const QString type = frame.value(QStringLiteral("type")).toString(); ///< 帧类型，决定分派分支。
@@ -1200,6 +1257,8 @@ void ProcessRuntime::handleFrame(const QJsonObject& frame)
 }
 
 // 从子到父发送队列取有限批次，并按大小选择 inline 或 shared 传输。
+/// @brief 从发布队列取有限批次，按大小选择 inline 或 shared 传输并写入 Socket。
+/// @return 无。
 void ProcessRuntime::drainPublishQueue()
 {
     assertSocketThread();
@@ -1279,6 +1338,10 @@ void ProcessRuntime::drainPublishQueue()
 }
 
 // 在运行时 Qt 线程中把模块日志编码成控制帧，避免跨线程直接使用 Socket。
+/// @brief 在运行时线程把模块日志编码为日志帧并发送。
+/// @param level 日志级别的整数取值。
+/// @param text 日志正文。
+/// @return 无；发送失败时按传输故障结束子进程。
 void ProcessRuntime::onSendLog(int level, const QString& text)
 {
     assertSocketThread();
@@ -1291,6 +1354,10 @@ void ProcessRuntime::onSendLog(int level, const QString& text)
 }
 
 // ModuleHost 的发布入口：业务线程只进入受锁保护的本地有界队列。
+/// @brief 模块发布入口：在锁保护下把载荷放入本地有界发布队列。
+/// @param topic 目标主题。
+/// @param payload 不可变消息载荷。
+/// @return 本地队列已收下返回 true；队列已停止或超限返回 false。
 bool ProcessRuntime::queuePublish(const QString& topic, const MessagePayload& payload)
 {
     bool logWarning = false; ///< 本次是否需要记录一条限流告警。
@@ -1317,6 +1384,10 @@ bool ProcessRuntime::queuePublish(const QString& topic, const MessagePayload& pa
 }
 
 // 日志体较小，使用 queued 调用切回 socket_ 所属线程发送。
+/// @brief 通过 queued 调用把日志切回 Socket 所属线程后发送。
+/// @param level 日志级别。
+/// @param text 日志正文。
+/// @return 无。
 void ProcessRuntime::queueLog(LogLevel level, const QString& text)
 {
     QMetaObject::invokeMethod(
@@ -1328,6 +1399,9 @@ void ProcessRuntime::queueLog(LogLevel level, const QString& text)
 }
 
 // 所有控制帧最终经过同一个编码函数写入 QLocalSocket。
+/// @brief 把控制帧编码为长度前缀帧后写入 Socket。
+/// @param frame 待发送的协议帧。
+/// @return 整帧写入成功返回 true；未连接或只写入部分字节返回 false。
 bool ProcessRuntime::sendFrame(const QJsonObject& frame)
 {
     assertSocketThread();
@@ -1338,6 +1412,10 @@ bool ProcessRuntime::sendFrame(const QJsonObject& frame)
 }
 
 // 向父进程确认“父到子消息是否进入本地输入队列”。
+/// @brief 向父进程回复父到子消息的投递确认。
+/// @param messageId 待确认的消息 ID。
+/// @param accepted 消息是否已进入本地输入队列。
+/// @return 发送成功或无需发送返回 true；发送失败返回 false。
 bool ProcessRuntime::sendDeliveryAck(const QString& messageId, bool accepted)
 {
     if (messageId.isEmpty())
@@ -1351,6 +1429,9 @@ bool ProcessRuntime::sendDeliveryAck(const QString& messageId, bool accepted)
 }
 
 // 处理“子到父消息”的最终结果，并回收在途计数和共享内存。
+/// @brief 处理 publishAck/sharedAck：回收在途计数与共享段并按需告警。
+/// @param frame 父进程返回的确认帧。
+/// @return 无。
 void ProcessRuntime::handlePublishAck(const QJsonObject& frame)
 {
     const QString messageId = frame.value(QStringLiteral("messageId")).toString(); ///< 被确认的消息 ID。
@@ -1359,7 +1440,7 @@ void ProcessRuntime::handlePublishAck(const QJsonObject& frame)
     const bool accepted = frame.value(QStringLiteral("type")).toString() == kSharedAck
         ? true
         : frame.value(QStringLiteral("accepted")).toBool(); ///< 父进程是否接受该消息。
-    const bool known = publishQueue_->acknowledge(messageId); ///< 该 ACK 是否命中仍登记在途的消息。
+    const bool known = publishQueue_->acknowledge(messageId, accepted); ///< 该 ACK 是否命中仍登记在途的消息。
     // 无论父进程接受还是拒绝，ACK 都是共享段生命周期的结束信号。
     // known=false 通常表示重复/迟到 ACK，此时不会再次减少计数。
     QSharedMemory* shared = outgoingSharedSegments_.take(messageId); ///< 该消息关联的共享段，可能不存在。
@@ -1384,6 +1465,9 @@ void ProcessRuntime::handlePublishAck(const QJsonObject& frame)
 }
 
 // 记录退出原因、停止新发布并请求 Qt 事件循环退出；实际资源由析构回收。
+/// @brief 记录退出码、停止发布入口并请求 Qt 事件循环退出。
+/// @param exitCode 子进程最终退出码。
+/// @return 无。
 void ProcessRuntime::finish(int exitCode)
 {
     // finish 可能由断线、坏帧或正常 stop 触发；统一关闭 publish 队列，
@@ -1398,6 +1482,8 @@ void ProcessRuntime::finish(int exitCode)
         application_->quit();
 }
 
+/// @brief 退出前尝试有界收尾，判断是否可以安全销毁运行时对象。
+/// @return 消息线程已安全结束返回 true；回调卡死需由进程退出兜底时返回 false。
 bool ProcessRuntime::prepareForExit()
 {
     stopPublishQueue(QString(), false);
@@ -1418,6 +1504,8 @@ bool ProcessRuntime::prepareForExit()
 }
 
 // 清理断线/停止时仍未收到 ACK 的所有子进程所有共享段。
+/// @brief 释放所有尚未收到 ACK 的共享内存段。
+/// @return 无。
 void ProcessRuntime::clearSharedSegments()
 {
     const QList<QSharedMemory*> segments = outgoingSharedSegments_.values(); ///< 待释放的共享段列表。

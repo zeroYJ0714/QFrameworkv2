@@ -1,3 +1,8 @@
+// 【阅读导引】协调主窗口、模块菜单和 Dock。
+// 阅读顺序：createModuleDocks 建容器，attachInProcessUiModules 放入插件界面；setRequestedDockVisible 记录意图，applyRequestedDockVisibility 计算实际显示。
+// 需要分清：框架只调用通用端点，不直接依赖 ImageShow 等业务类型。菜单隐藏/关闭会询问 canClose；布局切换和窗口临时隐藏不是插件业务关闭。
+// 这是声明/类型入口：先看 public 接口和字段注释；复杂执行过程再到同名 .cpp 或指定实现文件阅读。
+
 #pragma once
 
 // 文件职责：声明主窗口的 UI 协调层。
@@ -196,9 +201,15 @@ private slots:
     /// @return 无；拿不到原生 QWindow 时直接返回。
     void startWindowMove(const QPoint& globalPosition,
                          const QPoint& titleBarPosition);
+    /// @brief 响应标题栏最小化按钮，把窗口最小化到任务栏。
+    /// @return 无。
+    void minimizeWindow();
     /// @brief 响应标题栏最大化/还原按钮，在最大化与普通窗口状态之间切换。
     /// @return 无。
     void toggleMaximizedState();
+    /// @brief 响应标题栏关闭按钮，走 QWidget::close 进入正常 closeEvent 与退出清理链路。
+    /// @return 无；本次关闭被 closeEvent 拒绝时窗口保持打开。
+    void closeWindow();
 
 protected:
     /// @brief 拦截窗口关闭：首次关闭先让插件保存草稿并启动轮询，就绪后按配置顺序询问各 UI 模块 canClose，全部通过才真正关闭。

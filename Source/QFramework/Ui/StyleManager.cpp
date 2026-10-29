@@ -1,3 +1,8 @@
+// 【阅读导引】读取并应用 QSS 样式文件。
+// 阅读顺序：loadStyleSheet 读取并校验，再应用到 QApplication；reload 使用已记住的路径；信号把样式同步给子进程。
+// 需要分清：加载失败必须保留可诊断原因。样式改变外观，不改变模块数据；所有界面样式操作在 GUI 线程进行。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：加载并应用 QFramework 的 Qt 样式表、字体和高 DPI 相关界面设置。
 // StyleManager 只在 GUI 线程访问 QApplication/QWidget；它保存的是样式值和路径，不拥有
 // 插件窗口，也不在样式切换时触碰 MessageBus、ADB 或 SQLite。
@@ -136,12 +141,19 @@ void setError(QString* errorMessage, const QString& message)
 }
 
 // StyleManager 不持有 QApplication；只在真正加载时检查当前应用对象。
+/// @brief 构造样式管理器，此时尚未加载任何 QSS 文件。
+/// @param parent 所属 QObject，通常为 FrameworkRuntime。
+/// @return 无（构造函数不返回值）。
 StyleManager::StyleManager(QObject* parent)
     : QObject(parent)
 {
 }
 
 // 先读取和结构校验，再一次性应用 QSS；失败时保留上一份成功样式。
+/// @brief 读取并校验 QSS 文件，全部通过后一次性应用到 QApplication。
+/// @param filePath QSS 文件路径，必须是 .qss 扩展名。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 应用成功返回 true；读取、编码或结构校验失败返回 false。
 bool StyleManager::loadStyleSheet(const QString& filePath,
                                   QString* errorMessage)
 {
@@ -168,6 +180,9 @@ bool StyleManager::loadStyleSheet(const QString& filePath,
 }
 
 // 重新读取最近一次成功路径，适合开发阶段修改 QSS 后热加载。
+/// @brief 按最近一次成功加载的路径重新读取并应用样式，用于开发期热加载。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 重载成功返回 true；从未成功加载过或重新加载失败返回 false。
 bool StyleManager::reloadStyleSheet(QString* errorMessage)
 {
     // 未成功加载过任何文件时没有可重载目标。
@@ -179,6 +194,8 @@ bool StyleManager::reloadStyleSheet(QString* errorMessage)
 }
 
 // 返回当前成功样式的绝对路径副本。
+/// @brief 查询当前生效样式的绝对文件路径。
+/// @return 路径副本；尚未成功加载时返回空字符串。
 QString StyleManager::currentFilePath() const
 {
     // 返回值副本，调用方修改它不会改变内部状态。
@@ -186,12 +203,19 @@ QString StyleManager::currentFilePath() const
 }
 
 // 返回当前成功样式文本副本，调用方可以安全修改返回值。
+/// @brief 查询当前生效的样式表文本。
+/// @return 样式文本副本；尚未成功加载时返回空字符串。
 QString StyleManager::currentStyleSheet() const
 {
     return currentStyleSheet_;
 }
 
 // 读取文件、限制大小、验证 UTF-8 和括号结构；不修改 QApplication 或成员快照。
+/// @brief 读取 QSS 文件并完成扩展名、大小、UTF-8 编码和结构校验。
+/// @param filePath 待读取的 QSS 文件路径。
+/// @param styleSheet 输出参数，校验全部通过时写入文件内容。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 全部校验通过返回 true，任一环节失败返回 false。
 bool StyleManager::readStyleSheet(const QString& filePath,
                                   QString* styleSheet,
                                   QString* errorMessage) const
@@ -234,6 +258,9 @@ bool StyleManager::readStyleSheet(const QString& filePath,
 }
 
 // 用状态机检查引号、注释和大括号是否闭合，拦截常见的半写入 QSS 文件。
+/// @brief 用轻量状态机检查 QSS 文本的引号、注释和大括号是否闭合。
+/// @param styleSheet 待校验的样式文本。
+/// @return 结构完整返回 true；存在未闭合的引号、注释或大括号返回 false。
 bool StyleManager::isStructurallyValid(const QString& styleSheet) const
 {
     // 轻量扫描器只检查括号、单双引号和 /* */ 注释是否闭合；

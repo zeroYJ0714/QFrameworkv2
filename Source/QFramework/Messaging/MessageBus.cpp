@@ -1,3 +1,8 @@
+// 【阅读导引】按主题把消息投递给订阅模块。
+// 阅读顺序：registerModule 登记端点和主题；publishFromModule/publishSharedFromModule 检查发布资格；ModuleQueue 串行回调订阅者。
+// 需要分清：Reliable 满时拒绝新消息；Latest 可以淘汰同主题旧等待项。publish 的 true 是准入结果，不是业务执行成功；停止超时的端点不能立即释放。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：实现进程内消息总线的注册、路由、容量控制和有界停止。
 // publish() 在发布线程只做轻量校验并把不可变 QByteArray/共享载荷放入订阅者队列；
 // 每个订阅模块有自己的投递线程和停止状态。Latest 只替换同主题最旧项，Reliable 满时拒绝新项，
@@ -237,6 +242,9 @@ struct MessageBus::Registration
 };
 
 // 保存配置快照；初始允许注册/发布，但消息投递保持暂停直到框架统一放行。
+/// @brief 构造消息总线，保存配置并处于“可注册但暂停投递”的初始状态。
+/// @param config 消息总线配置快照，含默认容量、载荷上限与停止预算。
+/// @return 无（构造函数不返回值）。
 MessageBus::MessageBus(const MessageBusConfig& config)
     : config_(config),
       accepting_(true),
@@ -260,6 +268,11 @@ MessageBus::~MessageBus()
 }
 
 // 校验模块 ID 与主题声明，创建专属 ModuleQueue，并把 ModuleEndpoint 绑定到总线。
+/// @brief 注册一个模块：冻结主题声明、创建专属队列并绑定端点。
+/// @param moduleId 全局唯一的模块 ID。
+/// @param endpoint 模块端点，不能为空。
+/// @param errorMessage 可选的失败原因输出参数，可为空。
+/// @return 注册成功返回 true；参数无效、主题声明非法或 ID 重复返回 false。
 bool MessageBus::registerModule(const QString& moduleId,
                                 ModuleEndpoint* endpoint,
                                 QString* errorMessage)
@@ -310,6 +323,10 @@ bool MessageBus::registerModule(const QString& moduleId,
 }
 
 // 同步 Registration 和 ModuleEndpoint 的发布开关；未知模块返回 false。
+/// @brief 设置模块的发布权限，并同步到端点。
+/// @param moduleId 目标模块 ID。
+/// @param running 是否允许发布；总线停止时一律视为不允许。
+/// @return 模块存在返回 true，未知模块返回 false。
 bool MessageBus::setModuleRunning(const QString& moduleId, bool running)
 {
     QMutexLocker locker(&mutex_);
@@ -323,6 +340,10 @@ bool MessageBus::setModuleRunning(const QString& moduleId, bool running)
 }
 
 // 单模块停止先关闭入口，不等待其消息线程；ProcessSupervisor 必须在发送 stop 前调用。
+/// @brief 关闭单个模块的发布入口与消息入口，但不等待其线程结束。
+/// @param moduleId 目标模块 ID。
+/// @param discardPendingMessages 为 true 时丢弃尚未消费的等待项。
+/// @return 模块存在返回 true，未知模块返回 false。
 bool MessageBus::beginModuleStop(const QString& moduleId, bool discardPendingMessages)
 {
     QMutexLocker locker(&mutex_);
@@ -336,6 +357,9 @@ bool MessageBus::beginModuleStop(const QString& moduleId, bool discardPendingMes
 }
 
 // 一次性暂停或恢复所有模块消费者，主要用于确定性的启动阶段。
+/// @brief 统一暂停或恢复所有模块的消息消费。
+/// @param enabled true 表示放行消费，false 表示暂停。
+/// @return 无；队列内容保持不变。
 void MessageBus::setDeliveryEnabled(bool enabled)
 {
     QMutexLocker locker(&mutex_);
@@ -346,6 +370,8 @@ void MessageBus::setDeliveryEnabled(bool enabled)
 }
 
 // 全局关闭发布入口，并解除暂停以便在停止预算内消费已有消息。
+/// @brief 全局关闭发布入口，并解除暂停以排空已有消息。
+/// @return 无。
 void MessageBus::beginShutdown()
 {
     QMutexLocker locker(&mutex_);
@@ -360,6 +386,9 @@ void MessageBus::beginShutdown()
 }
 
 // 在一份总 deadline 内回收全部模块线程；超时队列留在注册表中 quarantine。
+/// @brief 在共享的总 deadline 内停止全部模块队列，并标记超时项为隔离。
+/// @param drainTimeoutMs 全局排空预算毫秒数。
+/// @return 停止结果报告，区分已停止与超时的模块 ID。
 MessageBusStopReport MessageBus::stopQueues(int drainTimeoutMs)
 {
     // 用一份总 deadline 分配给所有模块，先停止生产再尽量排空可靠消息；某一模块超时
@@ -397,6 +426,10 @@ MessageBusStopReport MessageBus::stopQueues(int drainTimeoutMs)
 }
 
 // 从路由表移除模块、停止专属线程、解绑宿主并释放 Registration。
+/// @brief 注销一个模块：停止其队列、解绑端点并释放注册记录。
+/// @param moduleId 目标模块 ID。
+/// @param drainPendingMessages 为 true 时先排空待处理消息再停止。
+/// @return 成功注销返回 true；模块不存在或线程超时（已隔离）返回 false。
 bool MessageBus::unregisterModule(const QString& moduleId, bool drainPendingMessages)
 {
     Registration* registration = nullptr; ///< 目标模块的注册记录。
@@ -432,6 +465,8 @@ bool MessageBus::unregisterModule(const QString& moduleId, bool drainPendingMess
 }
 
 // 返回当前注册 ID 快照，顺序由 QHash 决定，不表示配置启动顺序。
+/// @brief 返回当前已注册模块 ID 的快照。
+/// @return 模块 ID 列表，顺序由哈希决定，不代表启动顺序。
 QStringList MessageBus::moduleIds() const
 {
     QMutexLocker locker(&mutex_);
@@ -439,6 +474,9 @@ QStringList MessageBus::moduleIds() const
 }
 
 // 返回指定模块队列统计；未知模块返回全零默认结构。
+/// @brief 查询指定模块队列的投递统计。
+/// @param moduleId 目标模块 ID。
+/// @return 统计快照；未知模块返回全零默认值。
 ModuleQueueStats MessageBus::queueStats(const QString& moduleId) const
 {
     QMutexLocker locker(&mutex_);
@@ -446,6 +484,9 @@ ModuleQueueStats MessageBus::queueStats(const QString& moduleId) const
     return registration == nullptr ? ModuleQueueStats() : registration->queue->stats();
 }
 
+/// @brief 判断指定模块的消息队列是否已经停止。
+/// @param moduleId 目标模块 ID。
+/// @return 模块不存在或线程已结束返回 true，仍在运行返回 false。
 bool MessageBus::isModuleQueueStopped(const QString& moduleId) const
 {
     QMutexLocker locker(&mutex_);
@@ -453,6 +494,8 @@ bool MessageBus::isModuleQueueStopped(const QString& moduleId) const
     return registration == nullptr || !registration->queue->isRunning();
 }
 
+/// @brief 列出停止超时、仍在运行且需隔离保留的模块 ID。
+/// @return 已标记隔离且线程仍运行的模块 ID 列表。
 QStringList MessageBus::quarantinedModuleIds() const
 {
     QStringList result; ///< 隔离模块 ID 收集结果。
@@ -466,6 +509,11 @@ QStringList MessageBus::quarantinedModuleIds() const
 }
 
 // 执行发布权限、主题大小和订阅路由检查，再把值对象复制进各订阅者队列。
+/// @brief 发布一条字节数组消息，内部转换为共享载荷后走统一发布路径。
+/// @param moduleId 发布者模块 ID。
+/// @param topic 目标主题。
+/// @param data 待发送的字节内容。
+/// @return 全部订阅者都接受返回 true，否则返回 false。
 bool MessageBus::publishFromModule(const QString& moduleId,
                                    const QString& topic,
                                    const QByteArray& data)
@@ -475,6 +523,11 @@ bool MessageBus::publishFromModule(const QString& moduleId,
 }
 
 // 执行发布权限、主题大小和订阅路由检查，再共享同一个不可变载荷引用。
+/// @brief 发布一条共享载荷消息，向所有订阅者队列入队。
+/// @param moduleId 发布者模块 ID。
+/// @param topic 目标主题。
+/// @param payload 共享不可变载荷。
+/// @return 全部订阅者都接受返回 true，否则返回 false。
 bool MessageBus::publishSharedFromModule(const QString& moduleId,
                                          const QString& topic,
                                          const MessagePayload& payload)
@@ -523,6 +576,11 @@ bool MessageBus::publishSharedFromModule(const QString& moduleId,
 }
 
 // 模块日志不进入消息主题，直接交给集中 Logger，避免形成递归消息链。
+/// @brief 把模块日志直接转发给集中 Logger。
+/// @param level 日志级别。
+/// @param moduleId 记录来源模块 ID。
+/// @param text 日志文本。
+/// @return 无。
 void MessageBus::logFromModule(LogLevel level,
                                const QString& moduleId,
                                const QString& text)
@@ -531,6 +589,9 @@ void MessageBus::logFromModule(LogLevel level,
 }
 
 // 查询主题专用规则；未配置时把全局默认值组合成完整 TopicConfig。
+/// @brief 取指定主题的生效配置，缺失时用全局默认值补齐。
+/// @param topic 目标主题名。
+/// @return 该主题的容量、载荷上限与策略。
 TopicConfig MessageBus::topicConfig(const QString& topic) const
 {
     // 主题没有专用配置时复制全局默认值，调用方随后可安全调整本地副本。
@@ -544,6 +605,10 @@ TopicConfig MessageBus::topicConfig(const QString& topic) const
 }
 
 // 统一记录发布拒绝原因，保持调用点的错误文字和来源格式一致。
+/// @brief 记录一次发布拒绝，并对同一模块的重复原因做限频。
+/// @param moduleId 触发拒绝的模块 ID。
+/// @param reason 拒绝原因文本。
+/// @return 无；处于限频窗口内只累计次数不写日志。
 void MessageBus::logRejected(const QString& moduleId, const QString& reason) const
 {
     // 日志限频只针对 Warning 文本，不改变真正的 rejected 统计，也不改变 Reliable

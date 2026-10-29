@@ -1,3 +1,8 @@
+// 【阅读导引】防止同一目录重复启动程序。
+// 阅读顺序：acquire 先规范化程序目录并计算哈希，再用 Windows CreateMutexW 判断同一会话是否已经运行。
+// 需要分清：句柄不是业务互斥锁；持有它代表该目录已有实例。析构关闭句柄，不结束其他程序；不同部署目录互不阻塞。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：用程序目录哈希命名 Windows 互斥量，检查同目录是否已有实例。
 // 此实现没有 Socket 唤醒消息；析构仅关闭本进程持有的互斥量句柄。
 #include "SingleInstanceGuard.h"
@@ -15,6 +20,8 @@
 namespace qframework
 {
 // 新 Guard 尚未拥有 Win32 互斥量句柄。
+/// @brief 构造尚未持有 Win32 互斥量句柄的守卫对象。
+/// @return 无（构造函数不返回值）。
 SingleInstanceGuard::SingleInstanceGuard()
     : mutexHandle_(nullptr)
 {
@@ -33,6 +40,10 @@ SingleInstanceGuard::~SingleInstanceGuard()
 }
 
 // 用可执行目录的规范化哈希获取会话内命名互斥量，并区分已运行和系统错误。
+/// @brief 按程序目录哈希获取会话内命名互斥量，判定是否已有同目录实例。
+/// @param executableDirectory 程序所在目录，用于生成互斥量身份。
+/// @param errorMessage 可选的失败原因输出参数，可为空。
+/// @return Acquired 表示本进程持有互斥量，AlreadyRunning 表示已有实例，Error 表示系统调用失败。
 SingleInstanceResult SingleInstanceGuard::acquire(
     const QString& executableDirectory,
     QString* errorMessage)

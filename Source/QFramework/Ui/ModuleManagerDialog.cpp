@@ -1,3 +1,8 @@
+// 【阅读导引】显示模块状态并发送操作意图。
+// 阅读顺序：构造时按配置生成行；setModuleState 等函数更新显示；按钮只发出带模块 ID 的信号。
+// 需要分清：界面文字是展示，稳定 moduleId 才是定位依据。对话框不直接创建/结束进程，也不负责插件生命周期。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：显示模块启用状态、启动状态和错误信息，并把用户操作交给 FrameworkRuntime。
 // 对话框及其控件只在 GUI 线程使用；它不直接加载 DLL、执行 QProcess 或修改 MessageBus，
 // 所有权由调用方通过 parent 管理，关闭只结束对话框，不擅自停止正在运行的模块。
@@ -52,6 +57,10 @@ bool isProcessType(ModuleType type)
 }
 
 // 构造一次性表格和按钮；之后只接受状态/可用性更新，不重新创建行。
+/// @brief 按模块配置一次性建好表格行和操作按钮，之后只做状态刷新。
+/// @param modules 模块配置列表，决定行数和每行的类型。
+/// @param parent 父窗口，关闭对话框时由 Qt 负责释放。
+/// @return 无（构造函数不返回值）。
 ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
                                          QWidget* parent)
     : QDialog(parent),
@@ -175,6 +184,11 @@ ModuleManagerDialog::ModuleManagerDialog(const QVector<ModuleConfig>& modules,
 }
 
 // 按 moduleId 更新状态单元格和详细 tooltip，未知 ID 安全忽略。
+/// @brief 按模块 ID 更新状态单元格文本和悬停详情，并刷新重启按钮可用性。
+/// @param moduleId 目标模块的稳定标识。
+/// @param state 状态文本，与配置中的生命周期状态保持一致。
+/// @param detail 悬停时显示的详细原因，可为空。
+/// @return 无；未知 ID 安全忽略。
 void ModuleManagerDialog::setModuleState(const QString& moduleId,
                                          const QString& state,
                                          const QString& detail)
@@ -193,6 +207,10 @@ void ModuleManagerDialog::setModuleState(const QString& moduleId,
 }
 
 // 切换对应“显示”按钮；非 UI 模块没有按钮且无需处理。
+/// @brief 切换指定模块“显示界面”按钮的可用状态。
+/// @param moduleId 目标模块的稳定标识。
+/// @param available 界面是否已就绪，决定按钮是否可点击。
+/// @return 无；非 UI 模块没有按钮，直接忽略。
 void ModuleManagerDialog::setUiAvailable(const QString& moduleId, bool available)
 {
     // 非 UI 模块不在 showButtons_ 中，因此没有按钮可更新。
@@ -202,6 +220,10 @@ void ModuleManagerDialog::setUiAvailable(const QString& moduleId, bool available
 }
 
 // operationBusyChanged 与状态文本共同决定按钮；任一仍在进行都不能重复提交。
+/// @brief 记录指定模块是否有重启操作正在进行，并同步刷新按钮可用性。
+/// @param moduleId 目标模块的稳定标识。
+/// @param busy 是否正在执行重启操作。
+/// @return 无；该模块没有重启按钮时直接忽略。
 void ModuleManagerDialog::setRestartBusy(const QString& moduleId, bool busy)
 {
     if (!restartButtons_.contains(moduleId))
@@ -211,6 +233,8 @@ void ModuleManagerDialog::setRestartBusy(const QString& moduleId, bool busy)
 }
 
 // 从点击按钮的动态属性取出 moduleId，再发出纯请求信号。
+/// @brief 处理“显示界面”按钮点击，从按钮属性取出模块 ID 后发出请求信号。
+/// @return 无。
 void ModuleManagerDialog::onShowButtonClicked()
 {
     // sender 是实际点击的 QToolButton，动态属性保存其 moduleId。
@@ -220,6 +244,8 @@ void ModuleManagerDialog::onShowButtonClicked()
 }
 
 // 发出重启请求，不在表格槽中同步等待子进程，避免阻塞 UI。
+/// @brief 处理“重启子进程”按钮点击，取出模块 ID 后发出重启请求信号。
+/// @return 无。
 void ModuleManagerDialog::onRestartButtonClicked()
 {
     // 只发请求，不在对话框线程同步等待子进程停止/启动。
@@ -228,6 +254,9 @@ void ModuleManagerDialog::onRestartButtonClicked()
         emit restartModuleRequested(button->property("moduleId").toString());
 }
 
+/// @brief 综合配置启用状态、重启进行中和生命周期状态，刷新重启按钮可用性。
+/// @param moduleId 目标模块的稳定标识。
+/// @return 无；该模块没有重启按钮时直接返回。
 void ModuleManagerDialog::updateRestartButton(const QString& moduleId)
 {
     QToolButton* button = restartButtons_.value(moduleId, nullptr); ///< 对应的重启按钮，可能不存在。
@@ -243,6 +272,9 @@ void ModuleManagerDialog::updateRestartButton(const QString& moduleId)
 }
 
 // 把枚举转换成和 INI 相同的稳定文本，便于用户对照配置。
+/// @brief 把模块类型枚举转换为与 INI 配置一致的稳定文本。
+/// @param type 待转换的模块类型。
+/// @return 类型文本，如 InProcessUi；未知类型按 ProcessNonUi 处理。
 QString ModuleManagerDialog::moduleTypeText(ModuleType type) const
 {
     // 使用与 INI 相同的稳定类型文本，便于初学者对照配置。

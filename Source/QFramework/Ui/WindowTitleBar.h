@@ -1,6 +1,11 @@
+// 【阅读导引】为无边框窗口提供标题栏操作。
+// 阅读顺序：本控件产生最小化、最大化、关闭和拖动请求，由 MainWindow 完成实际窗口动作。
+// 需要分清：按钮图标必须跟随真实窗口状态更新；点击标题栏和点击子控件要区分，不能把菜单点击误判为拖动。
+// 这是声明/类型入口：先看 public 接口和字段注释；复杂执行过程再到同名 .cpp 或指定实现文件阅读。
+
 #pragma once
 
-// 文件职责：提供 QFramework 无边框主窗口的客户区标题栏。
+// 文件职责：提供 QFramework 无边框主窗口和弹窗的客户区标题栏。
 //
 // WindowTitleBar 只管理可见的 Qt 控件和用户操作信号：左侧是菜单栏，右侧是三个
 // 窗口按钮。它不直接操作 MainWindow 的 Dock、模块或进程，原因是这些
@@ -14,6 +19,8 @@
 class QMenuBar;
 class QMouseEvent;
 class QToolButton;
+class QLabel;
+class QEvent;
 
 namespace qframework
 {
@@ -28,14 +35,18 @@ public:
     /// @return 无（构造函数不返回值）。
     explicit WindowTitleBar(QWidget* parent = nullptr);
 
+    // 弹窗复用拖动和窗口按钮，但以标题文字替代主窗口的菜单。
+    void setDialogMode(Qt::WindowFlags originalFlags);
+    void setTitle(const QString& title);
+
     // MainWindow 把已经创建的 QAction 加到这个菜单栏，避免复制一套业务动作。
     /// @brief 返回内嵌菜单栏的借用指针；菜单项由 MainWindow 创建后挂载，标题栏只负责显示与布局。
     /// @return 本控件持有的 QMenuBar 指针，所有权属于标题栏，调用方只借用，不应 delete。
     QMenuBar* menuBar() const;
 
     // 判断标题栏某个 Qt 客户区坐标是否落在菜单或窗口按钮上。
-    // 鼠标处理用它避免把菜单或按钮操作识别为窗口拖动。
-    /// @brief 判断标题栏客户区坐标是否落在菜单栏或窗口按钮上，供标题栏鼠标处理保留交互控件的操作。
+    // MainWindow 的 Windows 命中测试用它区分 HTCLIENT 和 HTCAPTION。
+    /// @brief 判断标题栏客户区坐标是否落在菜单栏或窗口按钮上，供 Windows 命中测试决定该点算 HTCLIENT 还是 HTCAPTION。
     /// @param titleBarPoint 已换算到标题栏客户区的坐标，以本控件左上角为原点。
     /// @return 落在菜单栏或按钮上返回 true；落在空白区或本控件矩形之外返回 false，后者按可拖动标题栏处理。
     bool isInteractiveAt(const QPoint& titleBarPoint) const;
@@ -66,7 +77,20 @@ signals:
     /// @return 无。
     void closeRequested();
 
+private slots:
+    // 把 QToolButton::clicked 转换成无参数的业务请求信号，避免标题栏知道窗口实现。
+    /// @brief 最小化按钮的点击槽：不直接操作窗口，只转发 minimizeRequested 给 MainWindow。
+    /// @return 无。
+    void onMinimizeButtonClicked();
+    /// @brief 最大化按钮的点击槽：转发 maximizeRestoreRequested，由 MainWindow 决定是最大化还是还原。
+    /// @return 无。
+    void onMaximizeButtonClicked();
+    /// @brief 关闭按钮的点击槽：转发 closeRequested，不在这里销毁窗口，以免丢掉未保存内容。
+    /// @return 无。
+    void onCloseButtonClicked();
+
 protected:
+    void changeEvent(QEvent* event) override;
     // 菜单和按钮继续按普通 Qt 控件处理；只有标题栏空白区请求移动或双击切换状态。
     /// @brief 空白区按下左键时记录拖动起点（全局坐标与标题栏内坐标）；命中菜单或按钮则交回基类处理。
     /// @param event 鼠标按下事件；event 为空或按下的不是左键时直接交回基类。
@@ -100,5 +124,7 @@ private:
     QToolButton* minimizeButton_; ///< 最小化按钮，点击转发 minimizeRequested，图标固定。
     QToolButton* maximizeButton_; ///< 最大化/还原按钮，图标与提示由 updateWindowControlState() 按窗口状态切换。
     QToolButton* closeButton_; ///< 关闭按钮，点击转发 closeRequested，图标固定。
+    QLabel* titleLabel_ = nullptr;
+    bool dialogMode_ = false;
 };
 }

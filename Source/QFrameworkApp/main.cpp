@@ -1,3 +1,8 @@
+// 【阅读导引】程序真正开始执行的位置。
+// 阅读顺序：依次创建 QApplication、检查单实例、初始化 FrameworkRuntime、显示窗口，再进入 application.exec 事件循环。
+// 需要分清：exec 不是结束程序，而是等待事件并分发回调。离开事件循环后仍要 shutdown，确保线程和插件先收尾再销毁应用。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：创建 Qt 应用、初始化框架运行时并进入 GUI 事件循环。
 // QApplication 和所有顶层 QWidget 都属于主 GUI 线程；本文件不直接执行 SQLite、ADB
 // 或媒体解码。框架对象在事件循环开始前完成配置，退出时先按统一关闭门禁清理模块，
@@ -9,6 +14,7 @@
 
 #include "FrameworkRuntime.h"
 #include "SingleInstanceGuard.h"
+#include "../QFramework/Ui/DialogStyle.h"
 
 // 应用入口只负责组装 Qt 应用对象和 FrameworkRuntime。
 // 具体的配置、日志、插件、子进程和窗口生命周期都集中在 runtime 中，
@@ -21,6 +27,7 @@ int main(int argc, char* argv[])
 {
     // QApplication 必须先于任何 QWidget 和框架 UI 对象创建。
     QApplication application(argc, argv); ///< Qt 应用对象，持有 GUI 线程和全局事件分发。
+    qframework::installDialogStyle(&application);
     QCoreApplication::setApplicationName(QStringLiteral("QFrameworkApp")); ///< 应用名，影响配置目录与日志标识。
     QCoreApplication::setOrganizationName(QStringLiteral("QFramework")); ///< 组织名，影响 QSettings 等 Qt 全局路径。
 

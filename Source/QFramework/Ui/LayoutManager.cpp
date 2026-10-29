@@ -1,3 +1,8 @@
+// 【阅读导引】把窗口布局保存成可恢复文件。
+// 阅读顺序：saveLayout 写 Qt 几何/停靠状态和显示意图；loadLayout 先校验文件，再尝试恢复，失败时保持或回退原状态。
+// 需要分清：Qt 的二进制布局通过 Base64 放进 JSON。requestedVisible 是用户意图，不等于此刻屏幕上能看见；隐藏标签页也可能仍要求显示。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：保存和恢复主窗口 Dock/Tab 布局，并处理版本化布局键。
 // QSettings、QMainWindow 和 QDockWidget 只在 GUI 线程访问；布局管理器不拥有 Dock 或插件，
 // 恢复失败时保留 Qt 默认布局并返回错误，避免破坏用户当前窗口状态。
@@ -52,12 +57,19 @@ bool decodeBase64(const QString& encoded, QByteArray* decoded)
 }
 
 // 保存主窗口借用指针；Dock 映射在 MainWindow 创建/释放模块时维护。
+/// @brief 构造布局管理器，只保存主窗口借用指针，不接管任何 Dock 所有权。
+/// @param mainWindow 目标主窗口，生命周期必须长于本对象。
+/// @return 无（构造函数不返回值）。
 LayoutManager::LayoutManager(QMainWindow* mainWindow)
     : mainWindow_(mainWindow)
 {
 }
 
 // 注册一个可用于布局保存/恢复的模块 Dock 借用指针。
+/// @brief 登记模块 Dock 的借用指针，供布局保存和恢复时查找。
+/// @param moduleId 模块的稳定标识。
+/// @param dockWidget 对应的 Dock 指针，所有权仍属于主窗口。
+/// @return 无；ID 为空或指针为空时忽略。
 void LayoutManager::registerModuleDock(const QString& moduleId,
                                        QDockWidget* dockWidget)
 {
@@ -66,8 +78,23 @@ void LayoutManager::registerModuleDock(const QString& moduleId,
         moduleDocks_.insert(moduleId, dockWidget);
 }
 
+// 仅删除映射，不触碰 MainWindow 对 Dock 的 QObject 所有权。
+/// @brief 移除模块 Dock 的借用映射，不销毁 Dock 本身。
+/// @param moduleId 模块的稳定标识。
+/// @return 无。
+void LayoutManager::unregisterModuleDock(const QString& moduleId)
+{
+    // 只移除借用映射，不 delete MainWindow 拥有的 Dock。
+    moduleDocks_.remove(moduleId);
+}
 
 // 把窗口几何、Qt Dock 状态和模块可见性写成带版本 JSON，并原子提交。
+/// @brief 把窗口几何、Qt Dock 状态和模块显示意图写成带版本 JSON 并原子落盘。
+/// @param filePath 目标文件路径，扩展名必须为 .qflayout。
+/// @param requestedVisibility 各模块的用户显示意图，按 moduleId 索引。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @param activation 是否把本次保存的路径记为当前活动布局。
+/// @return 写入并提交成功返回 true，任一环节失败返回 false。
 bool LayoutManager::saveLayout(const QString& filePath,
                                const QHash<QString, bool>& requestedVisibility,
                                QString* errorMessage,
@@ -131,6 +158,10 @@ bool LayoutManager::saveLayout(const QString& filePath,
 }
 
 // 只解析和校验布局文件，供启动菜单在不改变窗口的前提下判断是否可用。
+/// @brief 只解析并校验布局文件，不修改主窗口，供菜单判断布局是否可用。
+/// @param filePath 待校验的布局文件路径。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 文件有效返回 true，格式或内容不合法返回 false。
 bool LayoutManager::validateLayoutFile(const QString& filePath,
                                        QString* errorMessage) const
 {
@@ -149,6 +180,15 @@ bool LayoutManager::validateLayoutFile(const QString& filePath,
 }
 
 // 把磁盘文件转换成经过完整校验的 Qt 状态和模块显示意图，但不应用到窗口。
+/// @brief 读取并完整校验布局文件，输出可用的 Qt 状态和模块显示意图。
+/// @param filePath 待读取的布局文件路径。
+/// @param geometry 可选输出参数，写入校验通过的窗口几何字节。
+/// @param state 可选输出参数，写入校验通过的 Dock 状态字节。
+/// @param requestedVisibility 可选输出参数，写入各模块的显示意图。
+/// @param unavailableModuleIds 可选输出参数，写入当前未注册的模块 ID。
+/// @param legacyVisibilitySemantics 可选输出参数，写入文件是否使用旧可见性语义。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 全部校验通过返回 true，否则返回 false。
 bool LayoutManager::readLayoutFile(const QString& filePath,
                                    QByteArray* geometry,
                                    QByteArray* state,
@@ -249,6 +289,14 @@ bool LayoutManager::readLayoutFile(const QString& filePath,
 }
 
 // 完整解析并校验布局后尝试恢复；Qt 任一步失败都会回滚到调用前状态。
+/// @brief 解析并校验布局文件后应用到主窗口，Qt 恢复失败时回滚到调用前状态。
+/// @param filePath 待加载的布局文件路径。
+/// @param requestedVisibility 可选输出参数，写入各模块的显示意图。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @param unavailableModuleIds 可选输出参数，写入当前未注册的模块 ID。
+/// @param legacyVisibilitySemantics 可选输出参数，写入文件是否使用旧可见性语义。
+/// @param activation 是否把本次加载的路径记为当前活动布局。
+/// @return 恢复成功返回 true；校验失败或 Qt 回滚时返回 false。
 bool LayoutManager::loadLayout(const QString& filePath,
                                QHash<QString, bool>* requestedVisibility,
                                QString* errorMessage,
@@ -342,12 +390,18 @@ bool LayoutManager::loadLayout(const QString& filePath,
 }
 
 // 返回最近一次成功保存或加载的布局绝对路径。
+/// @brief 查询当前活动布局文件的绝对路径。
+/// @return 路径副本；尚未保存或加载过布局时返回空字符串。
 QString LayoutManager::activeFilePath() const
 {
     return activeFilePath_;
 }
 
 // 检查路径非空及 .qflayout 扩展名，避免误读/覆盖任意文件。
+/// @brief 校验布局路径非空且扩展名为 .qflayout。
+/// @param filePath 待校验的路径。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 路径合法返回 true，否则返回 false。
 bool LayoutManager::validateFilePath(const QString& filePath,
                                      QString* errorMessage) const
 {

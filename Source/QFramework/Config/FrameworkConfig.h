@@ -1,3 +1,8 @@
+// 【阅读导引】把 INI 配置翻译成程序能使用的结构体。
+// 阅读顺序：先读 load：解析模块清单，再解析消息容量、进程时限、布局和日志；resolvePath 把相对路径固定到配置文件目录。
+// 需要分清：配置是启动时的快照；模块是否存在、是否成功启动由运行时处理，配置读取成功不等于插件已可用。
+// 这是声明/类型入口：先看 public 接口和字段注释；复杂执行过程再到同名 .cpp 或指定实现文件阅读。
+
 #pragma once
 
 // 文件职责：把只读 QFramework.ini 转成有类型的内存配置。
@@ -125,6 +130,13 @@ public:
     /// @return 解析成功返回 true，否则返回 false。
     bool load(const QString& iniFilePath, QString* errorMessage = nullptr);
 
+    // 以下 getter 返回配置快照，调用方修改副本不会反向改变 FrameworkConfig。
+    /// @brief 返回当前配置文件的路径。
+    /// @return 配置文件绝对路径；未加载时为空字符串。
+    QString iniFilePath() const;
+    /// @brief 返回解析相对路径时使用的配置目录。
+    /// @return 配置文件所在目录的绝对路径；未加载时为空字符串。
+    QString configDirectory() const;
     /// @brief 返回按配置声明顺序排列的模块列表副本。
     /// @return 模块配置副本列表；未加载时为空。
     QVector<ModuleConfig> modules() const;
@@ -163,6 +175,7 @@ public:
 
 private:
     // load 成功后保存的只读内存快照。
+    QString iniFilePath_; ///< load 成功后保存的 INI 文件绝对路径。
     QString configDirectory_; ///< INI 文件所在目录。
     QVector<ModuleConfig> modules_; ///< 解析得到的模块配置列表。
     MessageBusConfig messageBus_; ///< 解析得到的消息总线配置。

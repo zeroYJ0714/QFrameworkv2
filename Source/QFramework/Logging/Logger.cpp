@@ -1,3 +1,8 @@
+// 【阅读导引】把多线程日志集中写入文件。
+// 阅读顺序：先看 start 建立写入环境，再看 log 如何提交记录，最后看 flush/stop 怎样把剩余内容落盘。
+// 需要分清：日志入口和文件写入分开；业务线程不应直接操作写文件线程的 QFile。日志已提交和日志已刷新到磁盘不是同一时刻。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：实现线程安全日志记录、文件滚动和 Qt 消息重定向。
 // Logger 由框架拥有，互斥锁只保护文件句柄、级别和路径快照；业务线程可以直接调用日志
 // 入口，但 QWidget、QSqlDatabase 和 ADB 资源不会在这里访问。关闭时先停止接收，再刷新
@@ -316,6 +321,8 @@ private:
 };
 
 // 使用函数内静态对象实现进程内单例，首次调用时由 C++ 线程安全初始化。
+/// @brief 返回进程内唯一 Logger 实例。
+/// @return 单例引用，生命周期贯穿整个进程。
 Logger& Logger::instance()
 {
     static Logger logger; ///< 进程内唯一实例，由 C++ 保证线程安全初始化。
@@ -323,6 +330,8 @@ Logger& Logger::instance()
 }
 
 // 构造时尚未启动 Worker，也尚未替换 Qt 全局消息处理器。
+/// @brief 构造尚未启动 Worker、也未接管 Qt 消息处理的 Logger。
+/// @return 无（构造函数不返回值）。
 Logger::Logger()
     : worker_(nullptr),
       previousQtHandler_(nullptr),
@@ -340,6 +349,11 @@ Logger::~Logger()
 }
 
 // 兼容旧调用方式：未提供刷新周期时固定使用 100 ms。
+/// @brief 以固定的 100 ms 刷新周期启动日志（兼容旧调用方式）。
+/// @param directory 日志输出目录。
+/// @param maxFileBytes 单个日志文件的字节上限。
+/// @param errorMessage 可选的失败原因输出参数，可为空。
+/// @return 启动成功返回 true；目录或上限无效、目录创建失败时返回 false。
 bool Logger::start(const QString& directory,
                    qint64 maxFileBytes,
                    QString* errorMessage)
@@ -350,6 +364,12 @@ bool Logger::start(const QString& directory,
 }
 
 // 创建输出目录并启动唯一 Worker；重复 start 视为已经成功运行。
+/// @brief 创建日志目录并启动唯一写盘线程，重复调用视为已成功。
+/// @param directory 日志输出目录。
+/// @param maxFileBytes 单个日志文件的字节上限，必须大于 0。
+/// @param flushIntervalMs 普通批次刷新周期，非法值回退为 100 ms。
+/// @param errorMessage 可选的失败原因输出参数，可为空。
+/// @return 启动成功或已在运行返回 true；参数无效或目录创建失败返回 false。
 bool Logger::start(const QString& directory,
                    qint64 maxFileBytes,
                    int flushIntervalMs,
@@ -376,6 +396,8 @@ bool Logger::start(const QString& directory,
 }
 
 // 从共享指针中摘除 Worker 后再等待，保证并发 log() 不会访问正在析构的对象。
+/// @brief 摘除并停止写盘线程；超时的线程交给 deleteLater 自回收。
+/// @return 无；最多等待约 5 秒。
 void Logger::stop()
 {
     Worker* worker = nullptr; ///< 被摘除的写盘线程，锁外独占操作。
@@ -399,6 +421,8 @@ void Logger::stop()
 }
 
 // 把同步刷新请求转给 Worker；Logger 未启动时是安全空操作。
+/// @brief 等待已提交日志真正写入并 flush。
+/// @return 无；Logger 未启动时安全忽略。
 void Logger::flush()
 {
     QMutexLocker locker(&mutex_);
@@ -408,6 +432,8 @@ void Logger::flush()
 }
 
 // 在 mutex_ 保护下读取 Worker 指针，避免与 stop() 并发数据竞争。
+/// @brief 查询写盘线程是否仍在运行。
+/// @return 已启动且未停止时返回 true。
 bool Logger::isRunning() const
 {
     QMutexLocker locker(&mutex_);
@@ -415,6 +441,11 @@ bool Logger::isRunning() const
 }
 
 // 在调用线程采集时间和线程 ID 后入队，文件格式化与 I/O 留给 Worker。
+/// @brief 采集时间与线程 ID 后把记录入队，不做任何文件 I/O。
+/// @param level 日志级别。
+/// @param moduleId 记录来源模块 ID。
+/// @param text 原始消息文本。
+/// @return 无；Logger 未启动时静默丢弃。
 void Logger::log(LogLevel level, const QString& moduleId, const QString& text)
 {
     LogRecord record; ///< 待入队的记录，字段全部按值复制。
@@ -431,6 +462,8 @@ void Logger::log(LogLevel level, const QString& moduleId, const QString& text)
 }
 
 // 全局安装一次 Qt 消息处理器，并保存原处理器以便恢复。
+/// @brief 安装全局 Qt 消息处理器，把 qDebug 等输出接入 Logger。
+/// @return 无；重复安装时安全忽略。
 void Logger::installQtMessageHandler()
 {
     QMutexLocker locker(&mutex_);
@@ -442,6 +475,8 @@ void Logger::installQtMessageHandler()
 }
 
 // 恢复 Logger 安装前的处理器；未安装时不做任何操作。
+/// @brief 恢复安装前保存的 Qt 消息处理器。
+/// @return 无；未安装时安全忽略。
 void Logger::uninstallQtMessageHandler()
 {
     QMutexLocker locker(&mutex_);
@@ -454,6 +489,11 @@ void Logger::uninstallQtMessageHandler()
 }
 
 // Qt 的静态回调把消息级别映射到 LogLevel；Fatal 写入后额外同步刷新。
+/// @brief Qt 全局消息处理器：映射级别写入日志，Fatal 时立即刷新。
+/// @param type Qt 消息类型。
+/// @param context Qt 提供的日志上下文，本实现不使用。
+/// @param message Qt 消息文本。
+/// @return 无。
 void Logger::qtMessageHandler(QtMsgType type,
                               const QMessageLogContext& context,
                               const QString& message)

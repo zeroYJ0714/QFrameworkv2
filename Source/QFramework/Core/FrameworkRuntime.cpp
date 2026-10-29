@@ -1,3 +1,8 @@
+// 【阅读导引】主程序的装配和收尾入口。
+// 阅读顺序：从 initialize 看配置、Logger、MessageBus、PluginManager、MainWindow 的创建顺序，再看 show 和 shutdown。
+// 需要分清：模块故障可以作为启动警告；配置等基础设施失败才让初始化返回 false。退出要先停消息再释放对象，防止回调访问已销毁插件。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：组装 QFramework 主进程的核心对象，包括配置、日志、MessageBus、插件管理
 // 和子进程监督器，并推进启动/停止状态机。FrameworkRuntime 通常由 GUI 主线程拥有；
 // 它不越过对象线程边界直接访问插件 QWidget，关闭时按固定顺序停止消息入口、插件和进程。
@@ -28,6 +33,9 @@ QMutex failFastMutex; ///< 保护 failFastHandler 的互斥锁，供测试替换
 ProcessFailFast::Handler failFastHandler = nullptr; ///< 可被测试替换的 fail-fast 处理器；为空时直接调用 qFatal。
 }
 
+/// @brief 在模块消息回调无法结束时触发 fail-fast，阻止继续卸载仍被使用的 DLL。
+/// @param moduleIds 退出时仍未结束回调的模块 ID 列表。
+/// @return 始终返回 true；正常路径不会返回，处理器或 qFatal 会终止进程。
 bool ProcessFailFast::requestForHungModules(const QStringList& moduleIds)
 {
     QStringList uniqueIds = moduleIds; ///< 去重后的模块 ID 列表，用于生成可读原因。
@@ -51,6 +59,9 @@ bool ProcessFailFast::requestForHungModules(const QStringList& moduleIds)
     return true;
 }
 
+/// @brief 替换 fail-fast 处理器，仅供测试注入可控的终止行为。
+/// @param handler 新的处理器；传空表示恢复为直接 qFatal。
+/// @return 无。
 void ProcessFailFast::setHandlerForTests(Handler handler)
 {
     QMutexLocker locker(&failFastMutex);
@@ -58,6 +69,9 @@ void ProcessFailFast::setHandlerForTests(Handler handler)
 }
 
 // 只保存 QApplication 借用指针并初始化所有可选组件为空，实际资源在 initialize 创建。
+/// @brief 构造运行时，仅借用 QApplication 并把各可选组件置空。
+/// @param application 主 GUI 线程的 QApplication，所有权仍在调用方。
+/// @return 无（构造函数不返回值）。
 FrameworkRuntime::FrameworkRuntime(QApplication* application)
     : application_(application),
       messageBus_(nullptr),
@@ -81,6 +95,10 @@ FrameworkRuntime::~FrameworkRuntime()
 }
 
 // 按依赖顺序构建整个主进程运行时；基础设施失败立即返回，模块级失败记录为警告。
+/// @brief 按依赖顺序创建配置、日志、消息总线、插件、子进程监督器和主窗口。
+/// @param configFilePath 只读 INI 配置文件的绝对路径。
+/// @param errorMessage 可选的失败原因输出参数，可为空。
+/// @return 基础设施初始化成功返回 true；配置、日志或前置状态无效时返回 false。
 bool FrameworkRuntime::initialize(const QString& configFilePath,
                                   QString* errorMessage)
 {
@@ -166,6 +184,8 @@ bool FrameworkRuntime::initialize(const QString& configFilePath,
 }
 
 // 显示已完成初始化的主窗口，并集中展示启动期间收集的非致命问题。
+/// @brief 显示主窗口并弹出此前收集的启动警告。
+/// @return 无；未完成初始化或主窗口为空时安全忽略。
 void FrameworkRuntime::show()
 {
     // initialize 失败时不显示一个半初始化窗口。
@@ -176,6 +196,8 @@ void FrameworkRuntime::show()
 }
 
 // 按“停止消息生产者 -> 解除 UI -> 删除依赖 -> 最后停日志”的反向顺序关闭。
+/// @brief 按依赖逆序停止消息、插件、子进程与日志，并释放全部运行时对象。
+/// @return 无；重复调用因 shutdownComplete_ 门禁而直接返回。
 void FrameworkRuntime::shutdown()
 {
     if (shutdownComplete_)
@@ -233,12 +255,17 @@ void FrameworkRuntime::shutdown()
 }
 
 // 返回 MainWindow 借用指针，主要供入口和自动化测试访问。
+/// @brief 返回主窗口借用指针，主要供入口和自动化测试访问。
+/// @return 已创建的主窗口指针；未初始化时可能为 nullptr。
 MainWindow* FrameworkRuntime::mainWindow() const
 {
     return mainWindow_;
 }
 
 // 过滤空警告，保存供 show() 展示，并立即写入集中日志保留诊断上下文。
+/// @brief 去重并收集启动警告，同时写入集中日志。
+/// @param warnings 待处理的启动警告文本列表，允许含空项。
+/// @return 无。
 void FrameworkRuntime::appendStartupWarnings(const QStringList& warnings)
 {
     // 同一条警告既保留在日志中，也留给 show() 向用户集中展示。
@@ -254,6 +281,8 @@ void FrameworkRuntime::appendStartupWarnings(const QStringList& warnings)
 }
 
 // 主窗口已经显示时补充呈现异步启动错误；用索引避免同一警告重复弹出。
+/// @brief 弹出尚未展示过的启动警告，并用计数避免重复提示。
+/// @return 无；主窗口未显示或没有新警告时安全忽略。
 void FrameworkRuntime::showPendingStartupWarnings()
 {
     if (mainWindow_ == nullptr || !mainWindow_->isVisible() ||

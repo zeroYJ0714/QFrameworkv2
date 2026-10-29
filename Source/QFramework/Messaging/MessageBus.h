@@ -1,3 +1,8 @@
+// 【阅读导引】按主题把消息投递给订阅模块。
+// 阅读顺序：registerModule 登记端点和主题；publishFromModule/publishSharedFromModule 检查发布资格；ModuleQueue 串行回调订阅者。
+// 需要分清：Reliable 满时拒绝新消息；Latest 可以淘汰同主题旧等待项。publish 的 true 是准入结果，不是业务执行成功；停止超时的端点不能立即释放。
+// 这是声明/类型入口：先看 public 接口和字段注释；复杂执行过程再到同名 .cpp 或指定实现文件阅读。
+
 #pragma once
 
 // 初学者阅读提示：MessageBus 是进程内的“邮局”。模块 publish 一条消息后，总线

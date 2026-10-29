@@ -16,8 +16,8 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration"><ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries><PlatformToolset>v141</PlatformToolset><CharacterSet>Unicode</CharacterSet><WholeProgramOptimization>true</WholeProgramOptimization></PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration"><ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries><PlatformToolset>v141</PlatformToolset><CharacterSet>Unicode</CharacterSet><WholeProgramOptimization>true</WholeProgramOptimization></PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" /><ImportGroup Condition="Exists('$(QtMsBuild)\qt_defaults.props')"><Import Project="$(QtMsBuild)\qt_defaults.props" /></ImportGroup>
-  <PropertyGroup Label="QtSettings" Condition="'$(Platform)'=='Win32'"><QtInstall>5.15.2_msvc2019</QtInstall><QtModules>core;gui;widgets</QtModules><QtDeploy>true</QtDeploy><QtDeployPdb>true</QtDeployPdb><QtDeployIncludeModules>network</QtDeployIncludeModules><QtDeployCompilerRuntime Condition="'$(Configuration)'=='Release'">true</QtDeployCompilerRuntime><QtLinkNatvisFile>false</QtLinkNatvisFile></PropertyGroup>
-  <PropertyGroup Label="QtSettings" Condition="'$(Platform)'=='x64'"><QtInstall>5.15.2_msvc2019_64</QtInstall><QtModules>core;gui;widgets</QtModules><QtDeploy>true</QtDeploy><QtDeployPdb>true</QtDeployPdb><QtDeployIncludeModules>network</QtDeployIncludeModules><QtDeployCompilerRuntime Condition="'$(Configuration)'=='Release'">true</QtDeployCompilerRuntime><QtLinkNatvisFile>false</QtLinkNatvisFile></PropertyGroup>
+  <PropertyGroup Label="QtSettings" Condition="'$(Platform)'=='Win32'"><QtInstall>5.15.2_msvc2019</QtInstall><QtModules>core;gui;widgets</QtModules><QtDeploy>true</QtDeploy><QtDeployPdb>true</QtDeployPdb><QtDeployIncludeModules>network;sql;multimedia</QtDeployIncludeModules><QtDeployCompilerRuntime Condition="'$(Configuration)'=='Release'">true</QtDeployCompilerRuntime><QtLinkNatvisFile>false</QtLinkNatvisFile></PropertyGroup>
+  <PropertyGroup Label="QtSettings" Condition="'$(Platform)'=='x64'"><QtInstall>5.15.2_msvc2019_64</QtInstall><QtModules>core;gui;widgets</QtModules><QtDeploy>true</QtDeploy><QtDeployPdb>true</QtDeployPdb><QtDeployIncludeModules>network;sql;multimedia</QtDeployIncludeModules><QtDeployCompilerRuntime Condition="'$(Configuration)'=='Release'">true</QtDeployCompilerRuntime><QtLinkNatvisFile>false</QtLinkNatvisFile></PropertyGroup>
   <Target Name="QtMsBuildNotFound" BeforeTargets="CustomBuild;ClCompile" Condition="!Exists('$(QtMsBuild)\qt.targets') or !Exists('$(QtMsBuild)\qt.props')"><Message Importance="High" Text="QtMsBuild: could not locate qt.targets or qt.props." /></Target>
   <ImportGroup Label="ExtensionSettings" /><ImportGroup Label="Shared" />
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'"><Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" /></ImportGroup>
@@ -38,16 +38,31 @@
   <!-- VS 直接启动 QFrameworkApp 时，运行目录必须拥有与源码一致的模块配置和依赖。 -->
   <Target Name="CopyQFrameworkRuntimeFiles" AfterTargets="Build">
     <ItemGroup>
+      <QFrameworkIni Include="$(SolutionDir)config\QFramework.ini" />
+      <LocateAnythingConfig Include="$(SolutionDir)config\locateanything.json" />
+      <LocateAnythingServer Include="$(SolutionDir)Runtime\LocateAnything\server\*.py;$(SolutionDir)Runtime\LocateAnything\server\*.txt;$(SolutionDir)Runtime\LocateAnything\server\*.html" />
+      <LocateAnythingTrainer Include="$(SolutionDir)Runtime\LocateAnything\trainer\*.py;$(SolutionDir)Runtime\LocateAnything\trainer\*.txt" />
       <QFrameworkNetworkRuntime Include="$(QMake_QT_INSTALL_BINS_)\Qt5Networkd.dll" Condition="'$(Configuration)'=='Debug'" />
       <QFrameworkNetworkRuntime Include="$(QMake_QT_INSTALL_BINS_)\Qt5Network.dll" Condition="'$(Configuration)'=='Release'" />
-      <QFrameworkIni Include="$(SolutionDir)config\QFramework.ini" />
       <QFrameworkLayouts Include="$(SolutionDir)config\Layouts\*.*" />
       <QFrameworkStyles Include="$(SolutionDir)config\Styles\*.qss" />
+      <QFrameworkFfmpeg Include="$(SolutionDir)ThirdParty\FFmpeg\x64\8.1\bin\*.dll" Condition="'$(Platform)'=='x64'" />
+      <QFrameworkSqlRuntimeFiles Include="$(QMake_QT_INSTALL_BINS_)\Qt5Sqld.dll" Condition="'$(Configuration)'=='Debug'" />
+      <QFrameworkSqlRuntimeFiles Include="$(QMake_QT_INSTALL_BINS_)\Qt5Sql.dll" Condition="'$(Configuration)'=='Release'" />
+      <QFrameworkSqlDriverFiles Include="$(QMake_QT_INSTALL_PLUGINS_)\sqldrivers\qsqlited.dll" Condition="'$(Configuration)'=='Debug'" />
+      <QFrameworkSqlDriverFiles Include="$(QMake_QT_INSTALL_PLUGINS_)\sqldrivers\qsqlite.dll" Condition="'$(Configuration)'=='Release'" />
     </ItemGroup>
-    <MakeDir Directories="$(OutDir)config;$(OutDir)config\Layouts;$(OutDir)config\Styles" />
+    <MakeDir Directories="$(OutDir)config;$(OutDir)config\Layouts;$(OutDir)config\Styles;$(OutDir)sqldrivers" />
     <Copy SourceFiles="@(QFrameworkIni)" DestinationFolder="$(OutDir)config" SkipUnchangedFiles="true" />
+    <!-- Preserve installed paths/settings; never copy model weights or a developer venv during Build. -->
+    <Copy SourceFiles="@(LocateAnythingConfig)" DestinationFolder="$(OutDir)config" Condition="!Exists('$(OutDir)config\locateanything.json')" />
+    <Copy SourceFiles="@(LocateAnythingServer)" DestinationFolder="$(OutDir)Runtime\LocateAnything\server" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(LocateAnythingTrainer)" DestinationFolder="$(OutDir)Runtime\LocateAnything\trainer" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(QFrameworkNetworkRuntime)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(QFrameworkLayouts)" DestinationFolder="$(OutDir)config\Layouts" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(QFrameworkStyles)" DestinationFolder="$(OutDir)config\Styles" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(QFrameworkFfmpeg)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="'@(QFrameworkFfmpeg)'!=''" />
+    <Copy SourceFiles="@(QFrameworkSqlRuntimeFiles)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(QFrameworkSqlDriverFiles)" DestinationFolder="$(OutDir)sqldrivers" SkipUnchangedFiles="true" />
   </Target>
 </Project>

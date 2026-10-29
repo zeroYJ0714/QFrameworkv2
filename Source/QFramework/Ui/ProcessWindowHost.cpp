@@ -1,3 +1,8 @@
+// 【阅读导引】把另一个进程的原生窗口放进 Qt 面板。
+// 阅读顺序：子进程就绪前显示 placeholder；拿到窗口句柄后包装 QWindow 并放入容器；尺寸变化再通知监督器。
+// 需要分清：原生窗口属于子进程，包装器属于宿主。窗口句柄失效后不能继续当 QWidget 使用；释放包装不应误当作直接销毁子进程。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：把进程 UI 模块提供的原生窗口句柄嵌入 Qt 宿主 Dock，并处理尺寸同步。
 // 原生句柄和 QWidget 都由 GUI 线程使用；本类只借用子进程窗口，不拥有子进程本身，进程
 // 停止或句柄失效时清空嵌入状态并发出错误，不在窗口事件中同步等待进程退出。
@@ -16,6 +21,9 @@
 namespace qframework
 {
 // 初始只显示占位标签；收到有效子进程句柄后再切换到嵌入容器。
+/// @brief 构造宿主控件，初始只显示占位标签等待子进程窗口。
+/// @param parent 父控件，通常是对应模块的 ManagedDockWidget。
+/// @return 无（构造函数不返回值）。
 ProcessWindowHost::ProcessWindowHost(QWidget* parent)
     : QWidget(parent),
       stackedLayout_(new QStackedLayout(this)),
@@ -48,6 +56,10 @@ ProcessWindowHost::~ProcessWindowHost()
 }
 
 // 把监督器上报的原生句柄包装成 QWindow/QWidget，并切换堆叠布局当前页。
+/// @brief 把子进程原生窗口句柄包装成 QWindow 容器并切换为当前页。
+/// @param windowId 子进程上报的原生窗口句柄，0 视为无效。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 成功嵌入返回 true，句柄为空或 Qt 无法包装时返回 false。
 bool ProcessWindowHost::attachWindow(quintptr windowId, QString* errorMessage)
 {
     // 0 从来不是有效窗口句柄，不交给 QWindow::fromWinId。
@@ -102,6 +114,9 @@ bool ProcessWindowHost::attachWindow(quintptr windowId, QString* errorMessage)
 }
 
 // 在进程未启动、断开、失败或重启时清理旧句柄并显示原因。
+/// @brief 清理已嵌入窗口并切回占位页，同时显示失败或等待原因。
+/// @param detail 占位页文案；为空时使用默认等待提示。
+/// @return 无。
 void ProcessWindowHost::showPlaceholder(const QString& detail)
 {
     // 故障/重启时先断开旧窗口，再切回占位页。
@@ -113,12 +128,17 @@ void ProcessWindowHost::showPlaceholder(const QString& detail)
 }
 
 // 只报告容器已经成功创建，不把非空句柄误当成可见窗口。
+/// @brief 查询当前是否已成功嵌入子进程窗口容器。
+/// @return 已创建嵌入容器返回 true，否则返回 false。
 bool ProcessWindowHost::hasEmbeddedWindow() const
 {
     // 以容器是否存在为准；裸 foreignWindow_ 不代表已经成功嵌入。
     return windowContainer_ != nullptr;
 }
 
+/// @brief 宿主尺寸变化时同步嵌入容器几何，并重新安排尺寸上报。
+/// @param event 尺寸变化事件，先交给基类处理。
+/// @return 无。
 void ProcessWindowHost::resizeEvent(QResizeEvent* event)
 {
     QWidget::resizeEvent(event);
@@ -127,6 +147,9 @@ void ProcessWindowHost::resizeEvent(QResizeEvent* event)
     scheduleClientSizeNotification();
 }
 
+/// @brief 宿主显示时同步嵌入容器几何，并重新安排尺寸上报。
+/// @param event 显示事件，先交给基类处理。
+/// @return 无。
 void ProcessWindowHost::showEvent(QShowEvent* event)
 {
     QWidget::showEvent(event);
@@ -135,17 +158,23 @@ void ProcessWindowHost::showEvent(QShowEvent* event)
     scheduleClientSizeNotification();
 }
 
+/// @brief 给出宿主控件的推荐尺寸。
+/// @return 固定的推荐尺寸，避免外部窗口历史尺寸撑大 Dock。
 QSize ProcessWindowHost::sizeHint() const
 {
     // 固定宿主提示尺寸，避免 foreign QWindow 的历史尺寸把整个 Dock 拉长。
     return QSize(320, 240);
 }
 
+/// @brief 给出宿主控件的最小推荐尺寸。
+/// @return 固定的最小推荐尺寸。
 QSize ProcessWindowHost::minimumSizeHint() const
 {
     return QSize(180, 120);
 }
 
+/// @brief 延迟汇总尺寸变化，用定时器合并 Dock 重排过程中的多次 resize。
+/// @return 无；未嵌入窗口时不安排上报。
 void ProcessWindowHost::scheduleClientSizeNotification()
 {
     // QMainWindow 在 Dock 拖动、上下拆分和 restoreState() 过程中，会短暂隐藏
@@ -157,6 +186,8 @@ void ProcessWindowHost::scheduleClientSizeNotification()
     resizeTimer_->start();
 }
 
+/// @brief 定时器到期后把最终客户区尺寸上报给 MainWindow。
+/// @return 无；未嵌入窗口或尺寸非正时不发信号。
 void ProcessWindowHost::flushClientSizeNotification()
 {
     // 50 ms 到期时 Dock 可能仍处于 Qt 内部重排阶段；只要嵌入容器仍存在，就把
@@ -171,6 +202,8 @@ void ProcessWindowHost::flushClientSizeNotification()
 }
 
 // 先解除原生父子关系，避免同步等待子进程退出时互等窗口消息。
+/// @brief 立即解除窗口嵌入，再延迟回收容器和 Qt 包装对象。
+/// @return 无。
 void ProcessWindowHost::clearEmbeddedWindow()
 {
     if (windowContainer_ == nullptr) {

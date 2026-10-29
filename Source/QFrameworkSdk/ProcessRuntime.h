@@ -1,3 +1,8 @@
+// 【阅读导引】独立 EXE 中与主程序通信的一端。
+// 阅读顺序：run/execute 启动事件循环；连接后注册身份；handleFrame 处理控制和业务消息；发送队列统一进入 sendFrame。
+// 需要分清：所有 Socket 操作留在运行时线程。发送 ACK 用于运输层确认，不代表业务动作完成；断线、退出、共享内存释放都要按同一生命周期处理。
+// 这是声明/类型入口：先看 public 接口和字段注释；复杂执行过程再到同名 .cpp 或指定实现文件阅读。
+
 #pragma once
 
 // 文件职责：声明进程插件侧运行时，把 ModuleEndpoint 的发布/日志转换成父子 IPC 帧。
@@ -213,6 +218,9 @@ private:
     int exitCode_; ///< finish() 记录的进程退出码。
     // 父进程拒绝统计用于限频诊断，不改变 publish() 的同步返回语义。
     quint64 publishRejectedCount_; ///< 被父进程拒绝的发布计数。
+    quint64 publishDroppedCount_; ///< 被丢弃的发布计数。
+    quint64 publishLocalRejectedCount_; ///< 本地队列满而拒绝的发布计数。
+    quint64 publishAbandonedCount_; ///< 停止时被放弃的未确认发布计数。
     qint64 lastPublishRejectWarningMs_; ///< 上次输出发布拒绝告警的时间戳，单位毫秒，用于限频。
     QHash<QString, TopicSettings> topicConfigs_; ///< 主题名到传输设置的映射。
     // messageId -> 共享内存句柄；直到 publishAck 或故障清理前保持所有权。

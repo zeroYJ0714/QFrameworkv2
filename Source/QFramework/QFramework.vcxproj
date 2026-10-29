@@ -147,6 +147,7 @@
     <QtMoc Include="Ui\ManagedDockWidget.h" />
     <QtMoc Include="Ui\MainWindow.h" />
     <QtMoc Include="Ui\WindowTitleBar.h" />
+    <ClInclude Include="Ui\DialogStyle.h" />
     <QtMoc Include="Ui\ModuleManagerDialog.h" />
     <QtMoc Include="Ui\ProcessWindowHost.h" />
     <ClInclude Include="Ui\LayoutManager.h" />
@@ -166,6 +167,7 @@
     <ClCompile Include="Ui\ManagedDockWidget.cpp" />
     <ClCompile Include="Ui\MainWindow.cpp" />
     <ClCompile Include="Ui\WindowTitleBar.cpp" />
+    <ClCompile Include="Ui\DialogStyle.cpp" />
     <ClCompile Include="Ui\ModuleManagerDialog.cpp" />
     <ClCompile Include="Ui\ProcessWindowHost.cpp" />
     <ClCompile Include="Ui\LayoutManager.cpp" />

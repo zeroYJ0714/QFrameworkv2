@@ -1,3 +1,8 @@
+// 【阅读导引】把窗口布局保存成可恢复文件。
+// 阅读顺序：saveLayout 写 Qt 几何/停靠状态和显示意图；loadLayout 先校验文件，再尝试恢复，失败时保持或回退原状态。
+// 需要分清：Qt 的二进制布局通过 Base64 放进 JSON。requestedVisible 是用户意图，不等于此刻屏幕上能看见；隐藏标签页也可能仍要求显示。
+// 这是声明/类型入口：先看 public 接口和字段注释；复杂执行过程再到同名 .cpp 或指定实现文件阅读。
+
 #pragma once
 
 // 文件职责：保存和恢复主窗口 geometry、Dock state 及每个模块 Dock 的可见性。
@@ -28,11 +33,15 @@ public:
     /// @return 无（构造函数不返回值）。
     explicit LayoutManager(QMainWindow* mainWindow);
 
-    /// @brief 登记模块 Dock 的借用指针，供保存和恢复时按 moduleId 找回该 Dock。
+    /// @brief 登记模块 Dock 的借用指针，供保存和恢复时按 moduleId 找回该 Dock；模块卸载时须对应调用 unregisterModuleDock。
     /// @param moduleId 模块的稳定标识，为空时本次登记被忽略。
     /// @param dockWidget Dock 借用指针，所有权仍属主窗口；为空时本次登记被忽略。
     /// @return 无；moduleId 为空或 dockWidget 为空时不会写入任何映射。
     void registerModuleDock(const QString& moduleId, QDockWidget* dockWidget);
+    /// @brief 删除模块 Dock 的借用映射，不销毁 Dock 本身；Dock 的实际释放由主窗口负责。
+    /// @param moduleId 模块的稳定标识，未登记时静默无操作。
+    /// @return 无。
+    void unregisterModuleDock(const QString& moduleId);
 
     /// @brief 把主窗口 geometry、Qt Dock state 和各模块显示意图写成版本化 JSON，用 QSaveFile 原子提交，失败不会破坏原布局文件。
     /// @param filePath 目标文件路径，扩展名必须为 .qflayout，否则直接失败。

@@ -1,3 +1,8 @@
+// 【阅读导引】主程序中管理子进程的一端。
+// 阅读顺序：startAll 启动批次；每个 Entry 保存一个子进程状态；handleFrame 处理注册、心跳和 ACK；onSupervisionTick 推进超时和停止。
+// 需要分清：异步 requestStop/requestRestart 不等于操作已经结束，要看完成信号。停止预算覆盖整个操作，不能给每个子步骤重新计算无限等待。
+// 这是声明/类型入口：先看 public 接口和字段注释；复杂执行过程再到同名 .cpp 或指定实现文件阅读。
+
 #pragma once
 
 // 文件职责：声明主进程子进程监督器。

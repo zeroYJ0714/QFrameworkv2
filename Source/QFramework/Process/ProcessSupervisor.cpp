@@ -1,3 +1,8 @@
+// 【阅读导引】主程序中管理子进程的一端。
+// 阅读顺序：startAll 启动批次；每个 Entry 保存一个子进程状态；handleFrame 处理注册、心跳和 ACK；onSupervisionTick 推进超时和停止。
+// 需要分清：异步 requestStop/requestRestart 不等于操作已经结束，要看完成信号。停止预算覆盖整个操作，不能给每个子步骤重新计算无限等待。
+// 这是执行实现：按入口调用和信号回调追踪，不要按文件行号把所有函数理解成连续执行。
+
 // 文件职责：监督 ProcessUi/ProcessNonUi 子进程及其本地 IPC。
 // 本类拥有 QProcess、QLocalServer、QLocalSocket 和共享内存对象，全部在监督器线程创建/使用/销毁；
 // 注册、认证、心跳、Latest/Reliable 队列、窗口嵌入和停止状态都由同一状态机推进。
@@ -377,6 +382,12 @@ struct ProcessSupervisor::Entry
 };
 
 // 构造监督器并启动轻量定时器；真正的子进程直到 startAll 才创建。
+/// @brief 构造监督器，保存配置并启动状态机心跳定时器。
+/// @param messageBus 消息总线，用于桥接子进程主题。
+/// @param messageBusConfig 消息总线配置，决定队列规则和大小上限。
+/// @param processConfig 子进程监督配置，含心跳间隔和重启策略。
+/// @param parent 所属 QObject，通常为 FrameworkRuntime。
+/// @return 无（构造函数不返回值）。
 ProcessSupervisor::ProcessSupervisor(MessageBus* messageBus,
                                      const MessageBusConfig& messageBusConfig,
                                      const ProcessConfig& processConfig,
@@ -408,6 +419,10 @@ ProcessSupervisor::~ProcessSupervisor()
 }
 
 // 筛选进程型配置并并行提交启动；最终结果由 startupBatchFinished 异步报告。
+/// @brief 为全部启用的子进程模块创建 Entry 并异步提交启动。
+/// @param modules 模块配置列表，非子进程类型会被跳过。
+/// @param errors 可选输出参数，写入被拒绝模块的原因。
+/// @return 全部启动请求都被接受返回 true，存在重复 ID 或启动失败返回 false。
 bool ProcessSupervisor::startAll(const QVector<ModuleConfig>& modules,
                                   QStringList* errors)
 {
@@ -456,18 +471,30 @@ bool ProcessSupervisor::startAll(const QVector<ModuleConfig>& modules,
 }
 
 // 兼容入口现在只提交异步停止请求。
+/// @brief 兼容入口：提交异步停止请求，不等待子进程真正退出。
+/// @param moduleId 目标模块的稳定标识。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 请求被接受返回 true，否则返回 false。
 bool ProcessSupervisor::stop(const QString& moduleId, QString* errorMessage)
 {
     return requestStop(moduleId, errorMessage);
 }
 
 // 兼容入口现在只提交异步重启请求。
+/// @brief 兼容入口：提交异步重启请求，不等待子进程真正重启完成。
+/// @param moduleId 目标模块的稳定标识。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 请求被接受返回 true，否则返回 false。
 bool ProcessSupervisor::restart(const QString& moduleId, QString* errorMessage)
 {
     return requestRestart(moduleId, errorMessage);
 }
 
 // 停止请求关闭入口并发送 stop 后立即返回，QProcess 信号继续推进状态。
+/// @brief 提交异步停止请求：关闭消息入口、发送 stop 帧后立即返回。
+/// @param moduleId 目标模块的稳定标识。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 请求被接受返回 true；模块不存在或已有操作进行中返回 false。
 bool ProcessSupervisor::requestStop(const QString& moduleId, QString* errorMessage)
 {
     // stop 是非阻塞状态转换：先关闭父子消息入口，再发送 stop 控制帧；QProcess 的
@@ -491,6 +518,10 @@ bool ProcessSupervisor::requestStop(const QString& moduleId, QString* errorMessa
 }
 
 // 手动重启只启动状态转换；重复点击不会创建第二轮 generation。
+/// @brief 提交异步重启请求：运行中先完整停止，停止完成后再启动新一代进程。
+/// @param moduleId 目标模块的稳定标识。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 请求被接受返回 true；模块不存在、正在关闭或已有操作进行中返回 false。
 bool ProcessSupervisor::requestRestart(const QString& moduleId, QString* errorMessage)
 {
     // restart 复用同一个 Entry；运行中先完整 stop，退出后才按延迟创建新 QProcess，
@@ -529,6 +560,10 @@ bool ProcessSupervisor::requestRestart(const QString& moduleId, QString* errorMe
 }
 
 // 无尺寸重载只请求子进程第一次显示，不携带宿主尺寸。
+/// @brief 请求子进程显示自己的窗口，不携带宿主尺寸。
+/// @param moduleId 目标模块的稳定标识。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 控制帧发送成功返回 true，否则返回 false。
 bool ProcessSupervisor::showWindow(const QString& moduleId, QString* errorMessage)
 {
     Entry* entry = findEntry(moduleId); ///< 目标模块的监督记录。
@@ -559,6 +594,12 @@ bool ProcessSupervisor::showWindow(const QString& moduleId, QString* errorMessag
 }
 
 // 带尺寸的兼容入口按两个有序控制帧发送；尺寸调整不会重复调用 QWidget::show()。
+/// @brief 兼容入口：先请求显示窗口，再按需下发尺寸调整帧。
+/// @param moduleId 目标模块的稳定标识。
+/// @param width 目标客户区宽度。
+/// @param height 目标客户区高度。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 两个请求都成功返回 true；尺寸非正时只要求显示成功。
 bool ProcessSupervisor::showWindow(const QString& moduleId,
                                     int width,
                                     int height,
@@ -572,6 +613,12 @@ bool ProcessSupervisor::showWindow(const QString& moduleId,
 }
 
 // 向正在运行的 ProcessUi 发送独立尺寸控制帧；失败才进入子进程故障路径。
+/// @brief 向正在运行的子进程 UI 发送独立的尺寸调整控制帧。
+/// @param moduleId 目标模块的稳定标识。
+/// @param width 目标客户区宽度，必须为正。
+/// @param height 目标客户区高度，必须为正。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 控制帧发送成功返回 true，否则返回 false。
 bool ProcessSupervisor::resizeWindow(const QString& moduleId,
                                       int width,
                                       int height,
@@ -612,6 +659,9 @@ bool ProcessSupervisor::resizeWindow(const QString& moduleId,
 }
 
 // 故障注入/紧急路径直接终止 QProcess，让统一 finished/fault 逻辑接管。
+/// @brief 立即强杀指定模块的子进程，后续状态由统一退出路径推进。
+/// @param moduleId 目标模块的稳定标识。
+/// @return 已发出强杀返回 true；模块或进程不存在、进程未运行时返回 false。
 bool ProcessSupervisor::terminate(const QString& moduleId)
 {
     Entry* entry = findEntry(moduleId); ///< 目标模块的监督记录。
@@ -623,6 +673,8 @@ bool ProcessSupervisor::terminate(const QString& moduleId)
 }
 
 // 先并行发送 stop，再用一个总 QDeadlineTimer 收尾，期间不泵送普通 GUI 事件。
+/// @brief 关闭全部子进程：先并行发 stop，再用总预算收尾并逐级升级为强杀。
+/// @return 无；总预算耗尽仍存活的进程会被标记为 Failed。
 void ProcessSupervisor::shutdown()
 {
     // 全局关闭先并行向所有子进程发 stop，再用一份总 deadline 等 ACK/进程退出；
@@ -696,6 +748,8 @@ void ProcessSupervisor::shutdown()
 }
 
 // 遍历 Entry 状态生成当前运行模块 ID 快照。
+/// @brief 生成当前处于 Running 阶段的模块 ID 列表。
+/// @return 运行中模块的稳定 ID 列表。
 QStringList ProcessSupervisor::runningModuleIds() const
 {
     QStringList result; ///< 运行中模块 ID 的收集结果。
@@ -707,12 +761,18 @@ QStringList ProcessSupervisor::runningModuleIds() const
 }
 
 // 未知模块返回空字符串，调用方可与 Running/Failed 等状态区分。
+/// @brief 查询指定模块当前对外可见的生命周期状态。
+/// @param moduleId 目标模块的稳定标识。
+/// @return 状态文本；模块不存在时返回空字符串。
 QString ProcessSupervisor::state(const QString& moduleId) const
 {
     const Entry* entry = findEntry(moduleId); ///< 目标模块的监督记录。
     return entry == nullptr ? QString() : entry->state;
 }
 
+/// @brief 查询指定模块发送队列的统计快照。
+/// @param moduleId 目标模块的稳定标识。
+/// @return 队列统计；模块不存在时返回全零。
 ProcessQueueStats ProcessSupervisor::queueStats(const QString& moduleId) const
 {
     ProcessQueueStats result; ///< 待返回的统计快照。
@@ -729,6 +789,9 @@ ProcessQueueStats ProcessSupervisor::queueStats(const QString& moduleId) const
 }
 
 // 保存最新 QSS，并广播给所有已注册且连接正常的 UI 子进程。
+/// @brief 保存最新 QSS 并广播给所有已注册的 UI 子进程。
+/// @param styleSheet 新的全局样式表文本。
+/// @return 无；单个子进程发送失败只标记该进程故障。
 void ProcessSupervisor::applyStyleSheet(const QString& styleSheet)
 {
     styleSheet_ = styleSheet;
@@ -744,6 +807,9 @@ void ProcessSupervisor::applyStyleSheet(const QString& styleSheet)
 }
 
 // 以下查找函数只返回监督器拥有的借用指针，不转移 Entry 所有权。
+/// @brief 按模块 ID 查找监督记录。
+/// @param moduleId 目标模块的稳定标识。
+/// @return 命中的记录指针；未找到返回 nullptr。
 ProcessSupervisor::Entry* ProcessSupervisor::findEntry(const QString& moduleId) const
 {
     for (Entry* entry : entries_) { ///< 当前比对的模块记录。
@@ -754,6 +820,9 @@ ProcessSupervisor::Entry* ProcessSupervisor::findEntry(const QString& moduleId) 
 }
 
 // 根据 Qt signal 的 sender() 反查对应本地服务器。
+/// @brief 按发送信号的本地服务器对象反查监督记录。
+/// @param object 信号发送者对象。
+/// @return 命中的记录指针；未找到返回 nullptr。
 ProcessSupervisor::Entry* ProcessSupervisor::findEntryByServer(QObject* object) const
 {
     for (Entry* entry : entries_) { ///< 当前比对的模块记录。
@@ -764,6 +833,9 @@ ProcessSupervisor::Entry* ProcessSupervisor::findEntryByServer(QObject* object) 
 }
 
 // 根据 readyRead/disconnected 的 sender() 反查子进程连接。
+/// @brief 按发送信号的 Socket 对象反查监督记录。
+/// @param object 信号发送者对象。
+/// @return 命中的记录指针；未找到返回 nullptr。
 ProcessSupervisor::Entry* ProcessSupervisor::findEntryBySocket(QObject* object) const
 {
     for (Entry* entry : entries_) { ///< 当前比对的模块记录。
@@ -774,6 +846,9 @@ ProcessSupervisor::Entry* ProcessSupervisor::findEntryBySocket(QObject* object) 
 }
 
 // 根据 QProcess 错误/退出信号反查模块配置。
+/// @brief 按发送信号的 QProcess 对象反查监督记录。
+/// @param object 信号发送者对象。
+/// @return 命中的记录指针；未找到返回 nullptr。
 ProcessSupervisor::Entry* ProcessSupervisor::findEntryByProcess(QObject* object) const
 {
     for (Entry* entry : entries_) { ///< 当前比对的模块记录。
@@ -784,6 +859,10 @@ ProcessSupervisor::Entry* ProcessSupervisor::findEntryByProcess(QObject* object)
 }
 
 // 为一个 Entry 创建随机服务器名/令牌、QLocalServer 和 QProcess 后立即返回。
+/// @brief 准备并启动一个子进程：生成服务器名与令牌、创建服务器和 QProcess 后立即返回。
+/// @param entry 目标监督记录，必须已设置 config。
+/// @param errorMessage 可选输出参数，失败时写入中文原因。
+/// @return 启动请求已提交返回 true，前置检查或资源创建失败返回 false。
 bool ProcessSupervisor::beginStartEntry(Entry* entry, QString* errorMessage)
 {
     if (entry == nullptr)
@@ -892,6 +971,10 @@ bool ProcessSupervisor::beginStartEntry(Entry* entry, QString* errorMessage)
 }
 
 // 编码并写入已连接 Socket；这里只判断写入是否被 Qt 接受。
+/// @brief 把控制帧编码后写入该子进程已连接的 Socket。
+/// @param entry 目标模块的监督记录。
+/// @param frame 待发送的协议帧。
+/// @return 整帧写入成功返回 true；未连接或只写入部分字节返回 false。
 bool ProcessSupervisor::sendFrame(Entry* entry, const QJsonObject& frame)
 {
     Q_ASSERT(QThread::currentThread() == thread());
@@ -904,6 +987,8 @@ bool ProcessSupervisor::sendFrame(Entry* entry, const QJsonObject& frame)
 }
 
 // 接受第一个合法待连接 Socket；同一 Entry 的额外连接立即拒绝。
+/// @brief 接受子进程的连接，只保留第一个合法 Socket。
+/// @return 无；多余连接会被立即断开并延迟销毁。
 void ProcessSupervisor::onServerConnection()
 {
     Entry* entry = findEntryByServer(sender()); ///< 发出新连接信号的模块记录。
@@ -926,6 +1011,8 @@ void ProcessSupervisor::onServerConnection()
 }
 
 // 累积并循环解析完整 IPC 帧，协议错误统一转入故障处理。
+/// @brief 读取子进程 Socket 数据并循环解析完整帧，协议错误转入故障处理。
+/// @return 无。
 void ProcessSupervisor::onSocketReadyRead()
 {
     Entry* entry = findEntryBySocket(sender()); ///< 发出可读信号的模块记录。
@@ -955,6 +1042,8 @@ void ProcessSupervisor::onSocketReadyRead()
 }
 
 // 非停止期间的连接断开属于模块故障，可能触发自动重启。
+/// @brief 处理子进程 IPC 连接断开：非停止阶段按模块故障处理。
+/// @return 无。
 void ProcessSupervisor::onSocketDisconnected()
 {
     Entry* entry = findEntryBySocket(sender()); ///< 发出断开信号的模块记录。
@@ -966,6 +1055,8 @@ void ProcessSupervisor::onSocketDisconnected()
 }
 
 // QProcess 已启动后进入注册阶段；这里只推进当前 generation。
+/// @brief 处理 QProcess 启动完成信号，把阶段推进到等待注册。
+/// @return 无。
 void ProcessSupervisor::onProcessStarted()
 {
     Entry* entry = findEntryByProcess(sender()); ///< 发出启动信号的模块记录。
@@ -974,6 +1065,9 @@ void ProcessSupervisor::onProcessStarted()
 }
 
 // 只把无法启动和崩溃升级为监督器故障，其他状态由 finished/Socket 路径处理。
+/// @brief 处理 QProcess 错误信号，只把无法启动和崩溃升级为模块故障。
+/// @param error QProcess 上报的错误类型。
+/// @return 无。
 void ProcessSupervisor::onProcessError(QProcess::ProcessError error)
 {
     Entry* entry = findEntryByProcess(sender()); ///< 发出错误信号的模块记录。
@@ -984,6 +1078,10 @@ void ProcessSupervisor::onProcessError(QProcess::ProcessError error)
 }
 
 // 非预期退出转换为可读错误，并进入统一清理/重启策略。
+/// @brief 处理子进程退出：停止阶段正常收尾，其余情况转为模块故障。
+/// @param exitCode 子进程退出码。
+/// @param exitStatus 正常退出还是崩溃退出。
+/// @return 无。
 void ProcessSupervisor::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
 {
     Entry* entry = findEntryByProcess(sender()); ///< 发出退出信号的模块记录。
@@ -1001,6 +1099,10 @@ void ProcessSupervisor::onProcessFinished(int exitCode, QProcess::ExitStatus exi
 }
 
 // 分派注册、生命周期、心跳、窗口、日志、ACK 和子到父业务消息帧。
+/// @brief 按 type 字段统一分派子进程上报的各类协议帧。
+/// @param entry 帧所属的模块记录。
+/// @param frame 已解析完成的协议帧。
+/// @return 无。
 void ProcessSupervisor::handleFrame(Entry* entry, const QJsonObject& frame)
 {
     if (entry == nullptr)
@@ -1232,6 +1334,8 @@ void ProcessSupervisor::handleFrame(Entry* entry, const QJsonObject& frame)
 }
 
 // 定时推进每个 Entry 自己的 deadline；不进入嵌套事件循环，也不借用别人的预算。
+/// @brief 状态机心跳：推进重启延迟、启动/停止超时和心跳探测。
+/// @return 无。
 void ProcessSupervisor::onSupervisionTick()
 {
     const qint64 now = QDateTime::currentMSecsSinceEpoch(); ///< 本次心跳的当前毫秒时间戳。
@@ -1309,6 +1413,12 @@ void ProcessSupervisor::onSupervisionTick()
 }
 
 // MessageBus 到子进程的非阻塞入口：验证后放入按主题有界等待队列。
+/// @brief 把 MessageBus 投递的消息放入指定子进程的有界等待队列。
+/// @param moduleId 目标子进程模块标识。
+/// @param topic 消息主题。
+/// @param senderModuleId 原始发送方模块标识。
+/// @param payload 不可变消息载荷。
+/// @return 已进入本地等待队列返回 true；模块不存在、载荷为空或超限时返回 false。
 bool ProcessSupervisor::enqueueMessageToChild(const QString& moduleId,
                                               const QString& topic,
                                               const QString& senderModuleId,
@@ -1399,6 +1509,9 @@ bool ProcessSupervisor::enqueueMessageToChild(const QString& moduleId,
 }
 
 // 在监督器 Qt 线程中有限批次写 Socket，并建立等待 deliveryAck 的在途记录。
+/// @brief 从指定子进程的等待队列取有限批次写入 Socket，并建立在途记录。
+/// @param moduleId 目标子进程模块标识。
+/// @return 无。
 void ProcessSupervisor::drainChildQueue(const QString& moduleId)
 {
     Entry* entry = findEntry(moduleId); ///< 目标模块的监督记录。
@@ -1534,6 +1647,10 @@ void ProcessSupervisor::drainChildQueue(const QString& moduleId)
                                   Q_ARG(QString, moduleId));
 }
 
+/// @brief 发送前失败时释放该消息占用的在途槽位、主题计数和共享段。
+/// @param entry 目标模块的监督记录。
+/// @param messageId 未能发出的消息 ID。
+/// @return 无；消息未登记时直接返回。
 void ProcessSupervisor::discardChildMessageBeforeSend(Entry* entry,
                                                        const QString& messageId)
 {
@@ -1561,6 +1678,11 @@ void ProcessSupervisor::discardChildMessageBeforeSend(Entry* entry,
 }
 
 // 根据 deliveryAck 回收父到子的在途槽位、主题计数和共享段。
+/// @brief 处理父到子消息的投递确认：释放在途槽位、主题计数和共享段。
+/// @param entry 目标模块的监督记录。
+/// @param messageId 被确认的消息 ID。
+/// @param accepted 子进程是否接受该消息。
+/// @return 无；重复或迟到 ACK 会被忽略。
 void ProcessSupervisor::acknowledgeChildMessage(Entry* entry,
                                                 const QString& messageId,
                                                 bool accepted)
@@ -1635,6 +1757,9 @@ void ProcessSupervisor::acknowledgeChildMessage(Entry* entry,
 }
 
 // 停止入口的顺序固定为：父到子闸门 -> MessageBus 单模块入口 -> 清等待队列。
+/// @brief 关闭指定模块的两层消息入口，并清空尚未发出的等待队列。
+/// @param entry 目标模块的监督记录。
+/// @return 无。
 void ProcessSupervisor::closeEntryIngress(Entry* entry)
 {
     if (entry == nullptr)
@@ -1656,6 +1781,10 @@ void ProcessSupervisor::closeEntryIngress(Entry* entry)
 }
 
 // 建立单个 Entry 的停止 deadline；函数不等待 QProcess 或 Socket。
+/// @brief 开始单个模块的停止流程：关入口、建 deadline 并发送 stop 帧。
+/// @param entry 目标模块的监督记录。
+/// @param purpose 本次停止的目的，决定停止完成后的去向。
+/// @return 无。
 void ProcessSupervisor::beginPrepareForExit()
 {
     if (preparingExit_ || shuttingDown_) return;
@@ -1798,6 +1927,9 @@ void ProcessSupervisor::beginStopEntry(Entry* entry, StopPurpose purpose)
 }
 
 // stopAcknowledged 是真实状态机输入：ACK 到达后不再停留在 WaitingStopAck。
+/// @brief 收到 stopAck 后把阶段推进到等待进程退出。
+/// @param entry 目标模块的监督记录。
+/// @return 无；阶段或 ACK 标记不匹配时不改变状态。
 void ProcessSupervisor::advanceStopEntry(Entry* entry)
 {
     if (entry != nullptr &&
@@ -1812,6 +1944,10 @@ void ProcessSupervisor::advanceStopEntry(Entry* entry)
 }
 
 // QProcess 已退出后清理本轮资源，并按 StopPurpose 决定停止、失败或下一次启动。
+/// @brief 子进程退出后清理本轮资源，并按停止目的决定停止、失败或排队重启。
+/// @param entry 目标模块的监督记录。
+/// @param detail 失败或停止的补充说明，可为空。
+/// @return 无。
 void ProcessSupervisor::finishEntryAfterProcessExit(Entry* entry, const QString& detail)
 {
     // QProcess 真正退出后才能销毁 Runtime。若 pendingStart 仍为 true，转入 RestartDelay；
@@ -1856,6 +1992,10 @@ void ProcessSupervisor::finishEntryAfterProcessExit(Entry* entry, const QString&
         emit stopFinished(entry->config.id, finalDetail.isEmpty(), finalDetail);
 }
 
+/// @brief 更新模块的操作忙标志，变化时发出 operationBusyChanged 信号。
+/// @param entry 目标模块的监督记录。
+/// @param busy 是否处于停止或重启操作中。
+/// @return 无；标志未变化时不发信号。
 void ProcessSupervisor::setOperationBusy(Entry* entry, bool busy)
 {
     if (entry == nullptr || entry->operationBusy == busy)
@@ -1865,6 +2005,10 @@ void ProcessSupervisor::setOperationBusy(Entry* entry, bool busy)
 }
 
 // 初始启动批次只在每个模块第一次达到 Running 或 Failed 后结算一次。
+/// @brief 把模块从启动批次待结算集合中移除，并在需要时上报批次结果。
+/// @param entry 目标模块的监督记录。
+/// @param error 启动失败原因，可为空表示成功。
+/// @return 无；该模块已结算过时不重复处理。
 void ProcessSupervisor::settleStartupEntry(Entry* entry, const QString& error)
 {
     if (entry == nullptr || !startupPendingModules_.remove(entry->config.id))
@@ -1874,6 +2018,8 @@ void ProcessSupervisor::settleStartupEntry(Entry* entry, const QString& error)
     scheduleStartupBatchFinished();
 }
 
+/// @brief 在启动批次全部结算后安排一次合并的 startupBatchFinished 信号。
+/// @return 无；批次未激活、仍有待结算模块或已安排时直接返回。
 void ProcessSupervisor::scheduleStartupBatchFinished()
 {
     if (!startupBatchActive_ || !startupPendingModules_.isEmpty() ||
@@ -1889,6 +2035,9 @@ void ProcessSupervisor::scheduleStartupBatchFinished()
     });
 }
 
+/// @brief 判断生命周期阶段是否属于停止过程中的过渡态。
+/// @param phase 待判断的生命周期阶段。
+/// @return 属于停止过渡态返回 true，否则返回 false。
 bool ProcessSupervisor::isStoppingPhase(LifecyclePhase phase) const
 {
     return phase == LifecyclePhase::StopRequested ||
@@ -1896,6 +2045,9 @@ bool ProcessSupervisor::isStoppingPhase(LifecyclePhase phase) const
            phase == LifecyclePhase::WaitingProcessExit;
 }
 
+/// @brief 判断生命周期阶段是否已完成注册（可以收发业务消息）。
+/// @param phase 待判断的生命周期阶段。
+/// @return 已注册或已进入停止过渡态返回 true，否则返回 false。
 bool ProcessSupervisor::isRegisteredPhase(LifecyclePhase phase) const
 {
     return phase == LifecyclePhase::WaitingStarted ||
@@ -1904,6 +2056,10 @@ bool ProcessSupervisor::isRegisteredPhase(LifecyclePhase phase) const
 }
 
 // 防重复地标记失败、销毁旧运行时，并按时间窗口决定是否自动重启。
+/// @brief 统一处理模块故障：标记失败、关闭入口并按窗口策略决定是否自动重启。
+/// @param entry 目标模块的监督记录。
+/// @param detail 面向用户的故障原因。
+/// @return 无。
 void ProcessSupervisor::handleFault(Entry* entry, const QString& detail)
 {
     if (entry == nullptr || shuttingDown_ ||
@@ -1963,6 +2119,9 @@ void ProcessSupervisor::handleFault(Entry* entry, const QString& detail)
 }
 
 // 统一释放桥接器、Socket、Server、QProcess、队列状态和共享内存。
+/// @brief 释放单个模块本轮的桥接器、连接、进程、队列状态和共享内存。
+/// @param entry 目标模块的监督记录。
+/// @return 无。
 void ProcessSupervisor::destroyRuntime(Entry* entry)
 {
     if (entry == nullptr)
@@ -2050,6 +2209,9 @@ void ProcessSupervisor::destroyRuntime(Entry* entry)
 }
 
 // 收集锁内共享段指针，锁外 detach/delete，缩短队列互斥锁持有时间。
+/// @brief 释放该模块所有仍持有、且未等到 ACK 的共享内存段。
+/// @param entry 目标模块的监督记录。
+/// @return 无。
 void ProcessSupervisor::clearOutgoingShared(Entry* entry)
 {
     QList<QSharedMemory*> segments; ///< 待释放的共享段列表。
@@ -2067,6 +2229,11 @@ void ProcessSupervisor::clearOutgoingShared(Entry* entry)
 }
 
 // 更新 Entry 快照后发信号，确保 UI 查询 state() 时能看到同一状态。
+/// @brief 先更新内部状态快照再发出 moduleStateChanged 信号。
+/// @param entry 目标模块的监督记录。
+/// @param stateValue 新的状态文本。
+/// @param detail 状态附带的详细说明，可为空。
+/// @return 无。
 void ProcessSupervisor::emitState(Entry* entry,
                                   const QString& stateValue,
                                   const QString& detail)

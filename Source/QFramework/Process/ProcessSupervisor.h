@@ -165,6 +165,8 @@ signals:
     /// @param busy 为 true 表示该模块正在停止或重启，此时不接受新的操作请求。
     /// @return 无。
     void operationBusyChanged(const QString& moduleId, bool busy);
+    /// @brief 当前准备请求的退出就绪状态改变时发射；旧请求和重复回执不触发。
+    void exitReadinessChanged();
     /// @brief startAll 批次内所有模块都结算（Running 或 Failed）后延迟发射一次。
     /// @param errors 启动失败模块的「模块 ID: 原因」文本列表；全部成功时为空。
     /// @return 无。

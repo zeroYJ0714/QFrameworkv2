@@ -15,6 +15,7 @@
 #include <QMainWindow>
 #include <QPoint>
 #include <QSize>
+#include <QStringList>
 #include <QVector>
 
 #include "FrameworkConfig.h"
@@ -98,9 +99,9 @@ public:
     /// @param presets 预设配置列表，按其稳定 index 建立菜单项；重复调用会先清空上一批菜单项，运行期不监听 INI 变化。
     /// @return 无；布局菜单尚未创建时只保存快照，校验失败的预设项被置灰并带上中文错误提示。
     void setLayoutPresets(const QVector<LayoutPresetConfig>& presets);
-    // 启动时只尝试 Layout.1；失败不会弹框，也不会建立活动布局。
-    /// @brief 启动时尝试加载编号 1 的布局预设，失败只写日志并禁用菜单项，不弹启动警告对话框。
-    /// @return 预设 1 存在、菜单项可用且文件恢复成功返回 true；缺失、被禁用或加载失败返回 false。
+    // 启动时补齐缺失的布局文件及目录，再加载 Layout.1；已有文件保持原样。
+    /// @brief 为缺失的预设创建显示所有已启用 UI 模块的默认布局，再加载编号 1；失败只记日志，不弹框。
+    /// @return 预设 1 的文件恢复成功返回 true；配置缺失、创建失败或加载失败返回 false。
     bool loadInitialLayoutPreset();
 
     // 委托 LayoutManager 恢复布局，并再次隐藏当前不可用模块的 Dock。
@@ -304,9 +305,11 @@ private:
     QHash<QString, ModuleConfig> modulesById_; ///< moduleId 到配置的索引，用于取 DisplayName 等只读字段。
     // 三个管理器为借用指针；layout/dialog/Dock/控件由本窗口拥有。
     PluginManager* pluginManager_; ///< 主进程插件管理器，借用指针不负责释放；可为空，为空时插件相关功能整体跳过。
-    QTimer* exitTimer_ = nullptr; ///< 退出准备阶段的 200ms 轮询定时器，首次关闭窗口时按需创建；等待期间消息总线和窗口事件照常处理。
+    QTimer* exitTimer_ = nullptr; ///< 退出准备阶段的 50ms 兜底轮询，首次关闭时创建；等待期间消息总线和窗口事件照常处理。
     QElapsedTimer exitElapsed_;
+    QStringList pendingExitModules_; ///< 上次输出的等待名单，只在变化时记录日志。
     bool preparingExit_ = false; ///< 是否已进入退出准备阶段：为 true 时再次 close() 只检查插件保存结果，不重新发起保存。
+    bool exitConfirmationInProgress_ = false;
     ProcessSupervisor* processSupervisor_; ///< 子进程监督器，借用指针不负责释放；可为空，为空时子进程窗口嵌入、显示和重启跳过。
     StyleManager* styleManager_; ///< 全局 QSS 管理器，借用指针不负责释放；可为空，为空时“样式”菜单各项直接返回。
     // 由 MainWindow 持有的客户区标题栏；setMenuWidget() 只改变它在 QMainWindow 中的位置。

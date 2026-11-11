@@ -5,15 +5,18 @@
 
 // 文件职责：把框架模块状态映射为菜单、Dock、状态栏和模块管理对话框。
 // MainWindow 只在 GUI 线程使用 QWidget/QAction/QTimer；插件加载、MessageBus 和子进程监督由
-// 其他对象完成，本类通过 Qt 信号槽接收状态。关闭流程先询问各模块 canClose，再在 5 秒内等待保存
-// 结果；取消、失败或超时必须拒绝 closeEvent，避免用户编辑内容被静默丢弃。
+// 其他对象完成，本类通过 Qt 信号槽接收状态。关闭流程先异步等待退出准备，再询问各模块 canClose；
+// 取消、失败或超时必须拒绝 closeEvent，避免用户编辑内容被静默丢弃。
 #include "MainWindow.h"
 
 #include <QAction>
 #include <QActionGroup>
 #include <QCloseEvent>
+#include <QDir>
+#include <QDebug>
 #include <QEvent>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QIcon>
 #include <QLabel>
@@ -21,6 +24,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QScreen>
+#include <QScopedValueRollback>
 #include <QSignalBlocker>
 #include <QStatusBar>
 #include <QStyle>
@@ -271,6 +275,8 @@ MainWindow::MainWindow(const QVector<ModuleConfig>& modules,
                 &ProcessSupervisor::operationBusyChanged,
                 moduleManagerDialog_,
                 &ModuleManagerDialog::setRestartBusy);
+        connect(processSupervisor_, &ProcessSupervisor::exitReadinessChanged,
+                this, &MainWindow::pollExitReadiness, Qt::QueuedConnection);
         connect(processSupervisor_,
                 &ProcessSupervisor::restartFinished,
                 this,
@@ -473,11 +479,42 @@ void MainWindow::setLayoutPresets(const QVector<LayoutPresetConfig>& presets)
     layoutPresetSeparator_->setVisible(!layoutPresetActions_.isEmpty());
 }
 
-// 启动只尝试编号 1；错误写日志并禁用该项，不弹出启动警告对话框。
-/// @brief 启动时尝试加载编号为 1 的布局预设。
-/// @return 加载成功返回 true；预设缺失或加载失败返回 false。
+// 启动时补齐缺失的预设文件，再加载编号 1；已有文件保持原样。
+/// @brief 为缺失的布局预设创建默认文件和目录，再加载编号为 1 的预设。
+/// @return 预设 1 加载成功返回 true；配置缺失、创建失败或加载失败返回 false。
 bool MainWindow::loadInitialLayoutPreset()
 {
+    QHash<QString, bool> defaultVisibility;
+    for (const QString& moduleId : moduleDocks_.keys())
+        defaultVisibility.insert(moduleId, true);
+
+    for (const LayoutPresetConfig& preset : layoutPresets_) {
+        if (preset.filePath.isEmpty() || QFileInfo::exists(preset.filePath))
+            continue;
+
+        QString error;
+        const QString directory = QFileInfo(preset.filePath).absolutePath();
+        bool created = false;
+        if (!QDir().mkpath(directory)) {
+            error = QString::fromUtf8(u8"无法创建布局目录：%1").arg(directory);
+        } else {
+            created = layoutManager_->saveLayout(
+                preset.filePath, defaultVisibility, &error, LayoutActivation::KeepCurrent);
+        }
+
+        QAction* action = layoutPresetActions_.value(preset.index, nullptr);
+        if (action != nullptr) {
+            action->setEnabled(created);
+            action->setToolTip(created ? preset.filePath : error);
+        }
+        if (!created) {
+            Logger::instance().log(
+                LogLevel::Warning,
+                QStringLiteral("QFrameworkApp"),
+                QString::fromUtf8(u8"创建布局预设 %1 失败：%2")
+                    .arg(preset.name, error));
+        }
+    }
     return activateLayoutPreset(1, true, nullptr);
 }
 
@@ -1105,26 +1142,38 @@ bool MainWindow::canHideModule(const QString& moduleId) const
 /// @return 无。
 void MainWindow::closeEvent(QCloseEvent* event)
 {
+    if (exitConfirmationInProgress_) {
+        event->ignore();
+        return;
+    }
     if (!preparingExit_) {
         event->ignore();
         preparingExit_ = true;
+        qInfo() << "[SHUTDOWN_TIMING] close_prepare_started";
+        statusBar()->showMessage(QString::fromUtf8(u8"正在等待模块完成退出准备…"));
         if (exitTimer_ == nullptr) {
             exitTimer_ = new QTimer(this); ///< 轮询插件退出就绪状态的定时器，首次关闭时按需创建。
-            exitTimer_->setInterval(200);
+            exitTimer_->setInterval(50);
             connect(exitTimer_, &QTimer::timeout, this, &MainWindow::pollExitReadiness);
         }
         exitElapsed_.start();
+        pendingExitModules_.clear();
         if (pluginManager_) pluginManager_->beginPrepareForExit();
         if (processSupervisor_) processSupervisor_->beginPrepareForExit();
         exitTimer_->start();
+        QMetaObject::invokeMethod(this, "pollExitReadiness", Qt::QueuedConnection);
         return;
     }
-    if ((pluginManager_ && !pluginManager_->isReadyForExit()) ||
-        (processSupervisor_ && !processSupervisor_->isReadyForExit())) {
+    const bool pluginsReady = !pluginManager_ || pluginManager_->isReadyForExit();
+    const bool processesReady = !processSupervisor_ || processSupervisor_->isReadyForExit();
+    if (!pluginsReady || !processesReady) {
         event->ignore();
         return;
     }
+    // canClose 可能打开模态对话框；嵌套事件循环中的就绪通知不能再次进入确认流程。
+    QScopedValueRollback<bool> confirming(exitConfirmationInProgress_, true);
     if (exitTimer_ != nullptr) exitTimer_->stop();
+    qInfo() << "[SHUTDOWN_TIMING] close_prepare_ready_ms=" << exitElapsed_.elapsed();
     if (pluginManager_ != nullptr) {
         for (const ModuleConfig& config : modules_) { ///< 当前询问 canClose 的模块配置。
             if (!config.enabled || config.type != ModuleType::InProcessUi)
@@ -1135,6 +1184,9 @@ void MainWindow::closeEvent(QCloseEvent* event)
                 preparingExit_ = false;
                 pluginManager_->cancelPrepareForExit();
                 if (processSupervisor_) processSupervisor_->cancelPrepareForExit();
+                statusBar()->clearMessage();
+                qInfo() << "[SHUTDOWN_TIMING] close_prepare_cancelled_ms=" << exitElapsed_.elapsed()
+                        << "veto_module=" << config.id;
                 event->ignore();
                 return;
             }
@@ -1143,25 +1195,37 @@ void MainWindow::closeEvent(QCloseEvent* event)
     QMainWindow::closeEvent(event);
 }
 
-/// @brief 定时检查插件是否已全部保存完成，就绪后再次触发关闭。
-/// @return 无；尚未就绪时等待下一次定时器触发。
+/// @brief 收到就绪通知或定时检查时更新等待名单，就绪后再次触发关闭。
+/// @return 无；尚未就绪时保持业务消息和窗口事件运行。
 void MainWindow::pollExitReadiness()
 {
-    if (!preparingExit_) return;
+    if (!preparingExit_ || exitConfirmationInProgress_ ||
+        exitTimer_ == nullptr || !exitTimer_->isActive()) return;
+    QStringList pending = processSupervisor_ ? processSupervisor_->pendingExitModules() : QStringList();
+    if (pluginManager_) pending.append(pluginManager_->pendingExitModules());
+    pending.removeDuplicates();
+    pending.sort();
+    if (pending != pendingExitModules_) {
+        pendingExitModules_ = pending;
+        qInfo() << "[SHUTDOWN_TIMING] close_prepare_pending_ms=" << exitElapsed_.elapsed()
+                << "pending_modules=" << pending;
+    }
     if (exitElapsed_.elapsed() >= 30000) {
-        QStringList pending = processSupervisor_ ? processSupervisor_->pendingExitModules() : QStringList();
-        if (pluginManager_) pending.append(pluginManager_->pendingExitModules());
+        qInfo() << "[SHUTDOWN_TIMING] close_prepare_timeout_ms=" << exitElapsed_.elapsed()
+                << "pending_modules=" << pending;
         preparingExit_ = false;
         exitTimer_->stop();
         if (pluginManager_) pluginManager_->cancelPrepareForExit();
         if (processSupervisor_) processSupervisor_->cancelPrepareForExit();
+        statusBar()->clearMessage();
+        QScopedValueRollback<bool> confirming(exitConfirmationInProgress_, true);
         QMessageBox::warning(this, QString::fromUtf8(u8"退出未完成"),
             QString::fromUtf8(u8"等待模块退出准备超过 30 秒，已取消关闭。请检查保存或服务状态。\n%1").arg(pending.join("\n")));
         return;
     }
-    if ((!pluginManager_ || pluginManager_->isReadyForExit()) &&
-        (!processSupervisor_ || processSupervisor_->isReadyForExit()))
+    if (pending.isEmpty()) {
         close(); // 第二次 close 才进入已有草稿保护；不提前 shutdown 或直接 quit。
+    }
 }
 
 // 实际显示必须同时满足“用户希望显示”和“模块界面已经 ready”。

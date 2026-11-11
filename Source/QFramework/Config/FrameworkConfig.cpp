@@ -161,7 +161,7 @@ bool FrameworkConfig::load(const QString& iniFilePath, QString* errorMessage)
 
     layout_.presets.clear();
     // 布局编号由配置维护者保证从 1 连续递增；遇到第一个缺失分组即结束读取。
-    // File 允许为空或指向暂时不存在的文件，MainWindow 会保留菜单项并显示校验原因。
+    // File 指向缺失文件时由 MainWindow 在启动时创建；空路径或无效文件保留校验提示。
     const QStringList topLevelGroups = settings.childGroups(); ///< 顶层分组快照，用于判断 Layout.n 是否存在。
     for (int index = 1; ; ++index) { ///< index：从 1 递增的布局编号。
         const QString groupName = QStringLiteral("Layout.%1").arg(index); ///< 当前布局分组名。

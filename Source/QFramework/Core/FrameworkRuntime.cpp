@@ -10,6 +10,7 @@
 
 #include <QApplication>
 #include <QDebug>
+#include <QElapsedTimer>
 #include <QMessageBox>
 #include <QMutex>
 #include <QMutexLocker>
@@ -175,8 +176,7 @@ bool FrameworkRuntime::initialize(const QString& configFilePath,
     // 子进程启动已经改成异步批次；即时 errors 只说明请求未被接受，最终错误和
     // MessageBus 投递闸门都由 startupBatchFinished 在事件循环中统一处理。
 
-    // 布局预设由 MainWindow 统一处理：启动只尝试 Layout.1，失败写日志并置灰菜单项，
-    // 不进入全局启动警告对话框，也不改变当前空白窗口状态。
+    // 布局预设由 MainWindow 补齐缺失文件后加载 Layout.1；失败只记日志并置灰菜单项。
     mainWindow_->loadInitialLayoutPreset();
 
     initialized_ = true;
@@ -204,21 +204,31 @@ void FrameworkRuntime::shutdown()
         return;
     shutdownComplete_ = true;
 
+    QElapsedTimer shutdownPhase; ///< 分段记录退出耗时，区分队列、子进程和插件收尾。
+    shutdownPhase.start();
     MessageBusStopReport stopReport; ///< 全局队列停止结果，用于识别超时模块。
     // 只在这里执行一次全局队列停止；PluginManager 和 MessageBus 析构不重复预算。
     if (messageBus_ != nullptr) {
         messageBus_->beginShutdown();
         stopReport = messageBus_->stopQueues(
             config_.messageBus().shutdownDrainTimeoutMs);
+        qInfo() << "[SHUTDOWN_TIMING] message_bus_stop_ms=" << shutdownPhase.restart()
+                << "timed_out_modules=" << stopReport.timedOutModuleIds;
     }
-    if (processSupervisor_ != nullptr)
+    if (processSupervisor_ != nullptr) {
         processSupervisor_->shutdown();
-    if (mainWindow_ != nullptr)
+        qInfo() << "[SHUTDOWN_TIMING] process_supervisor_stop_ms=" << shutdownPhase.restart();
+    }
+    if (mainWindow_ != nullptr) {
         mainWindow_->releaseInProcessUiModules();
+        qInfo() << "[SHUTDOWN_TIMING] release_module_ui_ms=" << shutdownPhase.restart();
+    }
     QStringList quarantinedPluginIds; ///< PluginManager 判定需隔离保留的模块 ID。
     if (pluginManager_ != nullptr) {
         quarantinedPluginIds = pluginManager_->shutdown(
             stopReport.timedOutModuleIds);
+        qInfo() << "[SHUTDOWN_TIMING] plugin_manager_stop_ms=" << shutdownPhase.restart()
+                << "quarantined_modules=" << quarantinedPluginIds;
     }
 
     QStringList unsafeModuleIds = quarantinedPluginIds; ///< 合并后的不安全模块 ID，决定是否保留 MessageBus。
@@ -247,6 +257,7 @@ void FrameworkRuntime::shutdown()
         Logger::instance().uninstallQtMessageHandler();
         // 先显式刷新，再 stop；即使最后一批日志还没到 100 ms 周期，也不会丢。
         Logger::instance().flush();
+        qInfo() << "[SHUTDOWN_TIMING] pre_logger_flush_ms=" << shutdownPhase.restart();
         Logger::instance().stop();
         loggerStarted_ = false;
     }

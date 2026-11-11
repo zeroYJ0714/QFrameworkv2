@@ -12,7 +12,9 @@
 
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QLocalServer>
@@ -378,6 +380,8 @@ struct ProcessSupervisor::Entry
     bool exitReady = false;
     StopPurpose preparePurpose = StopPurpose::None;
     QDeadlineTimer prepareDeadline;
+    QElapsedTimer prepareElapsed;
+    bool prepareReadyLogged = false;
     bool stopAcknowledged = false; ///< 是否已收到子进程的 stopAck。
 };
 
@@ -1217,8 +1221,17 @@ void ProcessSupervisor::handleFrame(Entry* entry, const QJsonObject& frame)
     }
     if (type == QStringLiteral("exitReadiness")) {
         if (!entry->prepareId.isEmpty() && entry->phase == LifecyclePhase::Running &&
-            frame.value(QStringLiteral("requestId")).toString() == entry->prepareId)
-            entry->exitReady = frame.value(QStringLiteral("ready")).toBool();
+            frame.value(QStringLiteral("requestId")).toString() == entry->prepareId) {
+            const bool ready = frame.value(QStringLiteral("ready")).toBool();
+            if (entry->exitReady == ready) return;
+            entry->exitReady = ready;
+            if (ready && !entry->prepareReadyLogged) {
+                entry->prepareReadyLogged = true;
+                qInfo() << "[SHUTDOWN_TIMING] prepare_module_ready_ms=" << entry->prepareElapsed.elapsed()
+                        << "scope=process module=" << entry->config.id << "request_id=" << entry->prepareId;
+            }
+            emit exitReadinessChanged();
+        }
         return;
     }
     if (type == kPong) {
@@ -1391,7 +1404,7 @@ void ProcessSupervisor::onSupervisionTick()
         }
         if (entry->phase != LifecyclePhase::Running || entry->process == nullptr)
             continue;
-        if (preparingExit_ && entry->prepareId.isEmpty())
+        if (preparingExit_ && entry->prepareId.isEmpty() && !entry->exitReady)
             beginPrepareEntry(entry, StopPurpose::None);
         if (!entry->prepareId.isEmpty() && !pollPrepareEntry(entry))
             continue;
@@ -1826,6 +1839,8 @@ void ProcessSupervisor::cancelPrepareEntry(Entry* entry)
     entry->prepareId.clear();
     entry->exitReady = false;
     entry->preparePurpose = StopPurpose::None;
+    entry->prepareElapsed.invalidate();
+    entry->prepareReadyLogged = false;
     if (!id.isEmpty() && entry->phase == LifecyclePhase::Running) {
         QJsonObject frame;
         frame.insert(QStringLiteral("type"), QStringLiteral("cancelPrepareExit"));
@@ -1846,13 +1861,23 @@ void ProcessSupervisor::beginPrepareEntry(Entry* entry, StopPurpose purpose)
 {
     if (entry->phase != LifecyclePhase::Running || !entry->prepareExitSupported) {
         if (purpose != StopPurpose::None) beginStopEntry(entry, purpose);
-        else entry->exitReady = true; // Legacy process runtime has no prepare gate.
+        else {
+            entry->exitReady = true; // Legacy process runtime has no prepare gate.
+            qInfo() << "[SHUTDOWN_TIMING] prepare_module_begin scope=process module=" << entry->config.id
+                    << "prepare_supported=false";
+            qInfo() << "[SHUTDOWN_TIMING] prepare_module_ready_ms=" << 0
+                    << "scope=process module=" << entry->config.id << "prepare_supported=false";
+        }
         return;
     }
     entry->preparePurpose = purpose;
     entry->prepareId = QUuid::createUuid().toString(QUuid::Id128);
     entry->exitReady = false;
     entry->prepareDeadline = QDeadlineTimer(30000);
+    entry->prepareElapsed.start();
+    entry->prepareReadyLogged = false;
+    qInfo() << "[SHUTDOWN_TIMING] prepare_module_begin scope=process module=" << entry->config.id
+            << "request_id=" << entry->prepareId;
     pollPrepareEntry(entry);
 }
 
@@ -1896,6 +1921,8 @@ void ProcessSupervisor::beginStopEntry(Entry* entry, StopPurpose purpose)
     entry->prepareId.clear();
     entry->exitReady = false;
     entry->preparePurpose = StopPurpose::None;
+    entry->prepareElapsed.invalidate();
+    entry->prepareReadyLogged = false;
     entry->stopPurpose = purpose;
     entry->stopAcknowledged = false;
     entry->stopEscalation = 0;
@@ -1957,6 +1984,8 @@ void ProcessSupervisor::finishEntryAfterProcessExit(Entry* entry, const QString&
     entry->prepareId.clear();
     entry->exitReady = false;
     entry->preparePurpose = StopPurpose::None;
+    entry->prepareElapsed.invalidate();
+    entry->prepareReadyLogged = false;
     const StopPurpose purpose = entry->stopPurpose; ///< 本次停止的目的。
     const bool shouldRestart = entry->pendingStart && !shuttingDown_ &&
         (purpose == StopPurpose::ManualRestart || purpose == StopPurpose::AutoRestart); ///< 是否应排队启动下一代进程。

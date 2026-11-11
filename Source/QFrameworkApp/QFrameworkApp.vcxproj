@@ -35,32 +35,25 @@
   </ItemGroup>
   <ItemGroup><ClCompile Include="main.cpp" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" /><ImportGroup Condition="Exists('$(QtMsBuild)\qt.targets')"><Import Project="$(QtMsBuild)\qt.targets" /></ImportGroup><ImportGroup Label="ExtensionTargets" />
-  <!-- VS 直接启动 QFrameworkApp 时，运行目录必须拥有与源码一致的模块配置和依赖。 -->
+  <!-- 编译后仅复制运行时依赖；config 由部署维护，避免覆盖用户保存的配置和布局。 -->
   <Target Name="CopyQFrameworkRuntimeFiles" AfterTargets="Build">
     <ItemGroup>
-      <QFrameworkIni Include="$(SolutionDir)config\QFramework.ini" />
-      <LocateAnythingConfig Include="$(SolutionDir)config\locateanything.json" />
       <LocateAnythingServer Include="$(SolutionDir)Runtime\LocateAnything\server\*.py;$(SolutionDir)Runtime\LocateAnything\server\*.txt;$(SolutionDir)Runtime\LocateAnything\server\*.html" />
       <LocateAnythingTrainer Include="$(SolutionDir)Runtime\LocateAnything\trainer\*.py;$(SolutionDir)Runtime\LocateAnything\trainer\*.txt" />
+      <LocateAnythingModel Include="$(SolutionDir)Runtime\LocateAnything\models\**\*.py;$(SolutionDir)Runtime\LocateAnything\models\model-code-manifest.json;$(SolutionDir)Runtime\LocateAnything\models\LICENSE" />
       <QFrameworkNetworkRuntime Include="$(QMake_QT_INSTALL_BINS_)\Qt5Networkd.dll" Condition="'$(Configuration)'=='Debug'" />
       <QFrameworkNetworkRuntime Include="$(QMake_QT_INSTALL_BINS_)\Qt5Network.dll" Condition="'$(Configuration)'=='Release'" />
-      <QFrameworkLayouts Include="$(SolutionDir)config\Layouts\*.*" />
-      <QFrameworkStyles Include="$(SolutionDir)config\Styles\*.qss" />
       <QFrameworkFfmpeg Include="$(SolutionDir)ThirdParty\FFmpeg\x64\8.1\bin\*.dll" Condition="'$(Platform)'=='x64'" />
       <QFrameworkSqlRuntimeFiles Include="$(QMake_QT_INSTALL_BINS_)\Qt5Sqld.dll" Condition="'$(Configuration)'=='Debug'" />
       <QFrameworkSqlRuntimeFiles Include="$(QMake_QT_INSTALL_BINS_)\Qt5Sql.dll" Condition="'$(Configuration)'=='Release'" />
       <QFrameworkSqlDriverFiles Include="$(QMake_QT_INSTALL_PLUGINS_)\sqldrivers\qsqlited.dll" Condition="'$(Configuration)'=='Debug'" />
       <QFrameworkSqlDriverFiles Include="$(QMake_QT_INSTALL_PLUGINS_)\sqldrivers\qsqlite.dll" Condition="'$(Configuration)'=='Release'" />
     </ItemGroup>
-    <MakeDir Directories="$(OutDir)config;$(OutDir)config\Layouts;$(OutDir)config\Styles;$(OutDir)sqldrivers" />
-    <Copy SourceFiles="@(QFrameworkIni)" DestinationFolder="$(OutDir)config" SkipUnchangedFiles="true" />
-    <!-- Preserve installed paths/settings; never copy model weights or a developer venv during Build. -->
-    <Copy SourceFiles="@(LocateAnythingConfig)" DestinationFolder="$(OutDir)config" Condition="!Exists('$(OutDir)config\locateanything.json')" />
+    <MakeDir Directories="$(OutDir)sqldrivers" />
     <Copy SourceFiles="@(LocateAnythingServer)" DestinationFolder="$(OutDir)Runtime\LocateAnything\server" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(LocateAnythingTrainer)" DestinationFolder="$(OutDir)Runtime\LocateAnything\trainer" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(LocateAnythingModel)" DestinationFiles="@(LocateAnythingModel->'$(OutDir)Runtime\LocateAnything\models\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(QFrameworkNetworkRuntime)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
-    <Copy SourceFiles="@(QFrameworkLayouts)" DestinationFolder="$(OutDir)config\Layouts" SkipUnchangedFiles="true" />
-    <Copy SourceFiles="@(QFrameworkStyles)" DestinationFolder="$(OutDir)config\Styles" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(QFrameworkFfmpeg)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" Condition="'@(QFrameworkFfmpeg)'!=''" />
     <Copy SourceFiles="@(QFrameworkSqlRuntimeFiles)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(QFrameworkSqlDriverFiles)" DestinationFolder="$(OutDir)sqldrivers" SkipUnchangedFiles="true" />

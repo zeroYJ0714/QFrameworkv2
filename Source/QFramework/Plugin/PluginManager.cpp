@@ -8,6 +8,8 @@
 // 不在这里跨线程直接调用，关闭时先停止发布入口，再等待消息队列按有界流程收尾。
 #include "PluginManager.h"
 
+#include <QDebug>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QJsonObject>
 #include <QPluginLoader>
@@ -52,6 +54,8 @@ struct PluginManager::LoadedPlugin
     InProcessUiModule* uiModule = nullptr; ///< instance 的 UI 视图；非 UI 插件为 nullptr。
     bool started = false; ///< 是否已成功执行过 onStart。
     bool quarantined = false; ///< 停止超时需保留，禁止卸载其 DLL。
+    QElapsedTimer prepareElapsed;
+    bool prepareReadyLogged = false;
 };
 
 // 保存中央 MessageBus 借用指针；实际 DLL 直到 loadAndStart() 才加载。
@@ -70,25 +74,36 @@ PluginManager::PluginManager(MessageBus* messageBus, QObject* parent)
 /// @return 无；跳过隔离中的插件。
 void PluginManager::beginPrepareForExit()
 {
-    for (LoadedPlugin* plugin : loaded_) ///< plugin：逐个通知的已加载插件。
-        if (plugin->started && !plugin->quarantined) plugin->endpoint->beginPrepareForExit();
+    for (LoadedPlugin* plugin : loaded_) { ///< plugin：逐个通知的已加载插件。
+        if (!plugin->started || plugin->quarantined || plugin->prepareElapsed.isValid()) continue;
+        plugin->prepareElapsed.start();
+        plugin->prepareReadyLogged = false;
+        qInfo() << "[SHUTDOWN_TIMING] prepare_module_begin scope=plugin module=" << plugin->config.id;
+        plugin->endpoint->beginPrepareForExit();
+    }
+    pendingExitModules();
 }
 
 /// @brief 查询是否所有已启动插件都已完成退出准备。
 /// @return 全部就绪返回 true；任一插件未就绪返回 false。
 bool PluginManager::isReadyForExit() const
 {
-    for (LoadedPlugin* plugin : loaded_) ///< plugin：逐个查询的已加载插件。
-        if (plugin->started && !plugin->quarantined && !plugin->endpoint->isReadyForExit()) return false;
-    return true;
+    return pendingExitModules().isEmpty();
 }
 
 QStringList PluginManager::pendingExitModules() const
 {
     QStringList pending;
-    for (LoadedPlugin* plugin : loaded_)
-        if (plugin->started && !plugin->quarantined && !plugin->endpoint->isReadyForExit())
+    for (LoadedPlugin* plugin : loaded_) {
+        if (!plugin->started || plugin->quarantined) continue;
+        if (!plugin->endpoint->isReadyForExit()) {
             pending.append(plugin->config.id);
+        } else if (plugin->prepareElapsed.isValid() && !plugin->prepareReadyLogged) {
+            plugin->prepareReadyLogged = true;
+            qInfo() << "[SHUTDOWN_TIMING] prepare_module_ready_ms=" << plugin->prepareElapsed.elapsed()
+                    << "scope=plugin module=" << plugin->config.id;
+        }
+    }
     return pending;
 }
 
@@ -96,8 +111,12 @@ QStringList PluginManager::pendingExitModules() const
 /// @return 无；跳过隔离中的插件。
 void PluginManager::cancelPrepareForExit()
 {
-    for (LoadedPlugin* plugin : loaded_) ///< plugin：逐个通知的已加载插件。
-        if (plugin->started && !plugin->quarantined) plugin->endpoint->cancelPrepareForExit();
+    for (LoadedPlugin* plugin : loaded_) { ///< plugin：逐个通知的已加载插件。
+        if (!plugin->started || plugin->quarantined) continue;
+        plugin->prepareElapsed.invalidate();
+        plugin->prepareReadyLogged = false;
+        plugin->endpoint->cancelPrepareForExit();
+    }
 }
 
 /// @brief 析构兜底：若尚未显式关闭，则停止总线并回收插件 DLL。
@@ -168,9 +187,15 @@ QStringList PluginManager::shutdown(const QStringList& timedOutModuleIds)
     QVector<LoadedPlugin*> quarantinedPlugins; ///< 需要保留的隔离插件，作为新的 loaded_。
     for (int i = loaded_.size() - 1; i >= 0; --i) { ///< i：从后往前回收，保证依赖逆序。
         LoadedPlugin* plugin = loaded_.at(i); ///< 当前处理的插件。
-        if (timedOutModuleIds.contains(plugin->config.id) ||
-            !messageBus_->isModuleQueueStopped(plugin->config.id) ||
-            !releasePlugin(plugin)) { ///< 超时或线程未停：标记隔离并保留。
+        const QString moduleId = plugin->config.id; ///< releasePlugin 成功会销毁记录，日志先复制稳定 ID。
+        QElapsedTimer moduleStopTimer; ///< 记录单个插件 onStop/销毁阶段的耗时。
+        moduleStopTimer.start();
+        const bool safeToRelease = !timedOutModuleIds.contains(moduleId) &&
+            messageBus_->isModuleQueueStopped(moduleId); ///< 只有消息线程停止后才可进入插件清理。
+        const bool released = safeToRelease && releasePlugin(plugin); ///< 执行插件 onStop、实例销毁和 DLL 卸载。
+        qInfo() << "[SHUTDOWN_TIMING] plugin_release_ms=" << moduleStopTimer.elapsed()
+                << "module=" << moduleId << "released=" << released;
+        if (!released) { ///< 超时或线程未停：标记隔离并保留。
             plugin->quarantined = true;
             quarantinedPlugins.prepend(plugin);
             emit moduleStateChanged(
